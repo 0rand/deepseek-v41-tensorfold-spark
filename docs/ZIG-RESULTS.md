@@ -67,6 +67,20 @@ The final run's raw records are not part of this export; the numbers above are c
 [`results/zig-q28-v2`](../results/zig-q28-v2/README.md) hold the earlier 2026-10-09 comparison (single Zig runs, 2K
 prefill), which this page replaces.
 
+## Split KV and the 3.0M pool
+
+The tables above were measured with the replicated 1.4M pool. The profile now serves split KV with a 3.0M pool
+([split KV and the pool](ZIG-SERVE.md#split-kv-and-the-pool)). Its measurements are pending:
+
+| Check | Replicated, 1.4M | Split, 3.0M |
+| --- | --- | --- |
+| Pool at boot (tokens) | 1,400,000 | pending |
+| Longest single prompt served | pending | pending |
+| Four live slots, each filled | pending | pending |
+| Lowest free memory under load (GiB, worse rank) | pending | pending |
+| Decode tok/s, code ×1 / ×4 | pending | pending |
+| Replies equal to the reference | 16/16 | pending |
+
 ## Historical vLLM comparison
 
 The [existing Python vs vLLM table](../README.md#historical-29-bpw-results-python-vs-vllm) remains unchanged:

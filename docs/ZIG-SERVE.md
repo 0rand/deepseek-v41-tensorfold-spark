@@ -215,7 +215,12 @@ upstream TensorFold settings.
 | `TF_DSV41_SLOTS` | 1 | `4` | Concurrent live slots |
 | `TF_DSV41_SLOT_DRAFTS` | 0 | `1` | Per-slot drafts with batched verification |
 | `TF_DSV41_ROWS_CAP` | 16 | `64` | Maximum rows per decode forward; requires matching AOT |
-| `TF_DSV41_POOL_TOKENS` | unset: no paged pool | `1400000` | Shared paged KV capacity, not capacity per slot |
+| `TF_DSV41_POOL_TOKENS` | unset: no paged pool | `3000000` | Shared paged KV capacity, not capacity per slot ([split KV and the pool](#split-kv-and-the-pool)) |
+| `TF_DSV41_KV_SPLIT` | 0 | `1` | Compressed KV rows sharded over the ranks instead of replicated; needs TP >= 2 and `POOL_TOKENS` |
+| `TF_DSV41_KV_SPLIT_COMPACT` | 0 | `1` | Split KV's owner-packed exchange where every rank's transport takes device lengths and the shard fits, else dense; `force` packs on any transport |
+| `TF_DSV41_KV_SPLIT_UNION_MIB` | 128 | `128 (unset)` | Byte budget of each block of a prefill's union of selected rows under split KV (bounds its exchange and staging) |
+| `TF_DSV41_FORMS_INPLACE` | 0 | `1` | Dense weight forms written over their trellis instead of beside it |
+| `TF_DSV41_BOOT_TRACE` | 0 | `0 (unset)` | Logs each boot step's memory; for a first boot of a new profile |
 | `TF_DSV41_SAMPLING` | 0 | `1` | Keyed sampling for nonzero temperature |
 | `TF_DSV41_EXPERT_TOPP` | unset: no pruning | `0.85` | Decode routed-expert top-p pruning |
 | `TF_DSV41_INDEX_BUDGET_MIB` | 256 | `64` | Index selection scratch budget |
@@ -328,6 +333,24 @@ should be completed as in [Changing serving settings](#changing-serving-settings
 `PF_4K=0`, drop `PF_4K_MEMORY_OK` and `PF_WS_FLOOR_GIB`, and use 2048 for `PREFILL_CHUNK` / `PREFILL_ROWS`. Do not
 enable two-batch prefill overlap (PF_TBO) alongside 4K without a separate memory gate: the tested combination
 exhausted memory.
+
+### Split KV and the pool
+
+Without split KV every rank holds every compressed KV row, so the pool is bounded by one node's free memory. With
+`TF_DSV41_KV_SPLIT=1` each rank holds its share of the rows and the ranks exchange the selected rows each round, about
+1,060 bytes a token on each rank. That is what lets the profile's `TF_DSV41_POOL_TOKENS=3000000` boot where the
+replicated layout fits about 1.4M: one slot can fill its whole `TF_DSV41_CONTEXT` (1M), two slots 1M each, four live
+slots about 750K each. The pool is shared, so these are totals across live slots, not per-slot reservations.
+`TF_DSV41_FORMS_INPLACE=1` frees the dense forms' separate copy for the pool, and `TF_DSV41_KV_SPLIT_COMPACT=1` sends
+each rank's packed rows instead of the dense table where the transport allows it.
+
+The boot check prices the pool against each rank's measured memory at the end of boot and refuses a pool that would
+leave the worst predicted dip (`TF_DSV41_SERVE_DIP_GIB`, default 3.0 GiB) under the hard floor, so an oversized
+`POOL_TOKENS` fails at boot, not under load. When live slots need the pool, admission parks idle sessions from RAM to
+the NVMe tier (`TF_DSV41_SESSION_DISK`); a parked chat's next prompt resumes it from disk, and a restore that fails on
+any rank is a cache miss: the prompt is prefilled from 0 and serving continues. Split KV costs some decode speed for the
+exchange (see [ZIG-RESULTS](ZIG-RESULTS.md#split-kv-and-the-30m-pool)). For a speed-first profile without long contexts,
+drop `KV_SPLIT` and `KV_SPLIT_COMPACT` and set `POOL_TOKENS=1400000`.
 
 `PIECE_RUNS`, `REPLAY_RUNS` and `JOIN_DRAFTS` batch several slots' prompt work into one run. They need
 `PREFILL_PIECES=1`, replay mode and the multi-segment AOT programs `aot-needs` lists under them.
