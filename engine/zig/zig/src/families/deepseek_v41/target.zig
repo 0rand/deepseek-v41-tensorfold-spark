@@ -187,7 +187,7 @@ pub const GpuTarget = struct {
         t.f.prefill_state.taps_rows = 0;
         const ss = t.sessions orelse return .{};
         if (planned) |a| {
-            const r = try ss.resumePlanned(ids.len, a.need, a.hit, a.spills);
+            const r = try ss.resumePlanned(ids, a.need, a.hit, a.spills);
             return .{ .at = r.at, .damaged = r.damaged };
         }
         const before = ss.stats.damaged;

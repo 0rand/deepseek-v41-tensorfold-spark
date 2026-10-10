@@ -150,8 +150,8 @@ pub const Serve = struct {
     }
 };
 
-/// Zig's dip below idle (TF_DSV41_SERVE_DIP_GIB unset): 2 x 1M measured 1.23 (rank 1) / 1.11 (rank 0), with a margin.
-pub const zig_dip_gib: f64 = 1.5;
+/// Zig's dip below idle (TF_DSV41_SERVE_DIP_GIB unset): 2 x 1M then 4 x 740K measured 2.48 (rank 1), 1.1 (rank 0).
+pub const zig_dip_gib: f64 = 3.0;
 
 /// Zig's terms before the pool: TF_DSV41_BOOT_GROWTH_GIB (unset 0: measured at boot's end), TF_DSV41_SERVE_DIP_GIB.
 pub fn zigFromEnv() !Serve {
@@ -491,20 +491,20 @@ test "the Zig check: measured at the end of boot, a measured rank 1 passes, a po
     const terms: Serve = .{ .growth = 0, .dip = zig_dip_gib };
     const pre = serveCheck(k, .{ .rank = 1, .avail_gib = 14.94, .terms = terms }, spl, 2, 3_000_000);
     try std.testing.expect(pre.ok);
-    // after the boot: MemAvailable 6.39 idle (TF_DSV41_BOOT_TRACE's end) - 1.5 dip = 4.89, over the 4.0 floor
-    const ok = afterBoot(14.94, pool, 6.39, zig_dip_gib, k.hard_gib, 3_000_000, per);
+    // after the boot: a measured rank 1 idle 8.70 - 3.0 dip = 5.70, over the 4.0 floor
+    const ok = afterBoot(14.94, pool, 8.70, zig_dip_gib, k.hard_gib, 3_000_000, per);
     try std.testing.expect(ok.ok);
-    try std.testing.expectApproxEqAbs(@as(f64, 14.94 - pool - 6.39), ok.growth, 1e-9);
-    try std.testing.expectApproxEqAbs(@as(f64, 4.89), ok.worst, 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 14.94 - pool - 8.70), ok.growth, 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 5.70), ok.worst, 1e-9);
     // the largest pool lands the worst point on the floor; 1 GiB more pool (1 GiB less idle) refuses
     const more = @as(u64, @intFromFloat(GiB / per));
     try std.testing.expect(ok.largest > 3_000_000);
     const edge = ok.largest - 3_000_000;
-    const over = afterBoot(14.94, pool + (@as(f64, @floatFromInt(edge)) * per / GiB) + 1.0, 6.39 - (@as(f64, @floatFromInt(edge)) * per / GiB) - 1.0, zig_dip_gib, k.hard_gib, ok.largest + more, per);
+    const over = afterBoot(14.94, pool + (@as(f64, @floatFromInt(edge)) * per / GiB) + 1.0, 8.70 - (@as(f64, @floatFromInt(edge)) * per / GiB) - 1.0, zig_dip_gib, k.hard_gib, ok.largest + more, per);
     try std.testing.expect(!over.ok);
     try std.testing.expectApproxEqAbs(@as(f64, 3.0), over.worst, 1e-6); // the floor less the GiB
     try std.testing.expect(over.largest < ok.largest + more);
-    // the earlier dip of 2.5 on this idle would refuse: the knob means Zig's dip below idle now
-    try std.testing.expect(!afterBoot(14.94, pool, 6.39, 2.5, k.hard_gib, 3_000_000, per).ok);
+    // an idle before the memory trims (6.39) refuses at the measured dip: 2.48 would have left 3.91
+    try std.testing.expect(!afterBoot(14.94, pool, 6.39, zig_dip_gib, k.hard_gib, 3_000_000, per).ok);
     try std.testing.expectEqual(Serve{ .growth = 0, .dip = zig_dip_gib }, try zigFromEnv());
 }

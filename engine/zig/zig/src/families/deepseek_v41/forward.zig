@@ -565,7 +565,8 @@ pub const Forward = struct {
         ptr: *anyopaque,
         commit: *const fn (ptr: *anyopaque, ids: []const u32) anyerror!void,
         save: *const fn (ptr: *anyopaque) anyerror!void,
-        restore: *const fn (ptr: *anyopaque, id: u32) anyerror!void,
+        /// `ids`: an NVMe entry's ids (the leader's prompt prefix: its tokens are not indexed)
+        restore: *const fn (ptr: *anyopaque, id: u32, ids: []const i64) anyerror!void,
         /// CED replay's prompt snapshot: an entry at the slot's position, the slot keeps going (sessions_gpu.zig)
         prompt: *const fn (ptr: *anyopaque) anyerror!void,
         /// the slot empty: its pages back, the committed ids cleared
@@ -644,6 +645,20 @@ pub const Forward = struct {
         if (f.sess) |x| return x.reset(x.ptr);
         if (f.kv) |k| try k.release();
         f.slot = .{};
+    }
+
+    /// Rank 0: a restore to the followers, with the entry's ids when it is not in RAM ([op, id, ids...]).
+    pub fn sendRestore(f: *Forward, id: u32, ids: ?[]const u32) !void {
+        if (!f.leads()) return;
+        const extra = if (ids) |x| x.len else 0;
+        const msg = try f.gpa.alloc(i64, 2 + extra);
+        defer f.gpa.free(msg);
+        msg[0] = op_sess_restore;
+        msg[1] = id;
+        if (ids) |x| for (x, msg[2..]) |t, *y| {
+            y.* = t;
+        };
+        try f.link.?.send(msg);
     }
 
     /// Rank 0: a session operation to the followers (before running it).
@@ -765,7 +780,8 @@ pub const Forward = struct {
                 },
                 op_sess_restore => {
                     const x = f.sess orelse return error.BadPlan;
-                    try x.restore(x.ptr, @intCast(msg[1]));
+                    if (msg.len < 2) return error.BadPlan;
+                    try x.restore(x.ptr, @intCast(msg[1]), msg[2..]);
                 },
                 op_sess_prompt => {
                     const x = f.sess orelse return error.BadPlan;
@@ -1347,7 +1363,6 @@ pub const Graphed = struct {
         return cs;
     }
 };
-
 
 /// M2a's peer: world 2, rank 0 alone on one GPU, the peer's half of every all-gather zeros (dsv41_m1_capture.py's
 /// ZeroPeer, the Python reference's). Only the all-gather the forward uses is implemented.
