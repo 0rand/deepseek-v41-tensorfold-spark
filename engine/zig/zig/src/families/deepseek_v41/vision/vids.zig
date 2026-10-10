@@ -43,6 +43,8 @@ pub const Registry = struct {
     order: std.ArrayList(u32) = .empty, // insertion order of ``owner`` (a ring once full)
     head: usize = 0,
     salts: std.AutoHashMapUnmanaged([32]u8, u32) = .empty,
+    /// ids dropped from ``owner`` since it was last rehashed
+    dead: u32 = 0,
 
     pub fn deinit(r: *Registry) void {
         r.owner.deinit(r.gpa);
@@ -81,12 +83,20 @@ pub const Registry = struct {
             if (r.order.items.len < r.cap) {
                 try r.order.append(r.gpa, v);
             } else {
-                _ = r.owner.remove(r.order.items[r.head]);
+                if (r.owner.remove(r.order.items[r.head])) r.dropped();
                 r.order.items[r.head] = v;
                 r.head = (r.head + 1) % r.cap;
             }
         }
         return out;
+    }
+
+    /// std's tombstones never clear and keys fill 80 %: rehash at a tenth, so a tenth of the map always stays free.
+    fn dropped(r: *Registry) void {
+        r.dead += 1;
+        if (@as(u64, r.dead) * 10 < r.owner.capacity()) return;
+        r.owner.rehash(std.hash_map.AutoContext(u32){});
+        r.dead = 0;
     }
 };
 
@@ -101,4 +111,20 @@ test "virtual ids are past the vocabulary, stable, and distinct per salt" {
     for (a) |v| try std.testing.expect(isVid(v));
     derive(&d, 1, &b);
     try std.testing.expect(!std.mem.eql(u32, &a, &b));
+}
+
+test "a full registry's id churn leaves its owner map free slots" {
+    const t = std.testing;
+    var r: Registry = .{ .gpa = t.allocator, .cap = 4096 };
+    defer r.deinit();
+    for (0..400) |i| {
+        // a new image's ids each evict the oldest once the ring is full
+        var digest: [32]u8 = @splat(0);
+        std.mem.writeInt(u64, digest[0..8], i, .little);
+        t.allocator.free(try r.vids(t.io, &digest, 64));
+        const meta = r.owner.metadata.?;
+        var free: usize = 0;
+        for (meta[0..r.owner.capacity()]) |x| free += @intFromBool(x.isFree());
+        try t.expect(free * 10 >= r.owner.capacity());
+    }
 }
