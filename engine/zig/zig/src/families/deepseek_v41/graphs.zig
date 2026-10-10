@@ -17,7 +17,7 @@
 //! (row mode) and comes with it. Knobs: TF_DSV41_GRAPHS (unset: on for M4's served model, model.zig; off for the gates'
 //! drivers; pods 17 / 22 showed graphed == eager, tokens and logits, R1 included),
 //! TF_DSV41_GRAPHS_MAX (48), TF_DSV41_GRAPH_BUCKET (2048), TF_DSV41_GRAPH_BUCKET_GROW (1.25),
-//! TF_DSV41_GRAPH_ROWS_MAX (64), TF_DSV41_GRAPH_FLOOR_GIB (5.0).
+//! TF_DSV41_GRAPH_ROWS_MAX (64), TF_DSV41_GRAPH_COST_MIB (64, `Room`), TF_DSV41_GRAPH_FLOOR_GIB (a fixed floor).
 
 const std = @import("std");
 const cuda = @import("cuda");
@@ -37,7 +37,7 @@ pub const Settings = struct {
     bucket: u32 = 2048,
     grow: f64 = 1.25,
     rows_max: u32 = 64,
-    floor_gib: f64 = 5.0,
+    room: Room = .{},
     /// TF_DSV41_GRAPH_FLOOR=hold (default `shed`): under the floor a miss runs eagerly, the held graphs stay
     /// (graph_cache.Settings.hold)
     floor_hold: bool = false,
@@ -55,7 +55,7 @@ pub const Settings = struct {
         if (std.c.getenv("TF_DSV41_GRAPH_BUCKET")) |v| s.bucket = try std.fmt.parseInt(u32, std.mem.span(v), 10);
         if (std.c.getenv("TF_DSV41_GRAPH_BUCKET_GROW")) |v| s.grow = try std.fmt.parseFloat(f64, std.mem.span(v));
         if (std.c.getenv("TF_DSV41_GRAPH_ROWS_MAX")) |v| s.rows_max = try std.fmt.parseInt(u32, std.mem.span(v), 10);
-        if (std.c.getenv("TF_DSV41_GRAPH_FLOOR_GIB")) |v| s.floor_gib = try std.fmt.parseFloat(f64, std.mem.span(v));
+        s.room = try Room.fromEnv();
         if (std.c.getenv("TF_DSV41_GRAPH_FLOOR")) |v| {
             const m = std.mem.span(v);
             if (std.mem.eql(u8, m, "hold")) s.floor_hold = true else if (!(m.len == 0 or std.mem.eql(u8, m, "shed"))) return error.BadGraphFloor;
@@ -109,15 +109,53 @@ pub fn audit(cs: []const calls.Call) ?[]const u8 {
     return null;
 }
 
-/// MemAvailable >= the floor (true where /proc/meminfo cannot be read): the cache's `room`.
-pub fn roomAbove(floor_gib: f64) bool {
-    var buf: [4096]u8 = undefined;
-    const fd = std.c.open("/proc/meminfo", .{ .ACCMODE = .RDONLY });
-    if (fd < 0) return true;
-    defer _ = std.c.close(fd);
-    const n = std.c.read(fd, &buf, buf.len);
-    if (n <= 0) return true;
-    return memAvailableAbove(buf[0..@intCast(n)], floor_gib);
+/// One more graph fits when its price leaves the hard floor and a 2K segment's floor: Python's 5 GiB kept ~1 GiB.
+pub const Room = struct {
+    /// TF_DSV41_GRAPH_FLOOR_GIB set: MemAvailable at least this instead
+    floor_gib: ?f64 = null,
+    /// TF_DSV41_GRAPH_COST_MIB: a capture's price
+    cost_gib: f64 = 64.0 / 1024.0,
+    /// max(TF_DSV41_FLOOR_HARD_GIB, TF_DSV41_PF_WS_FLOOR_GIB + a 2K segment's host transient)
+    keep_gib: f64 = 4.0,
+
+    /// a 2K segment's own run-time memory: its buffers are the boot plan's, so only Engram's bulk-read batches
+    pub const prefill_2k_gib: f64 = 64.0 / 1024.0;
+
+    pub fn fromEnv() !Room {
+        var r: Room = .{};
+        if (std.c.getenv("TF_DSV41_GRAPH_FLOOR_GIB")) |v| r.floor_gib = try std.fmt.parseFloat(f64, std.mem.span(v));
+        if (std.c.getenv("TF_DSV41_GRAPH_COST_MIB")) |v| r.cost_gib = try std.fmt.parseFloat(f64, std.mem.span(v)) / 1024.0;
+        const hard = gib("TF_DSV41_FLOOR_HARD_GIB", 4.0);
+        r.keep_gib = @max(hard, gib("TF_DSV41_PF_WS_FLOOR_GIB", hard) + prefill_2k_gib);
+        return r;
+    }
+
+    pub fn fits(r: Room, avail_gib: f64) bool {
+        if (r.floor_gib) |f| return avail_gib >= f;
+        return avail_gib - r.cost_gib >= r.keep_gib;
+    }
+};
+
+fn gib(name: [*:0]const u8, default: f64) f64 {
+    const v = std.c.getenv(name) orelse return default;
+    return std.fmt.parseFloat(f64, std.mem.span(v)) catch default;
+}
+
+/// The rule every graph cache asks (`room`): set once from the environment by the first cache made.
+pub var rule: ?Room = null;
+
+/// This rank's room for one more graph (true where /proc/meminfo cannot be read).
+pub fn room() bool {
+    const r = rule orelse blk: {
+        rule = Room.fromEnv() catch Room{};
+        break :blk rule.?;
+    };
+    return r.fits(memAvailableGiB() orelse return true);
+}
+
+/// MemAvailable now, in GiB, for a capture's measured cost (null: unknown).
+pub fn meter() ?f64 {
+    return memAvailableGiB();
 }
 
 /// MemAvailable in GiB (null where /proc/meminfo cannot be read): the prefill's handoff log.
@@ -140,17 +178,6 @@ fn memAvailableOf(text: []const u8) ?f64 {
         return @as(f64, @floatFromInt(kb)) / (1 << 20);
     }
     return null;
-}
-
-fn memAvailableAbove(text: []const u8, floor_gib: f64) bool {
-    var it = std.mem.splitScalar(u8, text, '\n');
-    while (it.next()) |line| {
-        if (!std.mem.startsWith(u8, line, "MemAvailable:")) continue;
-        var f = std.mem.tokenizeScalar(u8, line["MemAvailable:".len..], ' ');
-        const kb = std.fmt.parseInt(u64, f.next() orelse return true, 10) catch return true;
-        return @as(f64, @floatFromInt(kb)) * 1024.0 >= floor_gib * (1 << 30);
-    }
-    return true;
 }
 
 /// Every rank's verdict over the Collective: one i32 a rank all-gathered (every backend has the gather), on a stream
@@ -329,8 +356,62 @@ test "graphs: MemAvailable in GiB" {
     try std.testing.expectEqual(@as(?f64, null), memAvailableOf("MemTotal: 1 kB\n"));
 }
 
-test "graphs: MemAvailable floor" {
-    try std.testing.expect(memAvailableAbove("MemTotal: 1 kB\nMemAvailable:   6291456 kB\n", 5.0));
-    try std.testing.expect(!memAvailableAbove("MemAvailable:   4194304 kB\n", 5.0));
-    try std.testing.expect(memAvailableAbove("nothing here\n", 5.0));
+test "graphs: one more graph fits when its price leaves the hard floor and a 2K segment's floor and transient" {
+    // the serving profile: TF_DSV41_FLOOR_HARD_GIB 4, TF_DSV41_PF_WS_FLOOR_GIB 3.5 -> keep max(4, 3.5 + 1/16) = 4
+    const profile: Room = .{ .keep_gib = @max(4.0, 3.5 + Room.prefill_2k_gib) };
+    try std.testing.expect(profile.fits(4.66)); // a rank after traffic
+    try std.testing.expect(!profile.fits(4.03));
+    // a prefill floor above the hard floor raises what graphs must leave
+    const high: Room = .{ .keep_gib = @max(4.0, 4.5 + Room.prefill_2k_gib) };
+    try std.testing.expect(high.fits(4.66) and !high.fits(4.6));
+    // TF_DSV41_GRAPH_FLOOR_GIB: the fixed floor of before
+    const fixed: Room = .{ .floor_gib = 5.0 };
+    try std.testing.expect(!fixed.fits(4.66) and fixed.fits(5.1));
+}
+
+/// A test rank's MemAvailable (GiB): what `testRoom` and `testMeter` read; a capture takes `cost` of it.
+var test_avail: f64 = 0;
+
+fn testRoom() bool {
+    const r: Room = .{ .keep_gib = @max(4.0, 3.5 + Room.prefill_2k_gib) };
+    return r.fits(test_avail);
+}
+
+fn testMeter() ?f64 {
+    return test_avail;
+}
+
+const TestEngine = struct {
+    slot: u8 = 0,
+    fn engine(e: *TestEngine) gc.Engine {
+        return .{ .ctx = e, .capture = capture, .launch = launch, .free = free };
+    }
+    fn capture(ctx: *anyopaque, _: cuda.Stream, _: gc.Body) anyerror!*anyopaque {
+        test_avail -= 15.0 / 1024.0; // a graph's driver memory (graphs.py: ~15 MiB)
+        return &@as(*TestEngine, @ptrCast(@alignCast(ctx))).slot;
+    }
+    fn launch(_: *anyopaque, _: *anyopaque, _: cuda.Stream) anyerror!void {}
+    fn free(_: *anyopaque, _: *anyopaque) void {}
+};
+
+fn noBody(_: *anyopaque, _: cuda.Stream) anyerror!void {}
+
+test "graphs: rank 1 at 4.66 GiB captures, at 4.03 defers (eager, held graphs replay), and captures again once back" {
+    var e: TestEngine = .{};
+    var c = gc.Cache(u32).init(std.testing.allocator, e.engine(), .{ .max = 48, .hold = true });
+    defer c.deinit();
+    c.room = testRoom;
+    c.meter = testMeter;
+    const body: gc.Body = .{ .ctx = &e, .run = noBody };
+    const stream: cuda.Stream = .{ .d = undefined, .handle = null };
+    test_avail = 4.66;
+    try std.testing.expectEqual(gc.Outcome.captured, try c.run(1, stream, 7, body));
+    try std.testing.expectApproxEqAbs(@as(f64, 15), c.stats.capture_mib, 0.01);
+    test_avail = 4.03;
+    try std.testing.expectEqual(gc.Outcome.eager, try c.run(2, stream, 7, body));
+    try std.testing.expectEqual(gc.Outcome.replayed, try c.run(1, stream, 7, body));
+    try std.testing.expectEqual(@as(u64, 1), c.stats.eager);
+    test_avail = 4.66;
+    try std.testing.expectEqual(gc.Outcome.captured, try c.run(2, stream, 7, body));
+    try std.testing.expectEqual(@as(usize, 2), c.count());
 }

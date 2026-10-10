@@ -90,6 +90,7 @@ pub const LaneHost = struct {
     lone_job: ?*Job = null, // the job that driver holds now
     cache: ?*pc.Store = null, // kept prompt states (engine thread only); the backend restores and saves them
     memory: ?api.MemorySource = null, // the backend's memory counts; null: Engine.memory reports none
+    graphs: ?api.GraphsSource = null, // the backend's graph caches for /health; null: none
     explain: ?api.Explain = null, // the backend's words for a request it refuses; null: the error's name
     /// Runs first on the engine thread: a backend whose API state is per thread (a CUDA context) binds it there.
     on_thread: ?ThreadInit = null,
@@ -247,6 +248,7 @@ pub const LaneHost = struct {
             .oldest_queued_s = if (h.queued.items.len > 0) seconds(now - oldestQueued(h)) else 0,
             .pace = paceStatus(&h.pace, now),
         };
+        if (h.graphs) |g| out.graph_caches = @intCast(g.read(g.ctx, &out.graphs));
     }
 
     fn oldestQueued(h: *const LaneHost) i96 {

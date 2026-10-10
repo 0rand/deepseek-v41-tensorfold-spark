@@ -10,10 +10,24 @@ const Conn = @import("http_conn.zig").Conn;
 const Value = json.Value;
 const Allocator = std.mem.Allocator;
 
-/// /health's queue and round pace: what a stuck engine shows before it is called stalled.
+/// /health's queue, graph caches and round pace: what a stuck engine shows before it is called stalled.
 fn queueFields(a: Allocator, o: *json.Object, st: api.Status) Allocator.Error!void {
     try o.put(a, "queued", try json.intValue(a, st.waiting));
     try o.put(a, "oldest_queued_s", .{ .float = spark.round(st.oldest_queued_s, 1) });
+    if (st.graph_caches > 0) {
+        const g = try json.newObject(a);
+        for (st.graphs[0..st.graph_caches]) |c| {
+            const y = try json.newObject(a);
+            try y.put(a, "held", try json.intValue(a, c.held));
+            try y.put(a, "captured", try json.intValue(a, c.captured));
+            try y.put(a, "replayed", try json.intValue(a, c.replayed));
+            try y.put(a, "eager", try json.intValue(a, c.eager));
+            try y.put(a, "floor_hits", try json.intValue(a, c.floor_hits));
+            try y.put(a, "under_floor", .{ .bool = c.under_floor });
+            try g.put(a, c.name, .{ .object = y });
+        }
+        try o.put(a, "graphs", .{ .object = g });
+    }
     const p = st.pace orelse return;
     const x = try json.newObject(a);
     try x.put(a, "last_age_s", if (p.last_round_age_s) |v| .{ .float = spark.round(v, 1) } else .null);
@@ -168,4 +182,25 @@ test "stats snapshot exposes counters and omits unknown memory" {
     for ([_][]const u8{ "running", "waiting", "generation_tokens_running", "prompt_tokens_total", "generation_tokens_total", "mtp_drafted_total", "mtp_accepted_total", "decode_rounds_total", "memory" }) |key|
         try std.testing.expect(object.contains(key));
     try std.testing.expectEqual(@as(usize, 0), object.get("memory").?.object.count());
+}
+
+test "health: each graph cache's counts and floor state, by name" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var st: api.Status = .{ .graph_caches = 2 };
+    st.graphs[0] = .{ .name = "decode windows", .held = 40, .captured = 41, .replayed = 9000, .eager = 3, .floor_hits = 3, .under_floor = true };
+    st.graphs[1] = .{ .name = "row graphs", .held = 12, .captured = 12, .replayed = 800 };
+    const o = try json.newObject(a);
+    try queueFields(a, o, st);
+    const g = o.get("graphs").?.object;
+    const d = g.get("decode windows").?.object;
+    try std.testing.expectEqual(@as(?i64, 40), d.get("held").?.int64());
+    try std.testing.expectEqual(@as(?i64, 3), d.get("eager").?.int64());
+    try std.testing.expect(d.get("under_floor").?.bool);
+    try std.testing.expect(!g.get("row graphs").?.object.get("under_floor").?.bool);
+    // an engine without graph caches shows none
+    const none = try json.newObject(a);
+    try queueFields(a, none, .{});
+    try std.testing.expect(!none.contains("graphs"));
 }

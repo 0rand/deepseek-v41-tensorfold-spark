@@ -148,6 +148,8 @@ pub const Served = struct {
         s.host.on_thread = .{ .ctx = m, .run = bindContext };
         // /metrics' device memory: the bytes this rank holds in cuda.DeviceBuffers (weights, KV pool, staging), its peak
         s.host.memory = .{ .read = readMemory };
+        // /health's "graphs": each graph cache's held graphs, captures, replays, eager steps and floor state
+        s.host.graphs = .{ .read = readGraphs };
         // TF_DSV41_PREFILL_PIECES=1: prod's batcher plans the rounds (queued admissions, prompts in pieces between
         // decode rounds); the served shape only (own prefill, the verify tail), every rank with the same setting
         s.sched = null;
@@ -189,6 +191,14 @@ pub const Served = struct {
     fn readMemory(_: ?*anyopaque, reset_peak: bool) ?api.Memory {
         const u = @import("cuda").usage(reset_peak);
         return .{ .active = u.device, .cache = 0, .peak = u.peak };
+    }
+
+    fn readGraphs(_: ?*anyopaque, out: []api.GraphStatus) usize {
+        const gc = @import("cuda").graph_cache;
+        var snaps: [4]gc.Snapshot = undefined;
+        const n = gc.snapshots(snaps[0..@min(out.len, snaps.len)]);
+        for (snaps[0..n], out[0..n]) |x, *o| o.* = .{ .name = x.name, .held = x.held, .captured = x.captured, .replayed = x.replayed, .eager = x.eager, .floor_hits = x.floor_hits, .under_floor = x.under };
+        return n;
     }
 
     fn bindContext(ctx: *anyopaque) anyerror!void {

@@ -174,6 +174,25 @@ pub const MemorySource = struct {
     read: *const fn (ctx: ?*anyopaque, reset_peak: bool) ?Memory,
 };
 
+/// One graph cache's counts for /health (a backend's keyed CUDA graphs).
+pub const GraphStatus = struct {
+    name: []const u8 = "",
+    held: u32 = 0,
+    captured: u64 = 0,
+    replayed: u64 = 0,
+    eager: u64 = 0,
+    floor_hits: u64 = 0,
+    /// a new key last met no room on some rank (it ran eager); false again once a capture had room
+    under_floor: bool = false,
+};
+
+/// A backend's graph caches for LaneHost; read from HTTP threads, so it must not touch the GPU.
+pub const GraphsSource = struct {
+    ctx: ?*anyopaque = null,
+    /// fills `out` and returns how many it filled
+    read: *const fn (ctx: ?*anyopaque, out: []GraphStatus) usize,
+};
+
 pub const Status = struct {
     /// Requests in prefill or decode, and those waiting for a lane.
     running: u32 = 0,
@@ -191,6 +210,9 @@ pub const Status = struct {
     oldest_queued_s: f64 = 0,
     /// The round pace against its own baseline (core/pace.zig); null: the engine keeps none.
     pace: ?PaceStatus = null,
+    /// The backend's graph caches, the first `graph_caches` of them (0: it keeps none).
+    graphs: [4]GraphStatus = @splat(.{}),
+    graph_caches: u8 = 0,
 };
 
 pub const PaceStatus = struct {

@@ -113,8 +113,9 @@ pub const Dev = struct {
         const hold = if (std.c.getenv("TF_DSV41_GRAPH_FLOOR")) |v| std.mem.eql(u8, std.mem.span(v), "hold") else false;
         x.cache = graphs.gc.Cache(u32).init(gpa, x.engine.engine(), .{ .on = true, .max = max, .min_keep = 2, .hold = hold });
         x.cache.agree = x.agreement.agree();
-        x.cache.room = roomFn;
-        if (std.c.getenv("TF_DSV41_GRAPH_FLOOR_GIB")) |v| floor_gib = std.fmt.parseFloat(f64, std.mem.span(v)) catch 5.0;
+        x.cache.room = graphs.room;
+        x.cache.meter = graphs.meter;
+        x.cache.name = "draft passes";
         std.log.scoped(.dsv41).info("draft graphs: {t} (candidates on the device, the first {d} passes checked against the host's)", .{ want, check_passes });
         return x;
     }
@@ -464,10 +465,6 @@ pub const Chain = struct {
     }
 };
 
-var floor_gib: f64 = 5.0;
-fn roomFn() bool {
-    return graphs.roomAbove(floor_gib);
-}
 
 /// The fingerprint of a pass: the runner's owned buffers, its scratch, the pass's own and `extra`.
 pub fn fingerprint(r: *const run.Runner, x: *const Dev, extra: []const u64) u64 {

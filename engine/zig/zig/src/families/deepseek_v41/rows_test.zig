@@ -551,3 +551,7 @@ test "TF_DSV41_ROUND_GRAPH=split on the served row window: head + tail = the win
         try testing.expectEqual(@as(?usize, null), round_graph.splitAt(rows, 40));
     };
 }
+
+test {
+    _ = graphs; // graphs.zig's own tests (the room rule, the bucket ends)
+}

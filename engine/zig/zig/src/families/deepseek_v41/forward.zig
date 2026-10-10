@@ -1296,8 +1296,10 @@ pub const Graphed = struct {
         // `split`: a window's head and tail graphs in one cache of twice the cap (a head is ~1/43 of a window)
         g.cache = graphs.Cache.init(f.gpa, g.engine.engine(), .{ .on = true, .max = if (rg.split) 2 * s.max else s.max, .hold = s.floor_hold });
         g.cache.agree = g.agreement.agree();
-        g.cache.room = roomFn;
-        room_floor = s.floor_gib;
+        g.cache.room = graphs.room;
+        g.cache.meter = graphs.meter;
+        g.cache.name = "decode windows";
+        graphs.rule = s.room;
         // every buffer a graph bakes in, at the largest window: the exchanges' send, Engram's gathered rows
         const D: usize = f.cfg.hidden;
         const W: usize = f.comm.world();
@@ -1346,10 +1348,6 @@ pub const Graphed = struct {
     }
 };
 
-var room_floor: f64 = 5.0;
-fn roomFn() bool {
-    return graphs.roomAbove(room_floor);
-}
 
 /// M2a's peer: world 2, rank 0 alone on one GPU, the peer's half of every all-gather zeros (dsv41_m1_capture.py's
 /// ZeroPeer, the Python reference's). Only the all-gather the forward uses is implemented.
