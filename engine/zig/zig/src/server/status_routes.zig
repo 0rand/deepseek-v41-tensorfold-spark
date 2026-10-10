@@ -10,6 +10,22 @@ const Conn = @import("http_conn.zig").Conn;
 const Value = json.Value;
 const Allocator = std.mem.Allocator;
 
+/// /health's queue and round pace: what a stuck engine shows before it is called stalled.
+fn queueFields(a: Allocator, o: *json.Object, st: api.Status) Allocator.Error!void {
+    try o.put(a, "queued", try json.intValue(a, st.waiting));
+    try o.put(a, "oldest_queued_s", .{ .float = spark.round(st.oldest_queued_s, 1) });
+    const p = st.pace orelse return;
+    const x = try json.newObject(a);
+    try x.put(a, "last_age_s", if (p.last_round_age_s) |v| .{ .float = spark.round(v, 1) } else .null);
+    try x.put(a, "last_s", .{ .float = spark.round(p.last_round_s, 3) });
+    try x.put(a, "decode_s", .{ .float = spark.round(p.decode_s, 4) });
+    try x.put(a, "decode_base_s", .{ .float = spark.round(p.decode_base_s, 4) });
+    try x.put(a, "prefill_rows_s", .{ .float = spark.round(p.prefill_rows_s, 1) });
+    try x.put(a, "prefill_base_rows_s", .{ .float = spark.round(p.prefill_base_rows_s, 1) });
+    try x.put(a, "slow_s", .{ .float = spark.round(p.slow_s, 1) });
+    try o.put(a, "rounds", .{ .object = x });
+}
+
 /// With keys on, health names nothing about the model.
 pub fn health(srv: *Server, conn: *Conn, a: Allocator) !void {
     // draining: the engine is not asked, it may be stopping
@@ -17,14 +33,25 @@ pub fn health(srv: *Server, conn: *Conn, a: Allocator) !void {
     if (srv.health) |h| {
         // the Spark surface: ok / fatal / stalled and the live totals (503 in strict mode once the engine failed)
         var streams: ?spark.Streams = null;
+        var st: api.Status = .{};
         if (!drain) {
-            var st: api.Status = .{};
             srv.engine.status(&st, &.{});
             const lanes = srv.info.lanes;
             if (lanes > 1) streams = .{ .decoding = st.running -| st.waiting, .prefilling = st.waiting, .max = lanes };
         }
         const r = try h.status(a, streams, srv.info.context_window);
-        if (!drain) return routes.sendValue(conn, a, r.code, r.body);
+        if (!drain) {
+            try queueFields(a, r.body.object, st);
+            const inflight = if (r.body.object.get("inflight")) |v| @as(usize, @intCast(v.int64() orelse 0)) else 0;
+            if (try h.stuck(a, st, inflight)) |why| {
+                // the watchdog's restart signal: the engine is stuck, not merely busy
+                try r.body.object.put(a, "ok", .{ .bool = false });
+                try r.body.object.put(a, "status", .{ .string = "stalled" });
+                try r.body.object.put(a, "stall_reason", .{ .string = why });
+                return routes.sendValue(conn, a, 503, r.body);
+            }
+            return routes.sendValue(conn, a, r.code, r.body);
+        }
         try r.body.object.put(a, "ok", .{ .bool = false });
         try r.body.object.put(a, "status", .{ .string = "draining" });
         try r.body.object.put(a, "requests_in_progress", try json.intValue(a, srv.generating.load(.seq_cst)));

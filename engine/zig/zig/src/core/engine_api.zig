@@ -187,6 +187,24 @@ pub const Status = struct {
     streams: usize = 0,
     /// Generated tokens held by live streams, excluding their prompts.
     generation_tokens: u64 = 0,
+    /// The oldest queued request's wait in seconds (0: none queued).
+    oldest_queued_s: f64 = 0,
+    /// The round pace against its own baseline (core/pace.zig); null: the engine keeps none.
+    pace: ?PaceStatus = null,
+};
+
+pub const PaceStatus = struct {
+    /// seconds since the last round ended (null: none yet) and its length
+    last_round_age_s: ?f64 = null,
+    last_round_s: f64 = 0,
+    /// decode round seconds, quick average and baseline (0: not enough rounds yet)
+    decode_s: f64 = 0,
+    decode_base_s: f64 = 0,
+    /// prompt rows a second, quick average and baseline (0: not enough pieces yet)
+    prefill_rows_s: f64 = 0,
+    prefill_base_rows_s: f64 = 0,
+    /// how long the pace has been past its limits (0: it is not)
+    slow_s: f64 = 0,
 };
 
 pub const SubmitError = error{ Closed, Busy };
