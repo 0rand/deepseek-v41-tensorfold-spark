@@ -3,11 +3,40 @@
 This is a sanitized source snapshot based on TensorFold 1.0.2, upstream revision
 `f8fe17d24629aedabf90bbf78279dd776e6d62e7`, from
 [ashhart/TensorFold](https://github.com/ashhart/TensorFold). The DeepSeek-V4.1 source snapshot revision is
-`8e96f99cc27743bb80f4827ea78b30481e3b4bcc`, the engine source of the current serving kit: the previous snapshot's
-engine plus the serving fixes `71fbcd316f840f353bd0898edf0cf8424ec52a02`, `3d88039d9105eabf12677d3c82e00a5f6ec6e366`,
-`4bb2c952c7ab5e4038a2c58041c4d457ef6bf9b8` with its test `5dbd1a0bbfaa8ab5045f60e9701e0b3d222dd38b`,
-`db7a5559dad5def07291ed2229bd1f75117f329d` and `8e96f99cc27743bb80f4827ea78b30481e3b4bcc`. The previous snapshot was
-`55c96c65bf97b8c30455f171e01aec8c59544aeb`; the one before it `0d723a8275f5b7879a083e8042a7048242ee624c`.
+`74ace4be5cc46f2f7444011433c6fad53ea679a6`, the engine source of the current serving kit. The previous snapshot was
+`8e96f99cc27743bb80f4827ea78b30481e3b4bcc`; before it `55c96c65bf97b8c30455f171e01aec8c59544aeb` and
+`0d723a8275f5b7879a083e8042a7048242ee624c`.
+
+## Changes since 8e96f99c
+
+Every new engine path below is default-off unless noted; `config/prod-zig.env.example` opts into the ones the
+serving profile uses.
+
+- **Split KV:** a row window exchanges dense at any row count; row mode runs with split KV; a prefill's union of
+  selected rows is planned without a sort (a row bitmap and an index map), and its selection and uploads go through
+  pinned staging; a prefill workspace past the worst point is a warning, not a refusal.
+- **Memory:** under CED replay (`TF_DSV41_PREFILL=replay`) the prefill programs are planned without the head they never
+  run, so `w.logits` is no longer sized for 2,048 prefill rows (505 MiB a rank planned); rope.bin's host copy is freed
+  once its tables are uploaded; `TF_DSV41_FORMS_INPLACE` writes the dense forms over their trellis instead of beside it;
+  `TF_DSV41_BOOT_TRACE` logs each boot step's memory. The KV boot check uses the engine's own figures, measured at the
+  end of boot, with a default serving dip of 3.0 GiB (`TF_DSV41_SERVE_DIP_GIB`).
+- **Graph caches:** a capture is priced instead of held to a fixed 5 GiB floor; the memory floor's transitions are
+  logged and `/health` shows each cache's held, captured, replayed and eager counts.
+- **Serving:** `/health` reports the engine's round pace and queue and answers 503 `stalled` when rounds stop; a
+  drain's in-stream error carries the 503's code and type; admission waits and long prefills' progress are logged;
+  a prompt whose client leaves mid-prefill is kept for its retry.
+- **Sessions:** a session resumed from the NVMe tier takes its token history from the prompt instead of the RAM index,
+  which no longer holds it; a restore that fails on any rank is an agreed cache miss on every rank (the entry dropped,
+  the prompt prefilled from 0) instead of an error that stopped the server. Transport, device and memory errors still
+  stop it.
+- **Hash maps:** the Engram row cache, the CUDA arena's address maps, the vision id registry and the session page map
+  are rehashed before removal markers fill them (always on).
+- **Images:** the vision attention's rescaled row sum and its first add are one FMA, as in FlashAttention-2; separate
+  multiply and add rounded twice and let the fp32 row sum drift by an ulp after a rescaled block.
+- **Kit tools:** `kit-fatbins` refuses a vision fatbin built from another `vision.cu`; `aot-needs` lists the image
+  segments' variants under `TF_DSV41_IMAGES=native`.
+- New host tests for the union plan, the boot check, the boot trace, in-place forms, the health pace, the rehashes, the
+  NVMe resume and the agreed restore miss; the hang-up and drain tests hold their request until their checks are done.
 
 ## Changes since 55c96c65
 
