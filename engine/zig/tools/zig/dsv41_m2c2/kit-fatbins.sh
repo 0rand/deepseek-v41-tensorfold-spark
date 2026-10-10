@@ -96,6 +96,16 @@ done
 cmp -s .chk/glue-kit.sass .chk/glue-tree.sass \
     || { echo "[kit-fatbins] dsv41_glue.fatbin's sm_121 SASS differs from this tree's glue.cu (diff .chk/glue-*.sass)" >&2; exit 5; }
 echo "dsv41_glue.fatbin: $n kernels of glue.cu, sm_121 SASS == a fresh compile of the tree's glue.cu" > .chk/glue
+# dsv41_vision.fatbin: SASS equal to this tree's vision.cu (cuda.zig's flags, fmad on as torch's)
+V=/tree/zig/kernels/cuda/deepseek_v41_vision/vision.cu
+nvcc -fatbin -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ \
+    -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr -std=c++20 -O3 \
+    -gencode=arch=compute_121,code=sm_121 -o .chk/vision.fatbin "$V"
+cuobjdump -sass -arch sm_121 dsv41_vision.fatbin > .chk/vision-kit.sass
+cuobjdump -sass -arch sm_121 .chk/vision.fatbin > .chk/vision-tree.sass
+cmp -s .chk/vision-kit.sass .chk/vision-tree.sass \
+    || { echo "[kit-fatbins] dsv41_vision.fatbin's sm_121 SASS differs from this tree's vision.cu (diff .chk/vision-*.sass)" >&2; exit 5; }
+echo "dsv41_vision.fatbin: sm_121 SASS == a fresh compile of the tree's vision.cu" > .chk/vision
 EOF
 {
     echo "# tensorfold-zig-dsv41 kit fatbins (tools/zig/dsv41_m2c2/kit-fatbins.sh)"
@@ -104,6 +114,7 @@ EOF
     echo "nvcc $(cat "$OUT/.chk/nvcc") ($IMAGE)"
     echo "tp_mailbox.fatbin: $(cat "$OUT/.chk/tp" | tr '\n' ';' | sed 's/;$//')"
     cat "$OUT/.chk/glue"
+    cat "$OUT/.chk/vision"
     [[ -s "$OUT/.chk/fill" ]] && sed 's/^/built here, not in FATBINS: /' "$OUT/.chk/fill"
     (cd "$OUT" && sha256sum -- *.fatbin)
 } > "$OUT/FATBINS.txt"
