@@ -296,7 +296,8 @@ upstream TensorFold settings.
 | `TF_DSV41_THINKING` | 1 | `1` | Default thinking mode; requests can override |
 | `TF_DSV41_DEFAULT_EFFORT` | high | `high` | Default effort (high = 75) |
 | `TF_DSV41_SCHEMA_PROMPT` | 1 | `1` | Include response-format schema in the prompt |
-| `TF_DSV41_IMAGES` | placeholder | `placeholder` | Replace image parts with an omission notice; this profile does not serve native vision |
+| `TF_DSV41_IMAGES` | placeholder | `native` | Image input: DeepSeek's vision tower on rank 0 ([IMAGES](IMAGES.md#the-zig-serving-path)); `placeholder` turns each image into a notice, `reject` answers 400 |
+| `TF_DSV41_BIAS_VL` | unset: image rows route with the text bias | `/cache/dsv41-bias-vl` | Folder holding the release's `gate.bias_vl` tensors (`bias_vl.safetensors`), loaded on both ranks; boot fails if it names a folder without them |
 | `TF_DSV41_GRAMMAR` | 0 | `1` | Grammar-constrained structured output |
 | `TF_DSV41_TOOL_GRAMMAR` | 0 | `0` | Automatic tool-schema constraint; remains off |
 
