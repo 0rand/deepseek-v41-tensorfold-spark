@@ -10,6 +10,7 @@ pub const device = @import("device.zig");
 pub const DevicePool = device.DevicePool;
 pub const sess = @import("sess.zig");
 pub const sched = @import("sched.zig");
+pub const progress = @import("progress.zig");
 
 test {
     _ = layout;
@@ -20,4 +21,5 @@ test {
     _ = sess;
     _ = @import("sess4_test.zig");
     _ = sched;
+    _ = progress;
 }

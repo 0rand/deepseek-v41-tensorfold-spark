@@ -198,6 +198,12 @@ pub const GpuTarget = struct {
     fn piece(p: *anyopaque, slot: u32, ids: []const u32, start: u64, end: u64, save: bool) anyerror!void {
         const t = self_(p);
         try t.onSlot(slot);
+        if (start == end and save) {
+            // a leaving prompt's finished rows kept as they stand (the lane host: its client left mid-prompt)
+            if (t.f.slot.pos != start or start < ced.session_min or end + 1 > ids.len) return error.NotAChain;
+            if (t.sessions) |ss| _ = try ss.savePrompt();
+            return;
+        }
         if (t.f.slot.pos != start or start >= end or end + 1 > ids.len) return error.NotAChain;
         // the next round's piece of this prompt read ahead behind this one (Python's rounds._prefetch(ahead=
         // prefetch.next_pieces): the rows after it, as many as it holds, up to the prompt's last token)

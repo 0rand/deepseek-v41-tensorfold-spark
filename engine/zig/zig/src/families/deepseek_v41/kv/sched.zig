@@ -311,6 +311,8 @@ pub const Seq = struct {
     submitted: f64,
     /// prompt tokens in the slot's state (prefill progress)
     done: u64,
+    /// the tokens its saved prefix gave it at admission
+    cached: u64 = 0,
     /// the replay point still to snapshot at
     save_at: ?u64,
     decoding: bool = false,
@@ -462,7 +464,7 @@ pub const Planner = struct {
         r.longs += @intFromBool(long);
         if (price) |pr| r.owed += pr.total();
         r.admitted += 1;
-        try p.seqs.append(p.gpa, .{ .key = job.key, .n = job.n, .submitted = job.submitted, .done = cached, .save_at = p.savePoint(job.n, cached), .long = long, .price = price });
+        try p.seqs.append(p.gpa, .{ .key = job.key, .n = job.n, .submitted = job.submitted, .done = cached, .cached = cached, .save_at = p.savePoint(job.n, cached), .long = long, .price = price });
         return .{ .admit = .{ .need = pp.need, .hit = hit } };
     }
 
@@ -487,6 +489,16 @@ pub const Planner = struct {
         _ = p.mem_since.remove(job.key);
         p.counts.mem_refused += 1;
         return true;
+    }
+
+    /// A prompt whose client left: the grid point to keep its rows at for a retry, or null (nothing new, or saved).
+    pub fn leaving(p: *const Planner, key: usize) ?u64 {
+        for (p.seqs.items) |x| if (x.key == key) {
+            if (x.decoding or x.damaged or x.save_at == null) return null;
+            if (x.done % grid != 0 or x.done < p.s.session_min or x.done <= x.cached) return null;
+            return x.done;
+        };
+        return null;
     }
 
     /// The admitted request's entry failed to restore (a damaged NVMe file): this round's plan stands, its pieces do
@@ -620,6 +632,24 @@ test "a round whose last piece rounds up past the budget left ends the round (ba
     try std.testing.expectEqual(Piece{ .key = 1, .start = 0, .end = 2044, .save = false }, out.items[0]);
     try std.testing.expectEqual(Piece{ .key = 2, .start = 3, .end = 16, .save = false }, out.items[1]);
     try std.testing.expectEqualSlices(usize, &.{1}, finals.items);
+}
+
+test "a prompt that leaves mid-prefill is kept at its last grid point, if that is new and before its replay point" {
+    var p = Planner.init(std.testing.allocator, .{});
+    defer p.deinit();
+    try p.seqs.append(p.gpa, .{ .key = 1, .n = 9000, .submitted = 0, .done = 4096, .cached = 0, .save_at = snapshotPoint(9000) });
+    try p.seqs.append(p.gpa, .{ .key = 2, .n = 9000, .submitted = 0, .done = 4096, .cached = 4096, .save_at = snapshotPoint(9000) });
+    try p.seqs.append(p.gpa, .{ .key = 3, .n = 9000, .submitted = 0, .done = 4100, .cached = 0, .save_at = snapshotPoint(9000) });
+    try p.seqs.append(p.gpa, .{ .key = 4, .n = 9000, .submitted = 0, .done = 8992, .cached = 0, .save_at = null });
+    try p.seqs.append(p.gpa, .{ .key = 5, .n = 9000, .submitted = 0, .done = 48, .cached = 0, .save_at = snapshotPoint(9000) });
+    try p.seqs.append(p.gpa, .{ .key = 6, .n = 9000, .submitted = 0, .done = 4096, .cached = 0, .save_at = snapshotPoint(9000), .decoding = true });
+    try std.testing.expectEqual(@as(?u64, 4096), p.leaving(1));
+    try std.testing.expectEqual(@as(?u64, null), p.leaving(2)); // nothing past what it resumed from
+    try std.testing.expectEqual(@as(?u64, null), p.leaving(3)); // off the grid
+    try std.testing.expectEqual(@as(?u64, null), p.leaving(4)); // its replay point is saved already
+    try std.testing.expectEqual(@as(?u64, null), p.leaving(5)); // under session_min
+    try std.testing.expectEqual(@as(?u64, null), p.leaving(6)); // its prompt is in
+    try std.testing.expectEqual(@as(?u64, null), p.leaving(99));
 }
 
 test {

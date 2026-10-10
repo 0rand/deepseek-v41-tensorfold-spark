@@ -48,6 +48,8 @@ pub const Rounds = struct {
         left: *const fn (ctx: *anyopaque, key: usize) void,
         /// After the round: the pieces' seconds and the decode round's (finals included).
         after: *const fn (ctx: *anyopaque, piece_s: f64, decode_s: f64) void,
+        /// A request cancelled mid-prompt: the row its finished prefix is kept at (a save-only piece), or null.
+        leaving: ?*const fn (ctx: *anyopaque, key: usize) ?u64 = null,
     };
 };
 
@@ -351,6 +353,7 @@ pub const LaneHost = struct {
         dropped.deinit(h.gpa);
         for (ids) |id| {
             for (h.admitted.items, 0..) |job, i| if (job.id == id) {
+                if (job.started and !job.stream.finished) h.keepLeaving(job);
                 if (!job.stream.finished) h.core.discard(&job.stream);
                 h.lock();
                 _ = h.admitted.orderedRemove(i);
@@ -360,6 +363,14 @@ pub const LaneHost = struct {
             };
         }
         h.gpa.free(ids);
+    }
+
+    /// A request whose client left mid-prompt keeps its finished prefix as a session entry: the same prompt resumes.
+    fn keepLeaving(h: *LaneHost, job: *Job) void {
+        const rd = h.rounds orelse return;
+        const ask = rd.vtable.leaving orelse return;
+        const at = ask(rd.ctx, @intFromPtr(job)) orelse return;
+        h.core.piece(&job.stream, at, at, true) catch |e| std.log.warn("lane host: a leaving prompt's {d} rows were not kept ({t})", .{ at, e });
     }
 
     fn lock(h: *LaneHost) void {
@@ -978,5 +989,6 @@ test "a lane host serves the core's own tokens, in order, and cancels between ro
 
 test {
     _ = @import("lane_host_test.zig");
+    _ = @import("lane_host_resume_test.zig");
     _ = @import("pace.zig");
 }
