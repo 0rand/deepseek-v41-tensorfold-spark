@@ -113,6 +113,11 @@ pub fn errorBody(a: Allocator, cx: *const Cx, param: ?[]const u8) Allocator.Erro
     const o = try json.newObject(a);
     try o.put(a, "message", .{ .string = cx.message });
     if (cx.kind == .other or cx.kind == .server) return .{ .object = o };
+    if (cx.kind == .restarting) {
+        try o.put(a, "type", .{ .string = "server_error" });
+        try o.put(a, "code", .{ .string = "server_restarting" });
+        return .{ .object = o };
+    }
     try o.put(a, "type", .{ .string = "invalid_request_error" });
     if (cx.kind == .context_length) {
         try o.put(a, "param", if (param) |p| .{ .string = p } else .null);
@@ -305,6 +310,7 @@ fn sparkError(a: Allocator, cx: *const Cx, field: []const u8) Allocator.Error!Va
     return switch (cx.kind) {
         .context_length => spark.errorBody(a, cx.message, "invalid_request_error", "context_length_exceeded", field),
         .capacity, .server => spark.errorBody(a, cx.message, "server_error", null, null),
+        .restarting => spark.errorBody(a, cx.message, "server_error", "server_restarting", null),
         else => spark.errorBody(a, cx.message, "invalid_request_error", null, null),
     };
 }
@@ -420,7 +426,7 @@ const Run = struct {
         if (r.srv.config.wire == .spark) return r.out.vt.reply(r.out.ctx, if (cx.kind == .server) 500 else cx.status(), sparkError(a, cx, field) catch return);
         const kind_ok = cx.kind != .other and cx.kind != .server;
         const body = (if (kind_ok) errorBody(a, cx, field) else errorOther(a, cx.message)) catch return;
-        r.out.vt.reply(r.out.ctx, if (kind_ok) 400 else 500, wrapError(a, body) catch return);
+        r.out.vt.reply(r.out.ctx, if (cx.kind == .restarting) 503 else if (kind_ok) 400 else 500, wrapError(a, body) catch return);
     }
 
     /// A reply that ended before anything was sent: a refusal's 400, a failure's 500, nothing when the client left.

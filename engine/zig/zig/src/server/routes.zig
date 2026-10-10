@@ -82,7 +82,7 @@ pub var counted_hook: ?*const fn () void = null;
 
 /// Seconds a refused client is told to wait while the server drains for a restart (Retry-After).
 pub const retry_after_s = 30;
-pub const restarting = "server restarting: retry shortly";
+pub const restarting = @import("errors.zig").restarting;
 
 /// A request that arrives while a stop drains: 503, Retry-After, the API's own error shape; the connection closes.
 pub fn draining(conn: *Conn, anthropic_shape: bool) void {

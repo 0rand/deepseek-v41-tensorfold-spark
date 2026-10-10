@@ -685,7 +685,11 @@ const Generation = struct {
             .stop => "stop",
             .length => "length",
             .cancelled => "cancelled",
-            .failed => return cx.other(if (m.message.len > 0) try a.dupe(u8, m.message) else "the reply failed"),
+            .failed => {
+                // a drain's deadline ended it: the 503's code, not a failure's
+                if (g.srv.draining.load(.seq_cst) and std.mem.eql(u8, m.message, errors.restarting)) return cx.fail(.restarting, "{s}", .{errors.restarting});
+                return cx.other(if (m.message.len > 0) try a.dupe(u8, m.message) else "the reply failed");
+            },
         };
         var reason = reason_generic;
         var raw: []const u8 = "";

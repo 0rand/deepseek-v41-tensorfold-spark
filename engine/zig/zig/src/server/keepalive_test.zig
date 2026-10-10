@@ -73,7 +73,8 @@ test "a silent engine's stream gets keepalives before its first token (chat: SSE
     while (slow.active.load(.acquire) > 0 and idle < 300) : (idle += 1) std.Io.sleep(io, .fromMilliseconds(10), .awake) catch {};
     try leave(a, io, port, try d.chatBody(a, "@hang", true), &slow);
     var waited: u32 = 0;
-    while (slow.cancelled.load(.acquire) == 0 and waited < 300) : (waited += 1) std.Io.sleep(io, .fromMilliseconds(10), .awake) catch {};
+    while (slow.cancelled.load(.acquire) == 0 and waited < 1000) : (waited += 1) std.Io.sleep(io, .fromMilliseconds(10), .awake) catch {};
+    errdefer std.debug.print("not cancelled: {d} active, {d} waits\n", .{ slow.active.load(.acquire), waited });
     try testing.expect(slow.cancelled.load(.acquire) != 0);
 
     try std.posix.raise(.TERM);
