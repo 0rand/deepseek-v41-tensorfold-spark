@@ -196,74 +196,57 @@ pub const UnionIn = struct {
     cap: u64,
 };
 
-/// Plans a segment's union exchange: blocks of rows whose (W + 1) x M rows fit the cap; O(n log n) in the block's entries.
 /// Ranks a split exchange plans for (the session pool's bound: sessions.pool.max_world).
 pub const max_world = 8;
 
+/// Plans a segment's union exchange: blocks of rows whose (W + 1) x M rows fit the cap; O(entries + rows), no sort.
 pub fn planUnion(gpa: std.mem.Allocator, in: UnionIn, out: *std.ArrayList(Block)) !void {
     if (in.world < 1 or in.world > max_world or in.rank >= in.world) return error.BadWorld;
     const rows: u32 = @intCast(in.sel.len / in.k);
-    try planRange(gpa, in, 0, rows, out);
+    // a row's mark, then its index + 1 in its owner's list (every row a selection names is in the table's pages)
+    const seen = try gpa.alloc(u32, in.table.len << @intCast(in.psh));
+    defer gpa.free(seen);
+    try planRange(gpa, in, seen, 0, rows, out);
 }
 
-fn planRange(gpa: std.mem.Allocator, in: UnionIn, a: u32, b: u32, out: *std.ArrayList(Block)) !void {
+fn planRange(gpa: std.mem.Allocator, in: UnionIn, seen: []u32, a: u32, b: u32, out: *std.ArrayList(Block)) !void {
     const part = in.sel[@as(usize, a) * in.k .. @as(usize, b) * in.k];
-    var uniq: std.ArrayList(u32) = .empty;
-    defer uniq.deinit(gpa);
-    try uniq.ensureTotalCapacity(gpa, part.len);
-    for (part) |t| if (t >= 0) uniq.appendAssumeCapacity(@intCast(t));
-    std.mem.sort(u32, uniq.items, {}, std.sort.asc(u32));
-    var n: usize = 0;
-    for (uniq.items, 0..) |t, i| if (i == 0 or t != uniq.items[i - 1]) {
-        uniq.items[n] = t;
-        n += 1;
+    @memset(seen, 0);
+    for (part) |t| if (t >= 0) {
+        if (t >= seen.len) return error.RowOutsideTable;
+        seen[@intCast(t)] = 1;
     };
-    uniq.shrinkRetainingCapacity(n);
-    // stable partition by owner: each owner's rows stay sorted, so a row's index in its list is a binary search
+    // each owner's rows in ascending order (the sorted unique union, partitioned by owner): a row's index is a count
     var sizes: [max_world]u32 = @splat(0);
-    for (uniq.items) |t| sizes[ownerOf(t, in.psh, in.world)] += 1;
+    for (seen, 0..) |*x, t| if (x.* != 0) {
+        const r = ownerOf(@intCast(t), in.psh, in.world);
+        sizes[r] += 1;
+        x.* = sizes[r];
+    };
     var m: u32 = 1;
     for (sizes[0..in.world]) |sz| m = @max(m, sz);
     if (@as(u64, in.world + 1) * m * in.row_bytes > in.cap and b - a > 1) {
         const h = a + (b - a) / 2;
-        try planRange(gpa, in, a, h, out);
-        return planRange(gpa, in, h, b, out);
-    }
-    const lists = try gpa.alloc(u32, uniq.items.len);
-    defer gpa.free(lists);
-    var at: [max_world]u32 = undefined;
-    var acc: u32 = 0;
-    for (0..in.world) |r| {
-        at[r] = acc;
-        acc += sizes[r];
-    }
-    const starts = at;
-    for (uniq.items) |t| {
-        const r = ownerOf(t, in.psh, in.world);
-        lists[at[r]] = t;
-        at[r] += 1;
+        try planRange(gpa, in, seen, a, h, out);
+        return planRange(gpa, in, seen, h, b, out);
     }
     var blk: Block = .{ .a = a, .b = b, .m = m, .phys = try gpa.alloc(u32, m), .tokens = try gpa.alloc(i32, part.len) };
     errdefer blk.deinit(gpa);
+    @memset(blk.phys, 0); // padding: any stored row
     const mask = (@as(u32, 1) << @intCast(in.psh)) - 1;
-    const mine = lists[starts[in.rank]..][0..sizes[in.rank]];
-    for (blk.phys, 0..) |*p, i| p.* = if (i < mine.len) (in.table[mine[i] >> @intCast(in.psh)] << @intCast(in.psh)) | (mine[i] & mask) else 0; // padding: any stored row
+    for (seen, 0..) |x, t| if (x != 0 and ownerOf(@intCast(t), in.psh, in.world) == in.rank) {
+        const u: u32 = @intCast(t);
+        blk.phys[x - 1] = (in.table[u >> @intCast(in.psh)] << @intCast(in.psh)) | (u & mask);
+    };
     for (part, blk.tokens) |t, *o| {
         if (t < 0) {
             o.* = -1;
             continue;
         }
         const u: u32 = @intCast(t);
-        const r = ownerOf(u, in.psh, in.world);
-        const list = lists[starts[r]..][0..sizes[r]];
-        const idx = std.sort.binarySearch(u32, list, u, orderU32).?;
-        o.* = @intCast(r * m + idx);
+        o.* = @intCast(ownerOf(u, in.psh, in.world) * m + seen[u] - 1);
     }
     try out.append(gpa, blk);
-}
-
-fn orderU32(a: u32, b: u32) std.math.Order {
-    return std.math.order(a, b);
 }
 
 /// TF_DSV41_KV_SPLIT_COMPACT: off (0, dense), on (1: packed where every rank's transport takes device lengths and the shard fits), force

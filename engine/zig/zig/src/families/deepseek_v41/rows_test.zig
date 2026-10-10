@@ -256,6 +256,19 @@ test "row mode: split KV's dense exchange reads the stacked split table; a union
     try testing.expect(n.dense > 0);
     const big = try block.emit(a, &cfg, &w, o, &backbone, 24, 2040, true);
     try testing.expectError(error.UnionInRows, rowmode.transform(a, big, 24, .{ .slots = S, .rmax = 64, .pts = pts }));
+    // a row window past 16 rows (4 slots' verify windows, TF_DSV41_ROWS_CAP 64) exchanges dense
+    var ro = o;
+    ro.rows = true;
+    for ([_]u32{ 17, 24, 64 }) |R| {
+        const wide = try block.emit(a, &cfg, &w, ro, &backbone, R, 2040, true);
+        const wrows = try rowmode.transform(a, wide, R, .{ .slots = S, .rmax = 64, .pts = pts });
+        var dense: usize = 0;
+        for (wrows) |c| {
+            try testing.expect(!std.mem.eql(u8, c.name, "glue.kx_union"));
+            dense += @intFromBool(std.mem.eql(u8, c.name, "glue.kx_dense"));
+        }
+        try testing.expect(dense > 0);
+    }
     // the contiguous slot has no row mode
     try testing.expectError(error.NoPool, rowmode.transform(a, one, 8, .{ .slots = S, .rmax = rmax, .pts = 0 }));
 }

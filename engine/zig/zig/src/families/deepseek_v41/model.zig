@@ -265,9 +265,7 @@ pub const Model = struct {
             ko.resident = @import("prod_knobs.zig").streamScratch(&m.cfg, m.f.opts.limit, m.f.opts.prefill_rows);
             // TF_DSV41_PF_4K / _PF_TBO: the prefill workspace a long prompt allocates, priced on top of the worst point
             if (o.own_prefill) ko.workspace = try @import("forward_prefill.zig").workspaceBytes(&m.f, @intCast(m.f.opts.prefill_rows));
-            // a first start (this rank wrote prepared images) holds the 4K workspace off rather than refusing the pool
-            const first = if (cache) |c| c.stats.written > 0 else false;
-            if (try kvs.bootCheck(&m.ctx, &m.cfg, ko, m.tcfg.rank, world, first) == .held) m.f.prefill_state.ws_hold = true;
+            try kvs.bootCheck(&m.ctx, &m.cfg, ko, m.tcfg.rank, world);
             m.f.kv = try kvs.Kv.init(gpa, &m.driver, &m.ctx, &m.cfg, ko, &m.runner, comm);
             m.f.opts.pool = m.f.kv.?.options();
         }

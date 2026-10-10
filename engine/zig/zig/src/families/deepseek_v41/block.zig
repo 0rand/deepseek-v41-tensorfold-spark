@@ -695,7 +695,8 @@ pub const Emitter = struct {
         const n = e.n;
         const K: i64 = e.cfg.index_topk;
         const W: i64 = e.o.world;
-        const small = n <= 16;
+        // row windows exchange dense at any rows (kvsplit.py attend_rows: `win.rows or win.n <= dense_max`)
+        const small = n <= 16 or e.o.rows;
         // dense: every rank sends R x K rows; union: (W + 1) x M rows under the cap
         const sent: i64 = if (small) n * K else @divFloor(p.union_cap, (W + 1) * Pool.row_bytes);
         const recv = try e.buf("w.kx.recv", .{}, .u8, &.{ W * sent, Pool.row_bytes });

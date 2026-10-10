@@ -18,6 +18,7 @@ test {
     _ = budget;
     _ = device;
     _ = @import("split_test.zig");
+    _ = @import("union_plan_test.zig");
     _ = sess;
     _ = @import("sess4_test.zig");
     _ = sched;
