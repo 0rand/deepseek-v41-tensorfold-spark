@@ -66,18 +66,19 @@ pub fn optionsFromEnv(capacity: u64, world: u32) !?Options {
     return .{ .tokens = (tokens + unit - 1) / unit * unit, .split = split, .capacity = capacity, .union_cap = mib << 20 };
 }
 
-/// The measured boot check (memory.py serve_check, kv/budget.zig) before the pool is allocated: MemAvailable now - the pool
-/// (split counted) - the measured boot growth - the worst serving dip >= the hard floor (TF_DSV41_FLOOR_HARD_GIB). It runs
-/// where the GPU allocates from host memory (GB10; TF_DSV41_BOOT_MEASURED forces it); a refusal names the largest pool.
-pub fn bootCheck(ctx: *const cuda.Context, cfg: *const Config, o: Options, rank: u32, world: u32) !void {
+/// The boot check's figures for the measured check at the end of boot (`afterBoot`).
+pub const Boot = struct { rank: u32, at_check: f64, pool_gib: f64, pool_tokens: u64, bytes_a_token: f64, dip: f64, hard: f64, target: f64, workspace: u64 };
+
+/// Before the pool (GB10): refuses a pool that cannot fit at all; growth is measured at boot's end (null: not GB10).
+pub fn bootCheck(ctx: *const cuda.Context, cfg: *const Config, o: Options, rank: u32, world: u32) !?Boot {
     const budget = kv.budget;
     const mi = budget.meminfo() catch |e| {
         std.log.warn("kv: no /proc/meminfo ({t}): the measured boot check is skipped", .{e});
-        return;
+        return null;
     };
     const dev = try ctx.memInfo();
     const integrated = (ctx.attribute(.integrated) catch 0) != 0;
-    if (!budget.measuredApplies(budget.modeFromEnv(), integrated, dev.total, mi.total)) return;
+    if (!budget.measuredApplies(budget.modeFromEnv(), integrated, dev.total, mi.total)) return null;
     var knobs: budget.Knobs = .{};
     if (std.c.getenv("TF_DSV41_FLOOR_HARD_GIB")) |v| knobs.hard_gib = try std.fmt.parseFloat(f64, std.mem.span(v));
     // TF_DSV41_FLOOR_GIB (5): the floor target the load plans for (memory.py floor_settings: 0 < hard <= target)
@@ -86,38 +87,38 @@ pub fn bootCheck(ctx: *const cuda.Context, cfg: *const Config, o: Options, rank:
         std.log.err("kv: TF_DSV41_FLOOR_HARD_GIB={d} / TF_DSV41_FLOOR_GIB={d}: expected 0 < hard <= target", .{ knobs.hard_gib, target });
         return error.BadFloor;
     }
-    // the prefill price's knobs by prod's names (TF_DSV41_PREFILL_ROWS, TF_DSV41_INDEX_BUDGET_MIB)
-    if (std.c.getenv("TF_DSV41_PREFILL_ROWS")) |v| knobs.prefill_rows = try std.fmt.parseInt(u32, std.mem.span(v), 10);
-    // TF_DSV41_PF_4K: 4,096-row segments, priced as such (memory.py's chunk_gib scales by the window)
-    const pk = @import("prod_knobs.zig");
-    if (try pk.pf4k(&pk.env)) knobs.prefill_rows = pk.pf4k_rows;
-    // TF_DSV41_PF_TBO: a pair of segments in flight at once
-    if (try pk.pfTbo(&pk.env)) knobs.prefill_rows *= 2;
-    if (std.c.getenv("TF_DSV41_INDEX_BUDGET_MIB")) |v| knobs.index_budget_mib = try std.fmt.parseInt(u32, std.mem.span(v), 10);
     var layout = try kv.Layout.fromConfig(cfg, .{ .split = o.split and world > 1 });
-    var terms = try budget.Serve.fromEnv(rank);
+    // Zig's terms, not Python's: its plan holds from boot what Python's caching allocator takes while serving
+    var terms = try budget.zigFromEnv();
     terms.growth += @as(f64, @floatFromInt(o.resident)) / budget.GiB;
-    if (o.resident > 0) std.log.info("kv: boot growth + {d:.3} GiB the plan holds resident (the long-prompt stream top-k's scratch)", .{@as(f64, @floatFromInt(o.resident)) / budget.GiB});
     const r = budget.serveCheck(knobs, .{ .rank = rank, .avail_gib = @as(f64, @floatFromInt(mi.available)) / budget.GiB, .terms = terms }, layout.pool(), world, o.tokens);
     var buf: [1024]u8 = undefined;
     if (!r.ok) {
         std.log.err("kv: {s}", .{r.message(&buf)});
         return error.PoolDoesNotFit;
     }
-    std.log.info("kv: {s}", .{r.message(&buf)});
-    // the workspace on top of the worst serving point: the 4K / TBO path's transient the measured terms never held
-    if (o.workspace > 0) {
-        const ws = @as(f64, @floatFromInt(o.workspace)) / budget.GiB;
-        const left = r.worst - ws;
-        // a prompt takes the workspace only when every rank agrees it fits (forward_prefill.wsAgreed)
-        if (left < r.hard) {
-            std.log.warn("kv: rank {d}: the prefill workspace ({d:.2} GiB, TF_DSV41_PF_4K / TF_DSV41_PF_TBO) on top of the predicted worst MemAvailable {d:.2} GiB leaves {d:.2} GiB, under the {d:.1} GiB hard floor: long prompts at that point run 2,048-row segments (about {d:.0} fewer TF_DSV41_POOL_TOKENS keep 4K)", .{ rank, ws, r.worst, left, r.hard, (r.hard - left) * budget.GiB / @max(1.0, r.bytes_a_token) });
-        } else {
-            std.log.info("kv: rank {d}: prefill workspace {d:.2} GiB at a long prompt: worst MemAvailable {d:.2} GiB with it (hard floor {d:.1})", .{ rank, ws, left, r.hard });
-            if (left < target) std.log.warn("kv: memory: with the prefill workspace the floor {d:.2} GiB is under the {d} GiB target (TF_DSV41_FLOOR_GIB)", .{ left, target });
-        }
+    std.log.info("kv: before the pool: {s}; the boot's growth is measured at its end", .{r.message(&buf)});
+    return .{ .rank = rank, .at_check = r.avail_gib, .pool_gib = r.pool_gib, .pool_tokens = o.tokens, .bytes_a_token = r.bytes_a_token, .dip = terms.dip, .hard = r.hard, .target = target, .workspace = o.workspace };
+}
+
+/// At boot's end: idle - dip >= the hard floor or the pool is refused; a 4K workspace past it warns (wsAgreed).
+pub fn afterBoot(b: Boot) !void {
+    const budget = kv.budget;
+    const idle = @as(f64, @floatFromInt((try budget.meminfo()).available)) / budget.GiB;
+    const x = budget.afterBoot(b.at_check, b.pool_gib, idle, b.dip, b.hard, b.pool_tokens, b.bytes_a_token);
+    const msg = "kv: rank {d}: boot growth {d:.2} GiB measured (MemAvailable {d:.2} at the check - pool {d:.2} - {d:.2} now); worst serving point {d:.2} GiB (dip {d:.2}, TF_DSV41_SERVE_DIP_GIB; hard floor {d:.1})";
+    const args = .{ b.rank, x.growth, b.at_check, b.pool_gib, idle, x.worst, b.dip, b.hard };
+    if (!x.ok) {
+        std.log.err(msg ++ ": the pool does not fit; the largest that does: TF_DSV41_POOL_TOKENS={d}", args ++ .{x.largest});
+        return error.PoolDoesNotFit;
     }
-    if (r.worst < target) std.log.warn("kv: memory: floor {d:.2} GiB is under the {d} GiB target (TF_DSV41_FLOOR_GIB)", .{ r.worst, target });
+    std.log.info(msg, args);
+    if (b.workspace > 0) {
+        const ws = @as(f64, @floatFromInt(b.workspace)) / budget.GiB;
+        const left = x.worst - ws;
+        if (left < b.hard) std.log.warn("kv: rank {d}: the prefill workspace ({d:.2} GiB, TF_DSV41_PF_4K / TF_DSV41_PF_TBO) at the worst point leaves {d:.2} GiB, under the {d:.1} GiB hard floor: long prompts there run 2,048-row segments", .{ b.rank, ws, left, b.hard });
+    }
+    if (x.worst < b.target) std.log.warn("kv: memory: floor {d:.2} GiB is under the {d} GiB target (TF_DSV41_FLOOR_GIB)", .{ x.worst, b.target });
 }
 
 pub const Kv = struct {

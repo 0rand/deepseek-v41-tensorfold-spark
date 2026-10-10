@@ -114,6 +114,8 @@ pub const Model = struct {
     sessions: ?*sg.Sessions = null,
     /// live slots (TF_DSV41_SLOTS; > 1: stacked state and row-mode windows, batch.zig)
     slots: u32 = 1,
+    /// the boot check's figures before the pool, for its measured end (kv_state.afterBoot)
+    boot_check: ?kvs.Boot = null,
     slot_set: ?*slots_mod.SlotSet = null,
     rows: ?*batch.Batch = null,
     /// DSpark drafts over several live slots (TF_DSV41_SLOT_DRAFTS=1 with TF_DSV41_SLOTS > 1, dspark_slots.zig)
@@ -271,7 +273,7 @@ pub const Model = struct {
             // TF_DSV41_PF_4K / _PF_TBO: the prefill workspace a long prompt allocates, priced on top of the worst point
             if (o.own_prefill) ko.workspace = try @import("forward_prefill.zig").workspaceBytes(&m.f, @intCast(m.f.opts.prefill_rows));
             tr.step("forward", cuda.usage(false));
-            try kvs.bootCheck(&m.ctx, &m.cfg, ko, m.tcfg.rank, world);
+            m.boot_check = try kvs.bootCheck(&m.ctx, &m.cfg, ko, m.tcfg.rank, world);
             m.f.kv = try kvs.Kv.init(gpa, &m.driver, &m.ctx, &m.cfg, ko, &m.runner, comm);
             m.f.opts.pool = m.f.kv.?.options();
             tr.step("kv pool", cuda.usage(false));
@@ -391,6 +393,8 @@ pub const Model = struct {
         try m.driver.check(m.driver.api.cuCtxSynchronize(), "cuCtxSynchronize");
         tr.step("end", cuda.usage(false));
         tr.trim();
+        // the boot check on the boot's own figures: what it took, the dip below idle, the hard floor
+        if (m.boot_check) |b| try kvs.afterBoot(b);
         try comm.barrier();
     }
 

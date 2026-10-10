@@ -150,6 +150,33 @@ pub const Serve = struct {
     }
 };
 
+/// Zig's dip below idle (TF_DSV41_SERVE_DIP_GIB unset): 2 x 1M measured 1.23 (rank 1) / 1.11 (rank 0), with a margin.
+pub const zig_dip_gib: f64 = 1.5;
+
+/// Zig's terms before the pool: TF_DSV41_BOOT_GROWTH_GIB (unset 0: measured at boot's end), TF_DSV41_SERVE_DIP_GIB.
+pub fn zigFromEnv() !Serve {
+    return .{ .growth = try gibEnv(env(growth_env), 0), .dip = try gibEnv(env(dip_env), zig_dip_gib) };
+}
+
+/// The measured check at the end of boot (GiB): whether the worst point keeps the floor, and what the boot took.
+pub const AfterBoot = struct {
+    ok: bool,
+    /// what the boot took after the check besides the pool (plan, forms, rows, drafter, sampler)
+    growth: f64,
+    /// the worst serving point: idle less the dip
+    worst: f64,
+    /// the pool's tokens that would leave the worst point at the hard floor (0: none)
+    largest: u64,
+};
+
+/// The measured check: idle now - the dip >= the hard floor (growth = at the check - pool - now, for the log).
+pub fn afterBoot(at_check: f64, pool_gib: f64, idle: f64, dip: f64, hard: f64, pool_tokens: u64, bytes_a_token: f64) AfterBoot {
+    const worst = idle - dip;
+    const room_tokens = (worst - hard) * GiB / @max(1.0, bytes_a_token);
+    const largest = @as(f64, @floatFromInt(pool_tokens)) + room_tokens;
+    return .{ .ok = worst >= hard, .growth = at_check - pool_gib - idle, .worst = worst, .largest = if (largest > 0) @intFromFloat(@floor(largest)) else 0 };
+}
+
 pub const growth_env = "TF_DSV41_BOOT_GROWTH_GIB";
 pub const dip_env = "TF_DSV41_SERVE_DIP_GIB";
 pub const measured_env = "TF_DSV41_BOOT_MEASURED";
@@ -452,4 +479,32 @@ test "the measured check's knobs: growth / dip overrides, TF_DSV41_BOOT_MEASURED
     try std.testing.expectEqual(MemInfo{ .total = 126877032 * 1024, .available = 13526528 * 1024 }, mi);
     try std.testing.expectError(error.BadMeminfo, parseMeminfo("MemTotal: 1 kB\n"));
     if (@import("builtin").os.tag == .linux) try std.testing.expect(try memAvailable() > 0);
+}
+
+test "the Zig check: measured at the end of boot, a measured rank 1 passes, a pool 1 GiB past the largest refuses" {
+    var sl = try layout_mod.Layout.fromConfig(layout_mod.Release{}, .{ .split = true });
+    const spl = sl.pool();
+    const k: Knobs = .{};
+    const per = tokenBytes(spl, 2);
+    const pool = @as(f64, @floatFromInt(poolBytes(spl, 2, 3_000_000))) / GiB;
+    // a measured rank 1 before the pool: Python's terms refused it (6.07 - 2.10 workspace < 4); Zig's pass it
+    const terms: Serve = .{ .growth = 0, .dip = zig_dip_gib };
+    const pre = serveCheck(k, .{ .rank = 1, .avail_gib = 14.94, .terms = terms }, spl, 2, 3_000_000);
+    try std.testing.expect(pre.ok);
+    // after the boot: MemAvailable 6.39 idle (TF_DSV41_BOOT_TRACE's end) - 1.5 dip = 4.89, over the 4.0 floor
+    const ok = afterBoot(14.94, pool, 6.39, zig_dip_gib, k.hard_gib, 3_000_000, per);
+    try std.testing.expect(ok.ok);
+    try std.testing.expectApproxEqAbs(@as(f64, 14.94 - pool - 6.39), ok.growth, 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 4.89), ok.worst, 1e-9);
+    // the largest pool lands the worst point on the floor; 1 GiB more pool (1 GiB less idle) refuses
+    const more = @as(u64, @intFromFloat(GiB / per));
+    try std.testing.expect(ok.largest > 3_000_000);
+    const edge = ok.largest - 3_000_000;
+    const over = afterBoot(14.94, pool + (@as(f64, @floatFromInt(edge)) * per / GiB) + 1.0, 6.39 - (@as(f64, @floatFromInt(edge)) * per / GiB) - 1.0, zig_dip_gib, k.hard_gib, ok.largest + more, per);
+    try std.testing.expect(!over.ok);
+    try std.testing.expectApproxEqAbs(@as(f64, 3.0), over.worst, 1e-6); // the floor less the GiB
+    try std.testing.expect(over.largest < ok.largest + more);
+    // the earlier dip of 2.5 on this idle would refuse: the knob means Zig's dip below idle now
+    try std.testing.expect(!afterBoot(14.94, pool, 6.39, 2.5, k.hard_gib, 3_000_000, per).ok);
+    try std.testing.expectEqual(Serve{ .growth = 0, .dip = zig_dip_gib }, try zigFromEnv());
 }
