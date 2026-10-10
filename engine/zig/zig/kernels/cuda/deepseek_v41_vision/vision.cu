@@ -158,11 +158,11 @@ extern "C" __global__ void __launch_bounds__(128) dsv41_vision_attn(const __nv_b
                         if (!(first && ni == 0 && e == 0)) mx = fmaxf(mx, s[ni][hr * 2 + e]);
                 mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 2));
                 mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 1));
+                float sc = 1.f;
                 if (!first) {
                     const float prev = row_max[mi][hr];
                     const float cur = mx == -INFINITY ? 0.f : mx;
-                    const float sc = exp2f(__fmul_rn(__fsub_rn(prev, cur), scale_log2));
-                    row_sum[mi][hr] = __fmul_rn(row_sum[mi][hr], sc);
+                    sc = exp2f(__fmul_rn(__fsub_rn(prev, cur), scale_log2));
 #pragma unroll
                     for (int d = 0; d < 8; d++) {
                         acc_o[mi][d][hr * 2] = __fmul_rn(acc_o[mi][d][hr * 2], sc);
@@ -171,16 +171,16 @@ extern "C" __global__ void __launch_bounds__(128) dsv41_vision_attn(const __nv_b
                 }
                 row_max[mi][hr] = mx;
                 const float ms = mx == -INFINITY ? 0.f : __fmul_rn(mx, scale_log2);
-                float sum = first ? 0.f : row_sum[mi][hr];
-                bool init = first;
+                // FA2's row_sum *= scale and the first add are one FFMA (UNFUSE_FMA guards only exp)
+                float sum = 0.f;
 #pragma unroll
                 for (int ni = 0; ni < 16; ni++)
 #pragma unroll
                     for (int e = 0; e < 2; e++) {
                         const float p = exp2f(__fsub_rn(__fmul_rn(s[ni][hr * 2 + e], scale_log2), ms));
                         s[ni][hr * 2 + e] = p;
-                        sum = init ? p : __fadd_rn(sum, p);
-                        init = false;
+                        if (ni == 0 && e == 0) sum = first ? p : __fmaf_rn(row_sum[mi][hr], sc, p);
+                        else sum = __fadd_rn(sum, p);
                     }
                 row_sum[mi][hr] = sum;
             }
