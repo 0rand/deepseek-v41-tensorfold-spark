@@ -128,7 +128,9 @@ fn planPrograms(f: *Forward, p: *buffers.Plan, rows: u32, layers: []const u32) !
         for ([_]i64{ 0, top }) |start| {
             var ea = std.heap.ArenaAllocator.init(f.gpa);
             defer ea.deinit();
-            try p.add(try block_prefill.emitPrefill(ea.allocator(), f.cfg, f.widths, vision_rows.planOptions(f), layers, n, start, true));
+            // replay's segments run the encoder (no head): its whole programs plan no head, w.logits not 2,048 rows
+            const head = f.prefill_state.mode != .replay;
+            try p.add(try block_prefill.emitPrefill(ea.allocator(), f.cfg, f.widths, vision_rows.planOptions(f), layers, n, start, head));
         }
     }
     if (f.prefill_state.mode == .replay) try planReplay(f, p, rows, layers);

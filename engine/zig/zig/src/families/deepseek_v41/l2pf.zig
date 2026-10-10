@@ -187,7 +187,7 @@ fn fill(gpa: std.mem.Allocator, f: *fwd.Forward, weights: *const load.Weights, s
         for (spans.items, 0..) |sp, i| {
             words[2 * i] = @intCast(sp.addr);
             words[2 * i + 1] = @intCast(sp.bytes);
-            p.bytes[@intFromEnum(site)] += sp.bytes;
+            p.bytes[@backingInt(site)] += sp.bytes;
         }
         try cuda.DeviceBuffer.upload(.{ .d = r.d, .ptr = table, .len = 16 * spans.items.len }, 0, std.mem.sliceAsBytes(words));
         p.tables += 1;
@@ -211,7 +211,8 @@ fn locate(r: *const run.Runner, weights: *const load.Weights, x: block.Emitter.L
         .words => {
             var nb: [160]u8 = undefined;
             const lanes = try std.fmt.bufPrint(&nb, "s.{s}.lanes", .{x.name});
-            if (r.addressOf(lanes)) |p| return .{ .addr = p, .end = ownedEnd(r, p) orelse return error.L2pfSpan };
+            // in place (TF_DSV41_FORMS_INPLACE) the form lives in its trellis weight's buffer
+            if (r.addressOf(lanes)) |p| return .{ .addr = p, .end = ownedEnd(r, p) orelse weightEnd(weights, p) orelse return error.L2pfSpan };
             const tr = try std.fmt.bufPrint(&nb, "{s}.trellis", .{x.name});
             const t = weights.get(tr) orelse return null;
             return .{ .addr = t.ptr, .end = t.ptr + t.len };
@@ -233,6 +234,12 @@ fn locate(r: *const run.Runner, weights: *const load.Weights, x: block.Emitter.L
 /// The end of the runner-owned buffer holding `addr`.
 fn ownedEnd(r: *const run.Runner, addr: u64) ?u64 {
     for (r.owned.items) |b| if (b.ptr <= addr and addr < b.ptr + b.len) return b.ptr + b.len;
+    return null;
+}
+
+fn weightEnd(weights: *const load.Weights, addr: u64) ?u64 {
+    var it = weights.map.valueIterator();
+    while (it.next()) |t| if (t.ptr <= addr and addr < t.ptr + t.len) return t.ptr + t.len;
     return null;
 }
 

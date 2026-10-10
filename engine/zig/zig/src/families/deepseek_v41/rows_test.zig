@@ -567,4 +567,5 @@ test "TF_DSV41_ROUND_GRAPH=split on the served row window: head + tail = the win
 
 test {
     _ = graphs; // graphs.zig's own tests (the room rule, the bucket ends)
+    _ = @import("forms_inplace.zig"); // TF_DSV41_FORMS_INPLACE's binding
 }
