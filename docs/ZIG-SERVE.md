@@ -71,8 +71,13 @@ was not repeated for this publication; the exported host build and host tests ar
    touch build/zig/fatbins/.keep
    docker build -f docker/zig/Dockerfile --build-arg ZIG_COMMIT="$(git rev-parse HEAD)" \
      -t tensorfold-dsv41-zig:local build/zig
+   scripts/check-zig-image.sh tensorfold-dsv41-zig:local
    docker save tensorfold-dsv41-zig:local -o build/zig-image.tar
    ```
+
+   `check-zig-image.sh` checks that every library the engine opens at run time (NCCL, verbs and its mlx5 provider,
+   cuBLAS / cuBLASLt for image input) resolves in the image, and that cuBLAS is the release the vision tower's
+   exactness was measured on.
 
    The image label records the recipe commit you built (set `ZIG_COMMIT` in the config to the same value); the engine source revision is in `engine/zig/SOURCE-EXPORT.md`. Transfer the tar to rank 1 and run
    `docker load -i build/zig-image.tar` there. Compare the label and root filesystem layers on both nodes with
