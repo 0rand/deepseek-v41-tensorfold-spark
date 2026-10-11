@@ -305,7 +305,9 @@ does not fall back persistently. That trades workspace margin for speed. On a fi
 prepared images (about 95 GiB), its predicted worst MemAvailable is lower than on later starts. If the workspace does
 not fit then, that rank logs `first start (prepared images written this boot)` and the process serves with 2,048-row
 segments instead of refusing to start; the next start, which reads the prepared images, uses 4K. An existing install
-whose prepared images are complete is not affected. For a conservative 2K profile set
+whose prepared images are complete is not affected. Under `PF_4K=1`, `aot-needs` also lists the 2,048-row segment
+programs this fallback (and the per-piece one) runs; a fill made from a 4K env with an older `aot-needs` lacks them
+and should be completed: run `aot-needs` with this env and `triton_fill.py compile --have` on the set. For a conservative 2K profile set
 `PF_4K=0`, drop `PF_4K_MEMORY_OK` and `PF_WS_FLOOR_GIB`, and use 2048 for `PREFILL_CHUNK` / `PREFILL_ROWS`. Do not
 enable two-batch prefill overlap (PF_TBO) alongside 4K without a separate memory gate: the tested combination
 exhausted memory.

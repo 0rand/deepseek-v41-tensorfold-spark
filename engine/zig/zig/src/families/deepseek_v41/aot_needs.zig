@@ -408,6 +408,49 @@ pub fn enumerate(gpa: std.mem.Allocator, n: *Needs, cfg: *const Config, w: *cons
         try log.print("aot-needs: row mode, {d} programs, {d} variants\n", .{ n.programs, n.keys.count() });
         try log.flush();
     }
+    try prompts(gpa, a, n, cfg, w, sv, layers, log);
+    // TF_DSV41_PF_4K: the forward's own 2,048-row segments too (the per-piece fallback and a first start run them)
+    if (sv.o.pf4k) {
+        var two = sv;
+        two.o.pf4k = false;
+        two.o.prefill_rows = (block.Options{}).prefill_rows;
+        try prompts(gpa, a, n, cfg, w, two, layers, log);
+    }
+    // DSpark
+    if (sv.drafts) {
+        var pa = std.heap.ArenaAllocator.init(gpa);
+        defer pa.deinit();
+        const pb = pa.allocator();
+        _ = try n.program(try dspark_emit.emitPass(pb, cfg, w, sv.o, cfg.dspark_block));
+        // ingests: a window's rows, and a prompt's prefilled tail in one call (target.handTaps: up to the window)
+        var rows: i64 = 1;
+        while (rows <= @max(max_rows, cfg.window)) : (rows += 1) {
+            _ = try n.program(try dspark_emit.emitIngest(pb, cfg, w, sv.o, rows, 0));
+            _ = try n.program(try dspark_emit.emitIngest(pb, cfg, w, sv.o, rows, 1));
+        }
+        if (sv.slot_drafts) {
+            var k: i64 = 1;
+            while (k <= sv.group) : (k += 1) _ = try n.program(try dspark_emit.emitPassSlots(pb, cfg, w, sv.o, cfg.dspark_block, k, sv.slots));
+            // TF_DSV41_DRAFT_CHAIN's `_chain` (one variant whatever the slots: they are its grid), with and without the
+            // confidence head (Python passes cval for its tensors without it); WORLD x k candidates a row
+            const world: i64 = sv.o.world;
+            const c = world * @min(64, @divTrunc(128, world));
+            for ([_]bool{ true, false }) |conf| _ = try n.program(try dspark_emit.emitChain(pb, cfg, w, sv.o, cfg.dspark_block, sv.slots, c, conf));
+            try log.print("aot-needs: DSpark chain (TF_DSV41_DRAFT_CHAIN), N {d}, KP {d}, {d} candidates, with and without the confidence head\n", .{ cfg.dspark_block, dspark_emit.chain_kp, c });
+        } else if (try @import("dspark_dev.zig").chainFromEnv()) {
+            // the served config would boot without its chain (dspark_slots refuses it): a fill env that drifted
+            try log.print("aot-needs: TF_DSV41_DRAFT_CHAIN=1 without slot drafts (TF_DSV41_SLOTS > 1, TF_DSV41_SLOT_DRAFTS=1, row mode): no _chain variant listed\n", .{});
+            try log.flush();
+            return error.ChainWithoutSlotDrafts;
+        }
+        try log.print("aot-needs: DSpark, {d} programs, {d} variants\n", .{ n.programs, n.keys.count() });
+        try log.flush();
+    }
+}
+
+/// A prompt's programs under `sv`: prefill segments (each regime), multi-segment runs, CED replay's decoder pass.
+fn prompts(gpa: std.mem.Allocator, a: std.mem.Allocator, n: *Needs, cfg: *const Config, w: *const block.Widths, sv: Served, layers: []const u32, log: *std.Io.Writer) !void {
+    const limit = sv.o.limit;
     // prefill: the full segment's regimes, then every row count at each regime's first start
     const P = sv.o.prefill_rows;
     {
@@ -489,36 +532,6 @@ pub fn enumerate(gpa: std.mem.Allocator, n: *Needs, cfg: *const Config, w: *cons
             try log.print("aot-needs: replay runs, {d} programs, {d} variants\n", .{ n.programs, n.keys.count() });
             try log.flush();
         }
-    }
-    // DSpark
-    if (sv.drafts) {
-        var pa = std.heap.ArenaAllocator.init(gpa);
-        defer pa.deinit();
-        const pb = pa.allocator();
-        _ = try n.program(try dspark_emit.emitPass(pb, cfg, w, sv.o, cfg.dspark_block));
-        // ingests: a window's rows, and a prompt's prefilled tail in one call (target.handTaps: up to the window)
-        var rows: i64 = 1;
-        while (rows <= @max(max_rows, cfg.window)) : (rows += 1) {
-            _ = try n.program(try dspark_emit.emitIngest(pb, cfg, w, sv.o, rows, 0));
-            _ = try n.program(try dspark_emit.emitIngest(pb, cfg, w, sv.o, rows, 1));
-        }
-        if (sv.slot_drafts) {
-            var k: i64 = 1;
-            while (k <= sv.group) : (k += 1) _ = try n.program(try dspark_emit.emitPassSlots(pb, cfg, w, sv.o, cfg.dspark_block, k, sv.slots));
-            // TF_DSV41_DRAFT_CHAIN's `_chain` (one variant whatever the slots: they are its grid), with and without the
-            // confidence head (Python passes cval for its tensors without it); WORLD x k candidates a row
-            const world: i64 = sv.o.world;
-            const c = world * @min(64, @divTrunc(128, world));
-            for ([_]bool{ true, false }) |conf| _ = try n.program(try dspark_emit.emitChain(pb, cfg, w, sv.o, cfg.dspark_block, sv.slots, c, conf));
-            try log.print("aot-needs: DSpark chain (TF_DSV41_DRAFT_CHAIN), N {d}, KP {d}, {d} candidates, with and without the confidence head\n", .{ cfg.dspark_block, dspark_emit.chain_kp, c });
-        } else if (try @import("dspark_dev.zig").chainFromEnv()) {
-            // the served config would boot without its chain (dspark_slots refuses it): a fill env that drifted
-            try log.print("aot-needs: TF_DSV41_DRAFT_CHAIN=1 without slot drafts (TF_DSV41_SLOTS > 1, TF_DSV41_SLOT_DRAFTS=1, row mode): no _chain variant listed\n", .{});
-            try log.flush();
-            return error.ChainWithoutSlotDrafts;
-        }
-        try log.print("aot-needs: DSpark, {d} programs, {d} variants\n", .{ n.programs, n.keys.count() });
-        try log.flush();
     }
 }
 
