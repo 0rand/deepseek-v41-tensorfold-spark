@@ -114,7 +114,9 @@ was not repeated for this publication; the exported host build and host tests ar
    timeouts do not end long prefills.
 
 4. Wait for the model to load and inspect the boot log: four slots, CED replay, row graphs, successful device-draft
-   self-check and RoCE probe. First preparation can take several minutes. Then query rank 0:
+   self-check and RoCE probe. First preparation can take several minutes. On that first start a rank that cannot
+   fit the 4K prefill workspace while it writes its prepared images logs `first start (prepared images written this
+   boot)` and serves with 2,048-row prefill segments (the same bits); restart once to use 4K. Then query rank 0:
 
    ```bash
    curl -fsS localhost:8000/v1/models
@@ -299,7 +301,11 @@ across both ranks; if either cannot leave `TF_DSV41_PF_WS_FLOOR_GIB` free, both 
 The boot budget can also refuse a profile that cannot fit.
 
 `TF_DSV41_PF_WS_FLOOR_GIB` defaults to the hard floor (4 GiB); the profile uses 3.5 GiB so the more constrained rank
-does not fall back persistently. That trades workspace margin for speed. For a conservative 2K profile set
+does not fall back persistently. That trades workspace margin for speed. On a first start, while a rank writes its
+prepared images (about 95 GiB), its predicted worst MemAvailable is lower than on later starts. If the workspace does
+not fit then, that rank logs `first start (prepared images written this boot)` and the process serves with 2,048-row
+segments instead of refusing to start; the next start, which reads the prepared images, uses 4K. An existing install
+whose prepared images are complete is not affected. For a conservative 2K profile set
 `PF_4K=0`, drop `PF_4K_MEMORY_OK` and `PF_WS_FLOOR_GIB`, and use 2048 for `PREFILL_CHUNK` / `PREFILL_ROWS`. Do not
 enable two-batch prefill overlap (PF_TBO) alongside 4K without a separate memory gate: the tested combination
 exhausted memory.
