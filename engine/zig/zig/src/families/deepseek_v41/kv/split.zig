@@ -118,8 +118,47 @@ pub fn earlyOn() bool {
     return std.mem.eql(u8, std.mem.trim(u8, v, " \t"), "1");
 }
 
+/// A prefill union by history (`Exchange.history`): owner o's rows of the mapped pages at o x M, in page order.
+pub const HistArgs = extern struct {
+    /// int32 [R, K] logical rows (-1: none)
+    sel: u64,
+    rows: u32,
+    k: u32,
+    /// int32 [pages] split page table (Slot.localTableAt)
+    table: u64,
+    /// the slot's mapped pages (Slot.len): every row a selection names is below pages << psh
+    pages: u32,
+    psh: u32,
+    rank: u32,
+    world: u32,
+    /// rows an owner (historyRows): owner o's row list fills recv rows [o M, o M + M)
+    m: u32,
+    row_bytes: u32,
+    base: u64,
+    /// out: [M, row bytes] (this rank's rows in page order, the padding unspecified) and int32 [R, K] tokens
+    send: u64,
+    tok: u64,
+};
+
+/// Rows an owner in a history union of `pages` mapped pages: owner 0's pages (the most), whole.
+pub fn historyRows(pages: u32, psh: u32, world: u32) u32 {
+    return ((pages + world - 1) / world) << @intCast(psh);
+}
+
+/// A row's place in its owner's history list: its page's turn among the owner's pages, then its row in it.
+pub fn historyIndex(t: u32, psh: u32, world: u32) u32 {
+    const mask = (@as(u32, 1) << @intCast(psh)) - 1;
+    return (((t >> @intCast(psh)) / world) << @intCast(psh)) | (t & mask);
+}
+
+/// TF_DSV41_KV_SPLIT_HISTORY=1: a prefill union under the cap sends the owned rows; no plan, no host sync.
+pub fn historyOn() bool {
+    const v = std.mem.span(std.c.getenv("TF_DSV41_KV_SPLIT_HISTORY") orelse return false);
+    return std.mem.eql(u8, std.mem.trim(u8, v, " \t"), "1");
+}
+
 comptime {
-    std.debug.assert(@sizeOf(DenseArgs) == 80 and @sizeOf(PackArgs) == 88 and @sizeOf(DedupArgs) == 120);
+    std.debug.assert(@sizeOf(DenseArgs) == 80 and @sizeOf(PackArgs) == 88 and @sizeOf(DedupArgs) == 120 and @sizeOf(HistArgs) == 72);
     std.debug.assert(@offsetOf(PackArgs, "rank") == 44 and @offsetOf(PackArgs, "base") == @offsetOf(DenseArgs, "base") and @offsetOf(PackArgs, "lens") == 80);
 }
 
@@ -137,13 +176,40 @@ pub const Kernels = struct {
         gather: *const fn (ptr: *anyopaque, base: u64, row_bytes: u32, phys: u64, n: u32, send: u64, stream: Stream) anyerror!void,
         /// The deduplicated pack (kvsplit.cu dedup_*: four launches); null: a Kernels without it (packs without dedup).
         dedup: ?*const fn (ptr: *anyopaque, a: DedupArgs, stream: Stream) anyerror!void = null,
+        /// The history union's gather and tokens (kvsplit.cu hist_*: two launches); null: unions plan on the host.
+        history: ?*const fn (ptr: *anyopaque, a: HistArgs, stream: Stream) anyerror!void = null,
     };
 };
 
 /// The kernels on host memory (addresses are host pointers): the reference the device kernels must equal, and the host ranks' path.
 pub const HostKernels = struct {
     pub fn kernels(h: *HostKernels) Kernels {
-        return .{ .ptr = h, .vtable = &.{ .dense = dense, .gather = gather, .pack = pack, .dedup = dedup } };
+        return .{ .ptr = h, .vtable = &.{ .dense = dense, .gather = gather, .pack = pack, .dedup = dedup, .history = history } };
+    }
+
+    /// hist_gather / hist_tok: row i of this rank's list is its page rank + W (i >> psh); the tokens by historyIndex.
+    fn history(_: *anyopaque, a: HistArgs, _: Stream) anyerror!void {
+        const sel: [*]const i32 = @ptrFromInt(a.sel);
+        const table: [*]const i32 = @ptrFromInt(a.table);
+        const base: [*]const u8 = @ptrFromInt(a.base);
+        const send: [*]u8 = @ptrFromInt(a.send);
+        const tok: [*]i32 = @ptrFromInt(a.tok);
+        const mask = (@as(u32, 1) << @intCast(a.psh)) - 1;
+        for (0..a.m) |i| {
+            const lp = a.rank + a.world * (@as(u32, @intCast(i)) >> @intCast(a.psh));
+            if (lp >= a.pages) continue;
+            const phys = (@as(usize, @intCast(table[lp])) << @intCast(a.psh)) | (i & mask);
+            @memcpy(send[i * a.row_bytes ..][0..a.row_bytes], base[phys * a.row_bytes ..][0..a.row_bytes]);
+        }
+        for (0..@as(usize, a.rows) * a.k) |i| {
+            if (sel[i] < 0) {
+                tok[i] = -1;
+                continue;
+            }
+            const t: u32 = @intCast(sel[i]);
+            if (t >> @intCast(a.psh) >= a.pages) return error.RowOutsideTable;
+            tok[i] = @intCast(ownerOf(t, a.psh, a.world) * a.m + historyIndex(t, a.psh, a.world));
+        }
     }
 
     /// dedup_*'s steps in order on host memory: the first entry of each key, places among each owner's first entries.
@@ -422,6 +488,13 @@ pub const Exchange = struct {
     pub fn dense(x: Exchange, a: DenseArgs, recv: DevicePtr, stream: Stream) !void {
         try x.kernels.vtable.dense(x.kernels.ptr, a, stream);
         try x.comm.allGather(a.send, recv, @as(usize, a.rows) * a.k * a.row_bytes, .u8, stream);
+    }
+
+    /// A history union: this rank's M rows and the tokens (two kernels), then recv [W, M, rb]; no host sync.
+    pub fn history(x: Exchange, a: HistArgs, recv: DevicePtr, stream: Stream) !void {
+        const f = x.kernels.vtable.history orelse return error.Unsupported;
+        try f(x.kernels.ptr, a, stream);
+        try x.comm.allGather(a.send, recv, @as(usize, a.m) * a.row_bytes, .u8, stream);
     }
 
     /// One union block: this rank's M rows (phys: the block's list on the device) to send, recv [W, M, rb].

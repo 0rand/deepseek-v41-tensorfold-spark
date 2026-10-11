@@ -504,9 +504,9 @@ test "rowtab at 1M: four slots' windows at the limit's end, padded, within the l
     var t: [rowtab.ncol * rmax]i64 = undefined;
     var r32: [rmax]i32 = undefined;
     try rowtab.plan(&mix, &ids, R, rmax, S, &t, &r32);
-    const pos = t[@intFromEnum(rowtab.Col.pos) * rmax ..][0..R];
+    const pos = t[@backingInt(rowtab.Col.pos) * rmax ..][0..R];
     try testing.expectEqualSlices(i64, &.{ limit - 6, limit - 5, limit - 4, limit - 3, limit - 2, limit - 1, 900_000, 131_071, 131_072, 131_073, 131_074, 0, 1, 1, 1, 1 }, pos);
-    const ws = t[@intFromEnum(rowtab.Col.wslot) * rmax ..][0..R];
+    const ws = t[@backingInt(rowtab.Col.wslot) * rmax ..][0..R];
     try testing.expectEqualSlices(i64, &.{ 3, 3, 3, 3, 3, 3, 0, 2, 2, 2, 2, 1, 1, -1, -1, -1 }, ws);
     // the window's context bucket: the limit's last (its end is the limit)
     const s: graphs.Settings = .{};
@@ -569,4 +569,5 @@ test "TF_DSV41_ROUND_GRAPH=split on the served row window: head + tail = the win
 test {
     _ = graphs; // graphs.zig's own tests (the room rule, the bucket ends)
     _ = @import("forms_inplace.zig"); // TF_DSV41_FORMS_INPLACE's binding
+    _ = @import("ex_stacks.zig"); // TF_DSV41_EX_STACKS's pairs and binding
 }

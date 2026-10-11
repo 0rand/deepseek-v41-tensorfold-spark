@@ -283,4 +283,45 @@ __global__ void __launch_bounds__(256) dedup_tok_kernel(const DedupArgs d) {
     }
 }
 
+// history union (TF_DSV41_KV_SPLIT_HISTORY): this rank's rows of the mapped pages in page order, tokens by place
+struct HistArgs {
+    const int* sel;          // int32 [R, K] logical rows (-1: none)
+    uint32_t rows, k;
+    const int* table;        // int32 [pages] split page table
+    uint32_t pages, psh, rank, world, m, row_bytes;
+    const uint8_t* base;
+    uint8_t* send;           // [M, row bytes]
+    int* tok;                // int32 [R, K]
+};
+static_assert(sizeof(HistArgs) == 72, "kv/split.zig HistArgs");
+
+__global__ void __launch_bounds__(256) hist_gather_kernel(const HistArgs a) {
+    const uint32_t wpr = a.row_bytes >> 3;
+    const uint32_t mask = (1u << a.psh) - 1u;
+    const long long words = (long long)a.m * wpr;
+    for (long long w = (long long)blockIdx.x * blockDim.x + threadIdx.x; w < words; w += (long long)gridDim.x * blockDim.x) {
+        const uint32_t i = (uint32_t)(w / wpr);
+        const uint32_t q = (uint32_t)(w - (long long)i * wpr);
+        const uint32_t lp = a.rank + a.world * (i >> a.psh);
+        if (lp >= a.pages) continue;
+        const unsigned long long row = ((unsigned long long)(uint32_t)a.table[lp] << a.psh) | (i & mask);
+        const uint64_t* src = reinterpret_cast<const uint64_t*>(a.base + row * a.row_bytes);
+        reinterpret_cast<uint64_t*>(a.send + (unsigned long long)i * a.row_bytes)[q] = src[q];
+    }
+}
+
+__global__ void __launch_bounds__(256) hist_tok_kernel(const HistArgs a) {
+    const long long n = (long long)a.rows * a.k;
+    const uint32_t mask = (1u << a.psh) - 1u;
+    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (long long)gridDim.x * blockDim.x) {
+        const int sv = a.sel[i];
+        if (sv < 0) {
+            a.tok[i] = -1;
+            continue;
+        }
+        const uint32_t pg = (uint32_t)sv >> a.psh;
+        a.tok[i] = (int)((pg % a.world) * a.m + (((pg / a.world) << a.psh) | ((uint32_t)sv & mask)));
+    }
+}
+
 }  // namespace dsv41_kvsplit

@@ -25,6 +25,14 @@ pub fn hasImage(ids: []const u32) bool {
     return false;
 }
 
+/// A decode or graphed window never carries image ids: only the prompt's segments fill their rows (refused loudly).
+pub fn checkWindow(ids: []const u32) !void {
+    for (ids, 0..) |t, i| if (isVid(t)) {
+        log.warn("images: a window of {d} rows holds an image position at row {d}; refused", .{ ids.len, i });
+        return error.ImageInWindow;
+    };
+}
+
 const Loc = struct { img: *const held.HeldImage, idx: u32, refs: u32 };
 const Span = struct { buf: cuda.DeviceBuffer, stamp: u64 };
 
@@ -277,13 +285,21 @@ const block = @import("block.zig");
 const load = @import("load.zig");
 const pack_mod = @import("pack.zig");
 const mode_mod = @import("dsv41_serve").vision.mode;
+const buffers = @import("buffers.zig");
+const vision_plan = @import("vision_plan.zig");
 
 /// TF_DSV41_IMAGES at boot, every rank: native sets `f.images` (Engram's keep at image positions, the same program on
 /// every rank) and, on rank 0, loads the tower and the rows (`f.vision`). TF_DSV41_BIAS_VL (a folder holding the
 /// release's `layers.<i>.ffn.gate.bias_vl`, as bias_vl_fetch.py writes it) is loaded on every rank as
 /// "L<i>.moe.bias_vl" (the router is replicated): image rows then take their own MoE call routed with it
-/// (vision.moe, block_prefill's moeSplit).
+/// (vision.moe, block_prefill's moeSplit). A driver that plans its buffers calls `bootPlan` first, `bootTower` after.
 pub fn boot(gpa: Allocator, io: std.Io, f: *fwd.Forward, pack: *const pack_mod.Pack, d: *const cuda.Driver, rank: u32, w: *load.Weights) !void {
+    try bootPlan(gpa, io, f, d, w);
+    try bootTower(gpa, io, f, pack, d, rank);
+}
+
+/// The part the buffer plan reads (`planOptions`), before it is built: `f.images` and, with TF_DSV41_BIAS_VL, the bias.
+pub fn bootPlan(gpa: Allocator, io: std.Io, f: *fwd.Forward, d: *const cuda.Driver, w: *load.Weights) !void {
     const raw: ?[]const u8 = if (std.c.getenv("TF_DSV41_IMAGES")) |v| std.mem.span(v) else null;
     const mode = mode_mod.parse(raw) orelse return error.BadImagesMode;
     if (mode != .native) return;
@@ -295,7 +311,11 @@ pub fn boot(gpa: Allocator, io: std.Io, f: *fwd.Forward, pack: *const pack_mod.P
             f.image_bias = true;
         }
     }
-    if (rank != 0) return;
+}
+
+/// Rank 0 with images on (after `bootPlan`): the tower and the rows.
+pub fn bootTower(gpa: Allocator, io: std.Io, f: *fwd.Forward, pack: *const pack_mod.Pack, d: *const cuda.Driver, rank: u32) !void {
+    if (!f.images or rank != 0) return;
     const t = try tower_mod.Tower.load(gpa, io, d, pack, .{});
     errdefer t.deinit();
     const r = try gpa.create(Rows);
@@ -304,6 +324,17 @@ pub fn boot(gpa: Allocator, io: std.Io, f: *fwd.Forward, pack: *const pack_mod.P
     // the gates' replays (tf-dsv41-m1 generate / m2b): the reference's prepared images held for the whole run
     if (std.c.getenv("TF_DSV41_VISION_HOLD")) |dir| try holdDir(r, gpa, io, std.mem.span(dir));
     log.info("images (TF_DSV41_IMAGES=native): tower {d:.2} GB on rank 0; image routing bias {s}", .{ @as(f64, @floatFromInt(t.bytes)) / 1e9, if (f.image_bias) "loaded" else "MISSING (TF_DSV41_BIAS_VL unset): image rows route with the text bias" });
+}
+
+/// The boot check after the buffer plan: an image segment of the plan's prefill rows finds every role it adds bound.
+pub fn checkPlan(f: *fwd.Forward, plan: *const buffers.Plan) !void {
+    if (!f.images) return;
+    var arena = std.heap.ArenaAllocator.init(f.gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const role = try vision_plan.missing(a, f.cfg, f.widths, f.opts, try f.backbone(a), f.opts.prefill_rows, f.image_bias, plan) orelse return;
+    log.err("images: the buffer plan has no {s} for an image segment (images were switched on after the plan was built)", .{role});
+    return error.ImagesUnplanned;
 }
 
 /// ``attach_bias_vl``: every backbone layer's `layers.<i>.ffn.gate.bias_vl` from `dir`, fp32 [E] (a missing one is
@@ -370,13 +401,9 @@ pub fn segmentOptions(f: *const fwd.Forward, ids: []const u32) block.Options {
     return o;
 }
 
-/// The options the buffer plan sizes with: the keep buffer exists when images are on, both MoE calls at full rows
-/// with the image bias.
+/// The options the buffer plan sizes with (vision_plan.planOptions).
 pub fn planOptions(f: *const fwd.Forward) block.Options {
-    var o = f.opts;
-    o.image_keep = f.images;
-    if (f.image_bias) o.image_rows = -1;
-    return o;
+    return vision_plan.planOptions(f.opts, f.images, f.image_bias);
 }
 
 /// Glue image_split (x [n, D] -> image rows, text rows) / image_merge (the two partials -> [n, D]): rows by the

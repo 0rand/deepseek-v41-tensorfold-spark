@@ -223,6 +223,42 @@ fn packedRank(comm: tp.Collective, me: u32, ctx: *const PCtx) anyerror!void {
         if (kind == .one_owner) for (0..W) |o| if (o != one) try testing.expectEqual(@as(i32, 0), plens[o]);
         try dedupCheck(x, pa, sel, &rslot, .{ .fi = fi, .K = K, .psh = fpsh, .rows = pts * per, .W = W });
     };
+    // TF_DSV41_KV_SPLIT_HISTORY: a one-slot union by history, every family and slot
+    for (pfams, 0..) |f, fi| for (slots, 0..) |s, si| {
+        const per: u32 = page / f.ratio;
+        try historyCheck(x, rnd, .{ .fi = fi, .si = si, .psh = std.math.log2_int(u32, per), .rows = @intCast(lens[si] / f.ratio), .pages = s.len, .W = W, .me = me }, @intFromPtr(host.tensors[fi].ptr), tables[si * pts ..][0..pts]);
+    };
+}
+
+const HCase = struct { fi: usize, si: usize, psh: u32, rows: u32, pages: u32, W: u32, me: u32 };
+
+/// The history union: rows by token == replicated, each owner's rows within M, M = the largest owner's mapped rows.
+fn historyCheck(x: split.Exchange, rnd: std.Random, c: HCase, base: u64, table: []const i32) !void {
+    const gpa = testing.allocator;
+    const R = 40;
+    const K = 16;
+    var sel: [R * K]i32 = undefined;
+    for (&sel) |*t| t.* = if (rnd.uintLessThan(u32, 9) == 0) -1 else @intCast(rnd.uintLessThan(u32, c.rows));
+    const m = split.historyRows(c.pages, c.psh, c.W);
+    var most: u32 = 0;
+    for (0..c.W) |o| most = @max(most, @as(u32, @intCast((c.pages + c.W - 1 - o) / c.W)) << @intCast(c.psh));
+    try testing.expectEqual(most, m);
+    const send = try gpa.alloc(u8, m * rb);
+    defer gpa.free(send);
+    const recv = try gpa.alloc(u8, c.W * m * rb);
+    defer gpa.free(recv);
+    var tok: [R * K]i32 = undefined;
+    try x.history(.{ .sel = @intFromPtr(&sel), .rows = R, .k = K, .table = @intFromPtr(table.ptr), .pages = c.pages, .psh = c.psh, .rank = c.me, .world = c.W, .m = m, .row_bytes = rb, .base = base, .send = @intFromPtr(send.ptr), .tok = @intFromPtr(&tok) }, @intFromPtr(recv.ptr), null);
+    for (sel, tok) |t, o| {
+        if (t < 0) {
+            try testing.expectEqual(@as(i32, -1), o);
+            continue;
+        }
+        const u: u32 = @intCast(t);
+        const own = split.ownerOf(u, c.psh, c.W);
+        try testing.expect(o >= own * m and o < (own + 1) * m);
+        for (recv[@as(usize, @intCast(o)) * rb ..][0..rb], 0..) |b, j| try testing.expectEqual(pvalue(c.fi, c.si, u, j), b);
+    }
 }
 
 const DCase = struct { fi: usize, K: u32, psh: u32, rows: u64, W: u32 };
@@ -272,7 +308,7 @@ fn dedupCheck(x0: split.Exchange, pa0: split.PackArgs, sel: []const i32, rslot: 
     for (mem[0..map_rows]) |m| try testing.expectEqual(@as(i32, std.math.maxInt(i32)), m);
 }
 
-test "packed == dedup == dense == replicated: 1 / 6 / 16 rows x K 512, ratio 2 and 1, one-owner and padded, W 2 and 3" {
+test "packed == dedup == dense == replicated, history union: 1 / 6 / 16 rows x K 512, ratio 2 and 1, W 2 and 3" {
     for ([_]u64{ 1, 2 }) |seed| {
         try tp.host.run(2, &PCtx{ .seed = seed }, packedRank);
         try tp.host.run(3, &PCtx{ .seed = seed }, packedRank);

@@ -47,6 +47,7 @@ const Config = @import("config.zig").Config;
 const ced = @import("ced.zig");
 const aot_cover = @import("aot_cover.zig");
 const cuda = @import("cuda");
+const kvs = @import("kv_state.zig");
 
 pub const Param = struct { name: []const u8, constexpr: bool, nospec: bool, noalign: bool };
 pub const Fn = struct { function: []const u8, params: []Param };
@@ -238,11 +239,9 @@ pub const Served = struct {
         o.mhc_pf_rows = try knobs.mhcPfRows(&knobs.env);
         const drafts = envOn("TF_DSV41_DRAFTS", false);
         o.taps = drafts;
-        const pages = @divExact(o.limit, block.Pool.page);
-        const split = envOn("TF_DSV41_KV_SPLIT", false);
-        // the pool's tensors' row counts are not launch arguments; its tables' stride (pts) and paging are
-        o.pool = .{ .comp_pages = if (split) @divExact(pages, 2) + 2 else pages + 1, .ik_pages = pages + 1, .pts = pages, .split = split };
+        o.pool = try poolFromEnv(o.limit, o.world);
         const slots: u32 = @intCast(try envInt("TF_DSV41_SLOTS", 1));
+        if (slots > 1 and o.pool == null) return error.SlotsNeedPool;
         const rows_mod = @import("dspark_rows.zig");
         return .{
             .o = o,
@@ -260,6 +259,29 @@ pub const Served = struct {
         };
     }
 };
+
+/// The served pool as model.zig opens it (kv_state.optionsFromEnv; null: no pool); TF_DSV41_NEEDS_POOL=1 / 0 forces it.
+pub fn poolFromEnv(limit: i64, world: u32) !?block.Pool {
+    const force: ?bool = if (std.c.getenv("TF_DSV41_NEEDS_POOL")) |v| std.mem.eql(u8, std.mem.span(v), "1") else null;
+    const ko = try kvs.optionsFromEnv(@intCast(limit), world);
+    if (!(force orelse (ko != null))) return null;
+    const pages = @divExact(limit, block.Pool.page);
+    const split = if (ko) |k| k.split else envOn("TF_DSV41_KV_SPLIT", false);
+    return .{
+        .comp_pages = if (split) @divExact(pages, 2) + 2 else pages + 1,
+        .ik_pages = pages + 1,
+        .pts = pages,
+        .split = split,
+        .early = split and earlyOn(),
+        .union_cap = if (ko) |k| @intCast(k.union_cap) else 128 << 20,
+    };
+}
+
+/// kv/split.zig's earlyOn (that file is the kv module's): TF_DSV41_KV_SPLIT_EARLY=1, blanks trimmed.
+fn earlyOn() bool {
+    const v = std.mem.span(std.c.getenv("TF_DSV41_KV_SPLIT_EARLY") orelse return false);
+    return std.mem.eql(u8, std.mem.trim(u8, v, " \t"), "1");
+}
 
 const period: i64 = 256;
 
@@ -605,7 +627,7 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, sigs_path: []const u8, out_path:
     // DSpark's ingest main_proj (a DSpark block's width; its EXL3 linear is CUDA, as mdraft_test.zig sets it)
     try w.dense.put(a, "dspark.main_proj", try w.k2("L40.attn.wkv"));
     const sv = try Served.fromEnv();
-    try log.print("aot-needs: limit {d}, {d} slot(s), rows cap {d}, prefill rows {d}, index budget {d} MiB, R1 {}, drafts {}, slot drafts {} (group {d}), world {d}\n", .{ sv.o.limit, sv.slots, sv.cap, sv.o.prefill_rows, sv.o.index_budget >> 20, sv.o.r1, sv.drafts, sv.slot_drafts, sv.group, sv.o.world });
+    try log.print("aot-needs: limit {d}, {d} slot(s), rows cap {d}, prefill rows {d}, index budget {d} MiB, R1 {}, drafts {}, slot drafts {} (group {d}), world {d}, pool {s}\n", .{ sv.o.limit, sv.slots, sv.cap, sv.o.prefill_rows, sv.o.index_budget >> 20, sv.o.r1, sv.drafts, sv.slot_drafts, sv.group, sv.o.world, if (sv.o.pool) |p| (if (p.split) "split" else "on") else "none (contiguous slot)" });
     var n: Needs = .{ .gpa = gpa, .sigs = &parsed.value.kernels };
     defer n.deinit();
     const have = if (aot_dir) |d| try cuda.aot.parseSpecs(gpa, try cwd.readFileAlloc(io, try std.fs.path.join(a, &.{ d, "aot.json" }), a, .limited(1 << 26))) else null;
@@ -634,6 +656,39 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, sigs_path: []const u8, out_path:
 // -- host tests ---------------------------------------------------------------------------------------------------
 
 const testing = std.testing;
+
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+
+test "aot-needs: the pool is the serve path's (kv_state.optionsFromEnv, model.zig's rule), TF_DSV41_NEEDS_POOL aside" {
+    const Case = struct { tokens: ?[:0]const u8, split: ?[:0]const u8, force: ?[:0]const u8, pool: bool };
+    const cases = [_]Case{
+        .{ .tokens = null, .split = null, .force = null, .pool = false }, // m2b, `generate` without the pool
+        .{ .tokens = null, .split = "1", .force = null, .pool = false },
+        .{ .tokens = "3000000", .split = null, .force = null, .pool = true },
+        .{ .tokens = "3000000", .split = "1", .force = null, .pool = true }, // prod-zig.env
+        .{ .tokens = null, .split = null, .force = "1", .pool = true },
+        .{ .tokens = "3000000", .split = "1", .force = "0", .pool = false },
+    };
+    defer for ([_][:0]const u8{ "TF_DSV41_POOL_TOKENS", "TF_DSV41_KV_SPLIT", "TF_DSV41_NEEDS_POOL" }) |k| {
+        _ = unsetenv(k);
+    };
+    const limit: i64 = 1 << 20;
+    for (cases) |c| {
+        inline for (.{ .{ "TF_DSV41_POOL_TOKENS", "tokens" }, .{ "TF_DSV41_KV_SPLIT", "split" }, .{ "TF_DSV41_NEEDS_POOL", "force" } }) |kv| {
+            if (@field(c, kv[1])) |v| _ = setenv(kv[0], v, 1) else _ = unsetenv(kv[0]);
+        }
+        const got = try poolFromEnv(limit, 2);
+        try testing.expectEqual(c.pool, got != null);
+        // unforced, the listing and the served engine agree: a pool exactly when model.zig opens one, split alike
+        const served = try kvs.optionsFromEnv(@intCast(limit), 2);
+        if (c.force == null) {
+            try testing.expectEqual(served != null, got != null);
+            if (served) |k| try testing.expectEqual(k.split, got.?.split);
+        }
+        if (got) |p| try testing.expectEqual(limit >> 8, p.pts);
+    }
+}
 
 test "aot-needs: a launch reduces to Triton's specialization (constexprs, == 1, % 16, width, alignment)" {
     var params = [_]Param{
@@ -675,4 +730,41 @@ test "aot-needs: a launch reduces to Triton's specialization (constexprs, == 1, 
     const bad: calls.Call = .{ .triton = true, .name = "_k", .args = &.{.{ .name = "Z", .arg = .{ .i = 3 } }} };
     try testing.expectError(error.NoKernel, n.reduce(a, &bad));
     _ = aot_cover;
+}
+
+test "aot guard: a program's key is its lookups' as `find` tells them apart, the trace's the same" {
+    const runner = @import("run.zig");
+    const aot = @import("cuda").aot;
+    const PJ = @typeInfo(@FieldType(aot.Spec, "params")).pointer.child;
+    var pj = [_]PJ{ .{ .name = "X", .type = "*bf16", .div16 = true, .nospec = false }, .{ .name = "N", .type = "i32", .div16 = true, .nospec = false } };
+    const specs = [_]aot.Spec{.{ .@"fn" = "_k", .hash = "h", .name = "_k", .num_warps = 4, .params = &pj, .consts = .{} }};
+    var ps = try runner.paramsOfSpecs(testing.allocator, &specs);
+    defer runner.freeParams(testing.allocator, &ps);
+    const t = calls.Tensor{ .role = .{ .buf = "w.x" }, .dt = .bf16, .shape = &.{4}, .stride = &.{1}, .offset = 0 };
+    var u = t;
+    u.role = .{ .buf = "w.y" };
+    u.offset = 4096;
+    const k = struct {
+        fn of(p: *const runner.Params, x: calls.Tensor, n: i64, b: i64) u64 {
+            const args = [_]calls.Named{ .{ .name = "X", .arg = .{ .t = x } }, .{ .name = "N", .arg = .{ .i = n } }, .{ .name = "B", .arg = .{ .i = b } } };
+            return runner.programKey(&.{ .{ .triton = false, .name = "ext.f", .args = &.{} }, .{ .triton = true, .name = "_k", .args = &args } }, p);
+        }
+    };
+    // not where a tensor lives (its role's base is taken 16-aligned); a launch int's class, a constexpr's value
+    try testing.expectEqual(k.of(&ps, t, 32, 64), k.of(&ps, u, 48, 64));
+    try testing.expect(k.of(&ps, t, 32, 64) != k.of(&ps, t, 33, 64));
+    try testing.expect(k.of(&ps, t, 32, 64) != k.of(&ps, t, 1, 64));
+    try testing.expect(k.of(&ps, t, 32, 64) != k.of(&ps, t, 32, 128));
+    try testing.expect(k.of(&ps, t, 32, 64) != k.of(&ps, t, 1 << 40, 64));
+    try testing.expect(k.of(&ps, t, 32, 64) != runner.programKey(&.{}, &ps));
+    // the trace's key: an int's class, a pointer's dtype and alignment, the constexprs
+    const tk = struct {
+        fn of(n: i32, addr: u64) u64 {
+            return aot.Trace.key("_k", &.{ aot.ptr("X", "*bf16", addr), aot.int("N", n) }, &.{aot.ci("B", 64)});
+        }
+    };
+    try testing.expectEqual(tk.of(32, 0x1000), tk.of(48, 0x2000));
+    try testing.expect(tk.of(32, 0x1000) != tk.of(33, 0x1000));
+    try testing.expect(tk.of(32, 0x1000) != tk.of(1, 0x1000));
+    try testing.expect(tk.of(32, 0x1000) != tk.of(32, 0x1008));
 }

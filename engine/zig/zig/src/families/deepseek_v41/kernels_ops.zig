@@ -448,6 +448,7 @@ pub const Functions = struct {
     kv_pack: ?cuda.Function = null,
     /// kvsplit's dedup steps (TF_DSV41_KV_SPLIT_DEDUP: mark, flags, pack, tok); null in a fatbin built before them
     kv_dedup: ?[4]cuda.Function = null,
+    kv_hist: ?[2]cuda.Function = null,
     kv_gather: cuda.Function,
     glue: [10]cuda.Function, // glue.syms order
     /// glue.cu's DSpark candidates (TF_DSV41_DRAFT_GRAPHS); null in a fatbin built before it (the host's candidates)
@@ -514,6 +515,7 @@ pub const Functions = struct {
         f.kv_gather = try m_kv.function("_ZN13dsv41_kvsplit13gather_kernelEPKhjPKjjPh");
         f.kv_pack = m_kv.function("_ZN13dsv41_kvsplit11pack_kernelENS_8PackArgsE") catch null;
         f.kv_dedup = kvsplit.dedupFns(m_kv) catch null;
+        f.kv_hist = kvsplit.histFns(m_kv) catch null;
         inline for (glue.syms, 0..) |name, i| f.glue[i] = try m_glue.function(name);
         f.ds_cands = m_glue.function(glue.ds_cands_sym) catch null;
         f.pick_pack = m_glue.function(glue.pick_pack_sym) catch null;
@@ -584,8 +586,32 @@ pub const kvsplit = struct {
         return out;
     }
 
+    /// kv/split.zig's HistArgs (the history union's gather and tokens).
+    pub const HistArgs = extern struct {
+        sel: u64,
+        rows: u32,
+        k: u32,
+        table: u64,
+        pages: u32,
+        psh: u32,
+        rank: u32,
+        world: u32,
+        m: u32,
+        row_bytes: u32,
+        base: u64,
+        send: u64,
+        tok: u64,
+    };
+
+    const hist_syms = [2][:0]const u8{ "_ZN13dsv41_kvsplit18hist_gather_kernelENS_8HistArgsE", "_ZN13dsv41_kvsplit15hist_tok_kernelENS_8HistArgsE" };
+
+    fn histFns(m: cuda.Module) ![2]cuda.Function {
+        return .{ try m.function(hist_syms[0]), try m.function(hist_syms[1]) };
+    }
+
     comptime {
         std.debug.assert(@sizeOf(DedupArgs) == 120 and @offsetOf(DedupArgs, "map") == 88 and @offsetOf(DedupArgs, "bcnt") == 112);
+        std.debug.assert(@sizeOf(HistArgs) == 72 and @offsetOf(HistArgs, "m") == 40 and @offsetOf(HistArgs, "base") == 48);
         std.debug.assert(@sizeOf(DenseArgs) == 80 and @offsetOf(DenseArgs, "rslot") == 32 and @offsetOf(DenseArgs, "send") == 64);
         std.debug.assert(@sizeOf(PackArgs) == 88 and @offsetOf(PackArgs, "rank") == 44 and @offsetOf(PackArgs, "lens") == 80);
     }
@@ -888,6 +914,20 @@ pub const Ops = struct {
             var args: cuda.Args = .{};
             args.add(d);
             try o.go(f, .{ g, 1, 1 }, 256, 0, null, &args);
+        }
+    }
+
+    /// kvsplit hist_gather + hist_tok: the history union's M rows of this rank and the selection's tokens.
+    pub fn kvHistory(o: Ops, a: kvsplit.HistArgs) !void {
+        const fs = o.f.kv_hist orelse return error.Unsupported;
+        if (a.row_bytes == 0 or a.row_bytes % 8 != 0 or a.k == 0 or a.world == 0 or a.world > 8 or a.psh > 30) return error.Shape;
+        const words = @as(u64, a.m) * (a.row_bytes / 8);
+        const n = @as(u64, a.rows) * a.k;
+        for (fs, [2]u64{ words, n }) |f, w| {
+            if (w == 0) continue;
+            var args: cuda.Args = .{};
+            args.add(a);
+            try o.go(f, .{ kvsplit.grid(w), 1, 1 }, 256, 0, null, &args);
         }
     }
 

@@ -45,6 +45,41 @@ fn procField(path: [*:0]const u8, key: []const u8) ?u64 {
     return field(buf[0..@intCast(n)], key);
 }
 
+/// The kernel memory a step can grow (driver page arrays, DMA tables, IOMMU / GPU page tables): /proc/meminfo keys.
+pub const kernel_keys = [_][]const u8{ "Slab:", "SUnreclaim:", "PageTables:", "SecPageTables:", "VmallocUsed:" };
+
+/// Those keys' bytes in `meminfo`, each null when this kernel does not report it.
+pub fn kernelOf(meminfo: []const u8) [kernel_keys.len]?u64 {
+    var out: [kernel_keys.len]?u64 = undefined;
+    for (kernel_keys, &out) |k, *o| o.* = field(meminfo, k);
+    return out;
+}
+
+/// The step's kernel line: each key's GiB and its growth since the last step (MiB; `last` null on the first step).
+pub fn kernelLine(buf: []u8, name: []const u8, now: [kernel_keys.len]?u64, last: ?[kernel_keys.len]?u64) []const u8 {
+    var w: std.Io.Writer = .fixed(buf);
+    w.print("boot trace: {s}: kernel", .{name}) catch return buf;
+    for (kernel_keys, now, 0..) |k, v, i| {
+        const key = k[0 .. k.len - 1];
+        const x = v orelse {
+            w.print(" {s} n/a", .{key}) catch return w.buffered();
+            continue;
+        };
+        const was: ?u64 = if (last) |l| l[i] else null;
+        const grew = if (was) |b| (@as(f64, @floatFromInt(x)) - @as(f64, @floatFromInt(b))) / (1 << 20) else 0;
+        w.print(" {s} {d:.3} GiB ({s}{d:.1} MiB)", .{ key, gib(x), if (grew < 0) "-" else "+", @abs(grew) }) catch return w.buffered();
+    }
+    return w.buffered();
+}
+
+fn readMeminfo(buf: []u8) []const u8 {
+    const fd = std.c.open("/proc/meminfo", .{ .ACCMODE = .RDONLY });
+    if (fd < 0) return buf[0..0];
+    defer _ = std.c.close(fd);
+    const n = std.c.read(fd, buf.ptr, buf.len);
+    return if (n > 0) buf[0..@intCast(n)] else buf[0..0];
+}
+
 const malloc_trim = @extern(?*const fn (usize) callconv(.c) c_int, .{ .name = "malloc_trim", .linkage = .weak });
 
 /// One boot step's figures: MemAvailable, the process's device and pinned bytes, its driver allocations, RssAnon.
@@ -71,6 +106,8 @@ pub fn stepLine(buf: []u8, name: []const u8, x: Figures, drop: ?f64) []const u8 
 pub const Trace = struct {
     on: bool = false,
     last: ?u64 = null,
+    /// the kernel keys at the last step (null before the first)
+    kernel: ?[kernel_keys.len]?u64 = null,
 
     pub fn fromEnv() Trace {
         const v = std.c.getenv("TF_DSV41_BOOT_TRACE") orelse return .{};
@@ -91,6 +128,12 @@ pub const Trace = struct {
         var buf: [256]u8 = undefined;
         log.info("{s}", .{stepLine(&buf, name, x, drop)});
         t.last = x.avail;
+        // the kernel's side: which of its own allocations a step's MemAvailable drop went to
+        var mb: [8192]u8 = undefined;
+        const k = kernelOf(readMeminfo(&mb));
+        var kb: [512]u8 = undefined;
+        log.info("{s}", .{kernelLine(&kb, name, k, t.kernel)});
+        t.kernel = k;
     }
 
     /// `totals`: buffers.Plan.totals() (roles and bytes by scope: persistent, window, layer).
@@ -150,4 +193,15 @@ test "proc fields in bytes, the step line" {
     var buf: [256]u8 = undefined;
     const x: Figures = .{ .avail = 6 << 30, .device = 3 << 29, .allocs = 2711, .pinned = 1 << 28, .anon = 1 << 30 };
     try std.testing.expectEqualStrings("boot trace: bind: MemAvailable 6.00 GiB (drop 0.500), device 1.50 GiB in 2711 driver allocations, pinned 0.250 GiB, RssAnon 1.00 GiB", stepLine(&buf, "bind", x, 0.5));
+}
+
+test "the kernel line: each key's GiB and growth since the last step, n/a where the kernel has no such key" {
+    const before = "Slab:            1048576 kB\nSUnreclaim:       524288 kB\nPageTables:       131072 kB\nVmallocUsed:      131072 kB\n";
+    const after = "Slab:            1572864 kB\nSUnreclaim:      1048576 kB\nPageTables:       131072 kB\nVmallocUsed:      655360 kB\n";
+    const a = kernelOf(before);
+    const b = kernelOf(after);
+    try std.testing.expectEqual(@as(?u64, null), b[3]); // no SecPageTables on this kernel
+    var buf: [512]u8 = undefined;
+    try std.testing.expectEqualStrings("boot trace: weights: kernel Slab 1.500 GiB (+512.0 MiB) SUnreclaim 1.000 GiB (+512.0 MiB) PageTables 0.125 GiB (+0.0 MiB) SecPageTables n/a VmallocUsed 0.625 GiB (+512.0 MiB)", kernelLine(&buf, "weights", b, a));
+    try std.testing.expectEqualStrings("boot trace: start: kernel Slab 1.000 GiB (+0.0 MiB) SUnreclaim 0.500 GiB (+0.0 MiB) PageTables 0.125 GiB (+0.0 MiB) SecPageTables n/a VmallocUsed 0.125 GiB (+0.0 MiB)", kernelLine(&buf, "start", a, null));
 }

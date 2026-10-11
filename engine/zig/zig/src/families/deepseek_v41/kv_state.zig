@@ -67,7 +67,7 @@ pub fn optionsFromEnv(capacity: u64, world: u32) !?Options {
 }
 
 /// The boot check's figures for the measured check at the end of boot (`afterBoot`).
-pub const Boot = struct { rank: u32, at_check: f64, pool_gib: f64, pool_tokens: u64, bytes_a_token: f64, dip: f64, hard: f64, target: f64, workspace: u64 };
+pub const Boot = struct { rank: u32, at_check: f64, pool_gib: f64, pool_tokens: u64, bytes_a_token: f64, reserve: f64, dip: f64, hard: f64, target: f64, workspace: u64 };
 
 /// Before the pool (GB10): refuses a pool that cannot fit at all; growth is measured at boot's end (null: not GB10).
 pub fn bootCheck(ctx: *const cuda.Context, cfg: *const Config, o: Options, rank: u32, world: u32) !?Boot {
@@ -98,16 +98,16 @@ pub fn bootCheck(ctx: *const cuda.Context, cfg: *const Config, o: Options, rank:
         return error.PoolDoesNotFit;
     }
     std.log.info("kv: before the pool: {s}; the boot's growth is measured at its end", .{r.message(&buf)});
-    return .{ .rank = rank, .at_check = r.avail_gib, .pool_gib = r.pool_gib, .pool_tokens = o.tokens, .bytes_a_token = r.bytes_a_token, .dip = terms.dip, .hard = r.hard, .target = target, .workspace = o.workspace };
+    return .{ .rank = rank, .at_check = r.avail_gib, .pool_gib = r.pool_gib, .pool_tokens = o.tokens, .bytes_a_token = r.bytes_a_token, .reserve = try budget.reserveFromEnv(), .dip = terms.dip, .hard = r.hard, .target = target, .workspace = o.workspace };
 }
 
 /// At boot's end: idle - dip >= the hard floor or the pool is refused; a 4K workspace past it warns (wsAgreed).
 pub fn afterBoot(b: Boot) !void {
     const budget = kv.budget;
     const idle = @as(f64, @floatFromInt((try budget.meminfo()).available)) / budget.GiB;
-    const x = budget.afterBoot(b.at_check, b.pool_gib, idle, b.dip, b.hard, b.pool_tokens, b.bytes_a_token);
-    const msg = "kv: rank {d}: boot growth {d:.2} GiB measured (MemAvailable {d:.2} at the check - pool {d:.2} - {d:.2} now); worst serving point {d:.2} GiB (dip {d:.2}, TF_DSV41_SERVE_DIP_GIB; hard floor {d:.1})";
-    const args = .{ b.rank, x.growth, b.at_check, b.pool_gib, idle, x.worst, b.dip, b.hard };
+    const x = budget.afterBoot(b.at_check, b.pool_gib, idle, b.reserve, b.dip, b.hard, b.pool_tokens, b.bytes_a_token);
+    const msg = "kv: rank {d}: boot growth {d:.2} GiB measured (MemAvailable {d:.2} at the check - pool {d:.2} - {d:.2} now); worst serving point {d:.2} GiB (post-boot reserve {d:.2}, TF_DSV41_POST_BOOT_GIB; dip {d:.2}, TF_DSV41_SERVE_DIP_GIB; hard floor {d:.1})";
+    const args = .{ b.rank, x.growth, b.at_check, b.pool_gib, idle, x.worst, b.reserve, b.dip, b.hard };
     if (!x.ok) {
         std.log.err(msg ++ ": the pool does not fit; the largest that does: TF_DSV41_POOL_TOKENS={d}", args ++ .{x.largest});
         return error.PoolDoesNotFit;
@@ -144,6 +144,8 @@ pub const Kv = struct {
     lens: ?cuda.DeviceBuffer = null,
     /// TF_DSV41_KV_SPLIT_DEDUP's map and scratch (kv/split.zig Dedup)
     dedup: ?cuda.DeviceBuffer = null,
+    /// TF_DSV41_KV_SPLIT_HISTORY: a union that fits the cap sends the slot's owned rows (kv/split.zig HistArgs)
+    hist: bool = false,
     stats: Stats = .{},
     /// the last union when it took several row blocks (empty: one block, already exchanged): each block's rows
     /// sit in `phys` at its offset, its tokens in the call's token rows; longpf.zig exchanges them block by block
@@ -175,6 +177,13 @@ pub const Kv = struct {
             // the compact mode's transport agreement happens here, once, outside any graph
             k.x = try kv.split.Exchange.init(comm, k.ops.kernels(), try kv.split.compactMode());
             if (kv.split.dedupOn()) try k.initDedup(d, cfg.index_topk);
+            if (kv.split.historyOn()) {
+                if (runner.kernels.ops.kv_hist == null) {
+                    std.log.err("[tensorfold] TF_DSV41_KV_SPLIT_HISTORY=1: the kvsplit fatbin has no history kernels (rebuild it)", .{});
+                    return error.MissingKernel;
+                }
+                k.hist = true;
+            }
         }
         return k;
     }
@@ -322,6 +331,10 @@ pub const Kv = struct {
         const a = try args(r, c);
         const n: usize = @intCast(a.sel.shape[0]);
         const kk: u32 = @intCast(a.sel.shape[1]);
+        if (k.hist) {
+            const m = kv.split.historyRows(k.slot.len, a.psh, k.world);
+            if (m > 0 and m <= k.opts.union_cap / ((@as(u64, k.world) + 1) * block.Pool.row_bytes)) return k.historyOf(r, a, n, kk, m);
+        }
         // the drain also ends the last union's async uploads, so its pinned staging is free again
         try r.stream.synchronize();
         const sel = (try pinned(r.d, &k.pin_sel, n * kk * 4)).slice(i32)[0 .. n * kk];
@@ -350,6 +363,29 @@ pub const Kv = struct {
         k.stats.unions += 1;
         k.stats.union_rows_max = @max(k.stats.union_rows_max, @as(u64, b.m) * k.world);
         k.stats.bytes += @as(u64, b.m) * block.Pool.row_bytes * k.world;
+    }
+
+    /// The union by history (TF_DSV41_KV_SPLIT_HISTORY): no selection read back, no plan, no drain; M rows an owner.
+    fn historyOf(k: *Kv, r: *run.Runner, a: anytype, n: usize, kk: u32, m: u32) !void {
+        const h: kv.split.HistArgs = .{
+            .sel = try r.tensorAddr(a.sel),
+            .rows = @intCast(n),
+            .k = kk,
+            .table = a.table,
+            .pages = k.slot.len,
+            .psh = a.psh,
+            .rank = k.rank,
+            .world = k.world,
+            .m = m,
+            .row_bytes = block.Pool.row_bytes,
+            .base = a.comp,
+            .send = a.send,
+            .tok = a.tok,
+        };
+        try k.x.history(h, a.recv, r.stream.handle);
+        k.stats.unions += 1;
+        k.stats.union_rows_max = @max(k.stats.union_rows_max, @as(u64, m) * k.world);
+        k.stats.bytes += @as(u64, m) * block.Pool.row_bytes * k.world;
     }
 
     /// A pinned staging buffer of at least `len` bytes (grown, never shrunk).
@@ -401,7 +437,7 @@ const Ops = struct {
     r: *run.Runner,
 
     fn kernels(o: *Ops) kv.split.Kernels {
-        return .{ .ptr = o, .vtable = &.{ .dense = dense, .gather = gather, .pack = pack, .dedup = dedup } };
+        return .{ .ptr = o, .vtable = &.{ .dense = dense, .gather = gather, .pack = pack, .dedup = dedup, .history = history } };
     }
 
     fn self(ptr: *anyopaque) *Ops {
@@ -421,6 +457,11 @@ const Ops = struct {
     fn pack(ptr: *anyopaque, a: kv.split.PackArgs, _: tp.collective.Stream) anyerror!void {
         const r = self(ptr).r;
         try r.kernels.others(r.stream).kvPack(.{ .sel = a.sel, .rows = a.rows, .k = a.k, .table = a.table, .pts = a.pts, .rslot = a.rslot, .psh = a.psh, .rank = a.rank, .base = a.base, .row_bytes = a.row_bytes, .world = a.world, .send = a.send, .tok = a.tok, .lens = a.lens });
+    }
+
+    fn history(ptr: *anyopaque, a: kv.split.HistArgs, _: tp.collective.Stream) anyerror!void {
+        const r = self(ptr).r;
+        try r.kernels.others(r.stream).kvHistory(.{ .sel = a.sel, .rows = a.rows, .k = a.k, .table = a.table, .pages = a.pages, .psh = a.psh, .rank = a.rank, .world = a.world, .m = a.m, .row_bytes = a.row_bytes, .base = a.base, .send = a.send, .tok = a.tok });
     }
 
     fn dedup(ptr: *anyopaque, a: kv.split.DedupArgs, _: tp.collective.Stream) anyerror!void {

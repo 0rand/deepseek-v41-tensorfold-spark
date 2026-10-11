@@ -97,7 +97,7 @@ pub const Arena = struct {
         if (len > a.o.small_max) {
             const n = roundUp(len, a.be.granularity);
             const p = a.be.chunk(a.be.ctx, n) orelse {
-                a.stats.fallback += 1;
+                a.fellBack(n);
                 return null;
             };
             errdefer a.be.release(a.be.ctx, p, n);
@@ -115,7 +115,7 @@ pub const Arena = struct {
         if (a.limit - a.cursor < n) {
             const cl = roundUp(@max(a.o.small_chunk, n), a.be.granularity);
             const base = a.be.chunk(a.be.ctx, cl) orelse {
-                a.stats.fallback += 1;
+                a.fellBack(cl);
                 return null;
             };
             errdefer a.be.release(a.be.ctx, base, cl);
@@ -129,6 +129,12 @@ pub const Arena = struct {
         a.cursor += n;
         a.stats.small += 1;
         return p;
+    }
+
+    /// A chunk the backend did not give: the request goes to cuMemAlloc (the first logged: a dead arena shows).
+    fn fellBack(a: *Arena, len: usize) void {
+        if (a.stats.fallback == 0) std.log.scoped(.cuda).warn("device arena ({s}): a {d} MiB chunk failed; requests go to cuMemAlloc", .{ a.be.name, len >> 20 });
+        a.stats.fallback += 1;
     }
 
     /// True when `p` was the arena's (and is now free); false: not ours, the caller frees it as before.
@@ -208,6 +214,8 @@ pub const Vmm = struct {
     va_len: usize = 0,
     next: u64 = 0,
     api: Api,
+    /// the first chunk that failed: the driver call and its CUresult (null: none failed)
+    failed: ?struct { call: []const u8, code: c_int } = null,
 
     const Api = struct {
         reserve: *const fn (*u64, usize, usize, u64, c_ulonglong) callconv(.c) abi.Result,
@@ -271,19 +279,27 @@ pub const Vmm = struct {
 
     fn chunk(ctx: *anyopaque, len: usize) ?u64 {
         const v: *Vmm = @ptrCast(@alignCast(ctx));
-        if (v.va + v.va_len - v.next < len) return null;
+        if (v.va + v.va_len - v.next < len) return v.fail("the reserved range", 0);
         var h: u64 = 0;
-        if (v.api.create(&h, len, &v.prop, 0) != abi.success) return null;
+        const rc = v.api.create(&h, len, &v.prop, 0);
+        if (rc != abi.success) return v.fail("cuMemCreate", rc);
         defer _ = v.api.release(h); // the mapping holds the memory until it is unmapped
         const at = v.next;
-        if (v.api.map(at, len, 0, h, 0) != abi.success) return null;
+        const rm = v.api.map(at, len, 0, h, 0);
+        if (rm != abi.success) return v.fail("cuMemMap", rm);
         const desc: AccessDesc = .{ .loc_id = v.device };
-        if (v.api.setAccess(at, len, &desc, 1) != abi.success) {
+        const ra = v.api.setAccess(at, len, &desc, 1);
+        if (ra != abi.success) {
             _ = v.api.unmap(at, len);
-            return null;
+            return v.fail("cuMemSetAccess", ra);
         }
         v.next += len;
         return at;
+    }
+
+    fn fail(v: *Vmm, call: []const u8, code: c_int) ?u64 {
+        if (v.failed == null) v.failed = .{ .call = call, .code = code };
+        return null;
     }
 
     fn release(ctx: *anyopaque, base: u64, len: usize) void {

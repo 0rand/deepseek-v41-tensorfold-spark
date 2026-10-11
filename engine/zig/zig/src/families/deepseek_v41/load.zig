@@ -3,6 +3,7 @@
 const std = @import("std");
 const cuda = @import("cuda");
 const named = @import("named.zig");
+const ex_stacks = @import("ex_stacks.zig");
 
 pub const Tensor = struct {
     ptr: u64,
@@ -38,7 +39,37 @@ pub const Weights = struct {
 
     /// Uploads every tensor `b` holds (its host images can be freed afterwards); a name already on the GPU is refused.
     pub fn upload(w: *Weights, d: *const cuda.Driver, b: *const named.Builder) !void {
-        for (b.out.items) |n| {
+        // TF_DSV41_EX_STACKS: a routed suh / svh and its shared expert's in one buffer (ex_stacks.zig)
+        var paired: std.AutoHashMapUnmanaged(usize, void) = .empty;
+        defer paired.deinit(w.gpa);
+        if (ex_stacks.enabled()) {
+            const names = try w.gpa.alloc([]const u8, b.out.items.len);
+            defer w.gpa.free(names);
+            const lens = try w.gpa.alloc(usize, b.out.items.len);
+            defer w.gpa.free(lens);
+            for (b.out.items, names, lens) |n, *x, *l| {
+                x.* = n.name;
+                l.* = n.bytes.len;
+            }
+            const ps = try ex_stacks.pairs(w.gpa, names, lens);
+            defer w.gpa.free(ps);
+            for (ps) |p| {
+                const r = b.out.items[p[0]];
+                const s = b.out.items[p[1]];
+                if (w.map.contains(r.name) or w.map.contains(s.name)) return error.DuplicateWeight;
+                var buf = try cuda.DeviceBuffer.alloc(d, r.bytes.len + s.bytes.len);
+                errdefer buf.free();
+                try cuda.DeviceBuffer.upload(buf, 0, r.bytes);
+                try cuda.DeviceBuffer.upload(buf, r.bytes.len, s.bytes);
+                try w.bufs.append(w.gpa, buf);
+                try w.put(r, buf.ptr);
+                try w.put(s, buf.ptr + r.bytes.len);
+                try paired.put(w.gpa, p[0], {});
+                try paired.put(w.gpa, p[1], {});
+            }
+        }
+        for (b.out.items, 0..) |n, i| {
+            if (paired.contains(i)) continue;
             if (w.map.contains(n.name)) return error.DuplicateWeight;
             var sha: [32]u8 = @splat(0);
             if (w.digest) std.crypto.hash.sha2.Sha256.hash(n.bytes, &sha, .{});
@@ -50,6 +81,13 @@ pub const Weights = struct {
         }
         // pageable uploads can still be in flight when cuMemcpyHtoD returns; the weights are whole before any launch
         try d.check(d.api.cuCtxSynchronize(), "cuCtxSynchronize");
+    }
+
+    fn put(w: *Weights, n: named.Named, ptr: u64) !void {
+        var sha: [32]u8 = @splat(0);
+        if (w.digest) std.crypto.hash.sha2.Sha256.hash(n.bytes, &sha, .{});
+        try w.map.put(w.gpa, try w.gpa.dupe(u8, n.name), .{ .ptr = ptr, .len = n.bytes.len, .kind = n.kind, .sha256 = sha, .shape = n.shape, .rank = n.rank });
+        w.bytes += n.bytes.len;
     }
 
     pub fn get(w: *const Weights, name: []const u8) ?Tensor {

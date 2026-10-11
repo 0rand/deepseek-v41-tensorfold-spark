@@ -139,6 +139,9 @@ pub const Served = struct {
         // drafts sized from the cost tables, not the wall clock: a request drafts (and so verifies) the same whatever the
         // load or the requests before it, so HTTP == CLI replay holds (TF_DSV41_DRAFT_TIMED=1: the measured pricing)
         s.cfg.timed = if (std.c.getenv("TF_DSV41_DRAFT_TIMED")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
+        // the depth policy as booted (Python's "M2 boot: DSpark on (depth ...)"): what a gate reads back from the log
+        const dset = s.x.policy.depth.set;
+        std.log.info("dsv41 depth: {t}, cap {d}, skip {s}, joint {d}, drafts priced {s}", .{ dset.mode, dset.cap, if (dset.skip) "on" else "off", dset.joint, if (s.cfg.timed) "by the wall clock" else "from the cost tables" });
         s.clock = .{ .io = io };
         s.core = lanes.Engine.init(gpa, &s.cfg, s.x.backend(), s.clock.clock());
         s.x.attach(&s.core);

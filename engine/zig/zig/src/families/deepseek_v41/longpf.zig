@@ -177,6 +177,8 @@ fn dtSize(dt: calls.Dt) i64 {
 /// `k`: the forward's ?*kv_state.Kv (its `blocks` and `fetchBlock`).
 /// TF_DSV41_PROFILE (profile.zig): each call timed on the GPU, the segment into the profile's prefill totals.
 pub fn window(s: *State, gpa: std.mem.Allocator, r: *run.Runner, k: anytype, start: u64, cs: []const calls.Call) !void {
+    try r.guard(cs);
+    if (k) |kx| if (kx.blocks.items.len > 0) for (cs) |*c| if (readsExchange(c)) try guardBlocks(gpa, r, kx, c);
     if (s.lazy) |*z| if (z.buf == null and names(cs, lazy_role)) try acquire(z, r);
     const p = r.prof;
     if (p) |x| x.beginPrefill();
@@ -215,6 +217,15 @@ pub fn release(s: *State, r: *run.Runner) !void {
     r.forget(lazy_role);
     b.free();
     z.buf = null;
+}
+
+/// The calls attendBlocks issues for `c`, one a block, probed before the window's first launch (Runner.guard).
+fn guardBlocks(gpa: std.mem.Allocator, r: *run.Runner, k: anytype, c: *const calls.Call) !void {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const subs = try arena.allocator().alloc(calls.Call, k.blocks.items.len);
+    for (k.blocks.items, subs) |b, *sub| sub.* = try blockCall(arena.allocator(), c, b.a, b.b);
+    try r.guard(subs);
 }
 
 fn attendBlocks(s: *State, gpa: std.mem.Allocator, r: *run.Runner, k: anytype, start: u64, c: *const calls.Call) !void {

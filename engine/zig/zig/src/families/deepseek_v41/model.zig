@@ -26,6 +26,7 @@ const prepared = @import("prepared.zig");
 const buffers = @import("buffers.zig");
 const forms = @import("forms.zig");
 const forms_inplace = @import("forms_inplace.zig");
+const ex_stacks = @import("ex_stacks.zig");
 const longpf = @import("longpf.zig");
 const run = @import("run.zig");
 const fwd = @import("forward.zig");
@@ -267,6 +268,8 @@ pub const Model = struct {
             m.f.opts.rope_rows = c + 2048;
         }
         try @import("prod_knobs.zig").apply(&m.f, a, io, m.tcfg.rank);
+        // TF_DSV41_IMAGES=native: on before the workspace and the buffer plan are sized (their image roles)
+        try vision_rows.bootPlan(gpa, io, &m.f, &m.driver, &m.weights);
         m.slots = try slots_mod.countFromEnv();
         if (try kvs.optionsFromEnv(@intCast(m.f.opts.limit), world)) |ko_| {
             var ko = ko_;
@@ -301,6 +304,8 @@ pub const Model = struct {
         if (longpf.lazyEnv()) if (bp.sizes.fetchOrderedRemove(longpf.lazy_role)) |kv| {
             m.f.prefill_state.long.lazy = .{ .bytes = kv.value };
         };
+        // TF_DSV41_EX_STACKS=1: the experts' suh / svh stacks read where the weights hold them (no second copy)
+        if (ex_stacks.enabled()) _ = try ex_stacks.bind(&m.runner, &m.weights, &bp);
         // TF_DSV41_FORMS_INPLACE=1: the dense forms over their trellis (not a second copy), unless a program reads it
         if (forms_inplace.enabled()) {
             const ws = &m.f.prefill_state.k4ws.plan;
@@ -308,6 +313,7 @@ pub const Model = struct {
         }
         tr.plan(bp.totals());
         try m.runner.bind(&bp);
+        try vision_rows.checkPlan(&m.f, &bp);
         tr.step("buffer plan", cuda.usage(false));
         const src: forms.Source = .{ .d = &m.driver, .weights = &m.weights, .plan = &m.pl };
         for (bp.sizes.keys()) |role| {
@@ -389,8 +395,8 @@ pub const Model = struct {
         // TF_DSV41_SAMPLING=1: keyed sampling (T > 0) on every rank; off: such requests are refused (error.Sampling)
         m.sampler = if (samp.enabled()) try samp.GpuSampler.init(gpa, &m.f) else null;
         m.gt.sampler = m.sampler;
-        // TF_DSV41_IMAGES=native (vision_rows.zig): Engram's keep at image positions on every rank, the tower on rank 0
-        try vision_rows.boot(gpa, io, &m.f, &m.pack, &m.driver, m.tcfg.rank, &m.weights);
+        // TF_DSV41_IMAGES=native (vision_rows.zig): the tower on rank 0 (the keep and the bias: bootPlan)
+        try vision_rows.bootTower(gpa, io, &m.f, &m.pack, &m.driver, m.tcfg.rank);
         // TF_DSV41_GRAMMAR=1: the checkpoint's grammar compilers on every rank (tokenizer.json from the pack, or
         // TF_DSV41_GRAMMAR_TOKENIZER's dir); masks for up to 64 rows a pick (Python's row cap)
         if (try grammar_gpu.enabled()) {

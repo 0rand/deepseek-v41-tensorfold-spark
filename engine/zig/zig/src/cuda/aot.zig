@@ -75,6 +75,8 @@ pub const Set = struct {
     parsed: std.json.Parsed(SetJson),
     variants: []Variant,
     gpa: std.mem.Allocator,
+    /// TF_DSV41_AOT_TRACE=<file>: every distinct lookup key and its outcome (Trace)
+    trace: ?*Trace = null,
 
     /// Loads every cubin listed in `dir`/aot.json into its own module.
     pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const Driver, device: abi.Device, dir: []const u8) !Set {
@@ -102,10 +104,11 @@ pub const Set = struct {
             variants[n] = .{ .spec = k, .kernel = try triton.Kernel.load(d, device, cubin, meta, name_z) };
             n += 1;
         }
-        return .{ .parsed = parsed, .variants = variants, .gpa = gpa };
+        return .{ .parsed = parsed, .variants = variants, .gpa = gpa, .trace = try Trace.fromEnv(gpa, io) };
     }
 
     pub fn deinit(self: *Set) void {
+        if (self.trace) |t| t.destroy();
         for (self.variants) |*v| v.kernel.unload();
         self.gpa.free(self.variants);
         self.parsed.deinit();
@@ -116,8 +119,11 @@ pub const Set = struct {
     pub fn find(self: *const Set, function: []const u8, args: []const Arg, consts: []const Const) !*const Variant {
         for (self.variants) |*v| {
             if (!std.mem.eql(u8, v.spec.@"fn", function)) continue;
-            if (matches(v.spec, args, consts)) return v;
+            if (!matches(v.spec, args, consts)) continue;
+            if (self.trace) |t| t.note(function, args, consts, v.spec.hash);
+            return v;
         }
+        if (self.trace) |t| t.note(function, args, consts, null);
         std.log.err("no captured Triton variant of {s} for this launch:", .{function});
         for (args) |a| switch (a.value) {
             .ptr => |p| std.log.err("  {s}: {s} at {x} (16-aligned {})", .{ a.name, p.ty, p.addr, p.addr % 16 == 0 }),
@@ -159,6 +165,90 @@ pub const Set = struct {
             }
         }
         try v.kernel.launchOn(.{ .x = grid[0], .y = grid[1], .z = grid[2] }, stream, &packed_args, .{}, &.{});
+    }
+};
+
+/// TF_DSV41_AOT_TRACE=<file>: one JSON line per distinct `find` key (as `matches` reads it) and its hit hash or null.
+pub const Trace = struct {
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    mutex: std.Io.Mutex = .init,
+    seen: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    text: std.ArrayList(u8) = .empty,
+
+    pub fn fromEnv(gpa: std.mem.Allocator, io: std.Io) !?*Trace {
+        const p = std.c.getenv("TF_DSV41_AOT_TRACE") orelse return null;
+        const path = std.mem.span(p);
+        if (path.len == 0) return null;
+        const t = try gpa.create(Trace);
+        t.* = .{ .gpa = gpa, .io = io, .path = path };
+        return t;
+    }
+
+    pub fn destroy(t: *Trace) void {
+        t.seen.deinit(t.gpa);
+        t.text.deinit(t.gpa);
+        t.gpa.destroy(t);
+    }
+
+    /// The key's hash: what `matches` tells apart, nothing else (equal keys pick the same variant).
+    pub fn key(function: []const u8, args: []const Arg, consts: []const Const) u64 {
+        var h = std.hash.Wyhash.init(0);
+        h.update(function);
+        for (args) |a| {
+            h.update(a.name);
+            h.update(class(a));
+            if (a.value == .ptr) h.update(a.value.ptr.ty);
+        }
+        for (consts) |c| {
+            h.update(c.name);
+            if (c.int) |x| h.update(std.mem.asBytes(&x));
+            if (c.f32) |x| h.update(std.mem.asBytes(&@as(u32, @bitCast(x))));
+            h.update("|");
+        }
+        return h.final();
+    }
+
+    fn class(a: Arg) []const u8 {
+        return switch (a.value) {
+            .i32 => |x| if (x == 1) "1" else if (@mod(x, 16) == 0) "div16" else "int",
+            .ptr => |x| if (x.addr % 16 == 0) "ptr/16" else "ptr",
+            .f32 => "fp32",
+            .u64 => |x| if (x % 16 == 0) "u64/16" else "u64",
+        };
+    }
+
+    pub fn note(t: *Trace, function: []const u8, args: []const Arg, consts: []const Const, hash: ?[]const u8) void {
+        const k = key(function, args, consts);
+        t.mutex.lockUncancelable(t.io);
+        defer t.mutex.unlock(t.io);
+        const got = t.seen.getOrPut(t.gpa, k) catch return;
+        if (got.found_existing) return;
+        t.line(function, args, consts, hash) catch return;
+        std.Io.Dir.cwd().writeFile(t.io, .{ .sub_path = t.path, .data = t.text.items }) catch {};
+    }
+
+    fn line(t: *Trace, function: []const u8, args: []const Arg, consts: []const Const, hash: ?[]const u8) !void {
+        var w: std.Io.Writer.Allocating = .fromArrayList(t.gpa, &t.text);
+        defer t.text = w.toArrayList();
+        const o = &w.writer;
+        try o.print("{{\"fn\":\"{s}\",\"hit\":", .{function});
+        if (hash) |x| try o.print("\"{s}\"", .{x}) else try o.writeAll("null");
+        try o.writeAll(",\"args\":{");
+        for (args, 0..) |a, i| {
+            const ty = switch (a.value) {
+                .ptr => |x| x.ty,
+                else => "",
+            };
+            try o.print("{s}\"{s}\":\"{s}{s}{s}\"", .{ if (i > 0) "," else "", a.name, ty, if (ty.len > 0) " " else "", class(a) });
+        }
+        try o.writeAll("},\"consts\":{");
+        for (consts, 0..) |c, i| {
+            try o.print("{s}\"{s}\":", .{ if (i > 0) "," else "", c.name });
+            if (c.int) |x| try o.print("{d}", .{x}) else if (c.f32) |x| try o.print("{e}", .{x}) else try o.writeAll("null");
+        }
+        try o.writeAll("}}\n");
     }
 };
 

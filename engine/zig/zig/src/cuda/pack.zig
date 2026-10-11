@@ -15,10 +15,26 @@ pub const Pack = struct {
     segments: std.ArrayList([2]u64) = .empty,
     cursor: u64 = 0,
     limit: u64 = 0,
-    stats: struct { buffers: u64 = 0, bytes: u64 = 0, mapped: u64 = 0, freed: u64 = 0, outside: u64 = 0 } = .{},
+    stats: struct { buffers: u64 = 0, bytes: u64 = 0, mapped: u64 = 0, freed: u64 = 0, outside: u64 = 0, fell_back: u64 = 0 } = .{},
+    /// a backend whose chunks do not follow each other (cuMemAlloc): segments of `seg_min`, larger buffers their own
+    fallback: ?arena.Backend = null,
+    contiguous: bool = true,
+    seg_min: usize = 256 << 20,
 
     pub fn init(gpa: std.mem.Allocator, be: arena.Backend) Pack {
         return .{ .gpa = gpa, .be = be };
+    }
+
+    /// The first backend's chunk failed: pack on the fallback from here (none: the buffer goes to cuMemAlloc).
+    fn fallBack(p: *Pack) bool {
+        const f = p.fallback orelse return false;
+        p.be = f;
+        p.fallback = null;
+        p.contiguous = false;
+        p.cursor = 0;
+        p.limit = 0;
+        p.stats.fell_back += 1;
+        return true;
     }
 
     /// Under DeviceBuffer.alloc / free, over whatever hook was there (the pack must outlive every buffer it hands out).
@@ -49,6 +65,7 @@ pub const Pack = struct {
             const h = p.prev orelse return null;
             return h.alloc(h.ctx, len);
         }
+        if (!p.contiguous) return p.segmented(len);
         const at = std.mem.alignForward(u64, p.cursor, p.alignment);
         if (at + len > p.limit) {
             const grow = std.mem.alignForward(usize, @intCast(at + len - p.limit), p.be.granularity);
@@ -65,11 +82,32 @@ pub const Pack = struct {
             };
             // the first segment, or a new one: the buffer's own pages to start it
             const n = std.mem.alignForward(usize, len, p.be.granularity);
-            const base = p.be.chunk(p.be.ctx, n) orelse return null;
+            const base = p.be.chunk(p.be.ctx, n) orelse return if (p.fallBack()) p.segmented(len) else null;
             p.segments.append(p.gpa, .{ base, n }) catch return null;
             p.stats.mapped += n;
             p.cursor = base;
             p.limit = base + n;
+        }
+        return p.place(len);
+    }
+
+    /// Without contiguous growth: a `seg_min`+ buffer its own chunk, the rest bumped in segments.
+    fn segmented(p: *Pack, len: usize) ?u64 {
+        if (len >= p.seg_min) {
+            const n = std.mem.alignForward(usize, len, p.be.granularity);
+            const base = p.be.chunk(p.be.ctx, n) orelse return null;
+            p.segments.append(p.gpa, .{ base, n }) catch return null;
+            p.stats.mapped += n;
+            p.stats.buffers += 1;
+            p.stats.bytes += len;
+            return base;
+        }
+        if (std.mem.alignForward(u64, p.cursor, p.alignment) + len > p.limit) {
+            const base = p.be.chunk(p.be.ctx, p.seg_min) orelse return null;
+            p.segments.append(p.gpa, .{ base, p.seg_min }) catch return null;
+            p.stats.mapped += p.seg_min;
+            p.cursor = base;
+            p.limit = base + p.seg_min;
         }
         return p.place(len);
     }
@@ -134,6 +172,19 @@ const Fake = struct {
         return at;
     }
     fn release(_: *anyopaque, _: u64, _: usize) void {}
+};
+
+/// A backend whose every chunk fails (GB10's VMM on the Sparks, 2026-10-11: 0 buffers packed).
+const Broken = struct {
+    calls: u32 = 0,
+    fn backend(b: *Broken) arena.Backend {
+        return .{ .ctx = b, .granularity = 2 << 20, .chunk = chunk, .release = Fake.release, .name = "broken" };
+    }
+    fn chunk(ctx: *anyopaque, _: usize) ?u64 {
+        const b: *Broken = @ptrCast(@alignCast(ctx));
+        b.calls += 1;
+        return null;
+    }
 };
 
 const Prev = struct {
@@ -203,4 +254,42 @@ test "pack: a range that does not follow the last starts a new segment" {
     const x = p.alloc(3 << 20).?;
     try t.expectEqual(@as(usize, 2), p.segments.items.len);
     try t.expect(p.owns(x) and !p.owns(1));
+}
+
+test "pack: when the first backend's chunks fail it packs on the fallback; a boot never packs 0 buffers" {
+    const t = std.testing;
+    var broken: Broken = .{};
+    var plain: Fake = .{ .gap = true }; // cuMemAlloc's chunks: never following each other
+    var p = Pack.init(t.allocator, broken.backend());
+    defer p.segments.deinit(t.allocator);
+    p.fallback = plain.backend(2 << 20);
+    p.seg_min = 64 << 20;
+    p.begin();
+    var sizes: [800]usize = undefined;
+    var prng = std.Random.DefaultPrng.init(5);
+    // the weights' small tensors (scales, norms, tables) between a few large ones
+    for (&sizes, 0..) |*s, i| s.* = if (i % 40 == 0) 300 << 20 else prng.random().intRangeAtMost(usize, 1000, 2 << 20);
+    var total: u64 = 0;
+    var spans: std.ArrayList([2]u64) = .empty;
+    defer spans.deinit(t.allocator);
+    for (sizes) |s| {
+        const x = p.alloc(s) orelse return error.NotPacked;
+        try t.expectEqual(@as(u64, 0), x % 512);
+        try spans.append(t.allocator, .{ x, x + s });
+        total += s;
+    }
+    try t.expectEqual(@as(u32, 1), broken.calls); // tried once, then the fallback for good
+    try t.expectEqual(@as(u64, 1), p.stats.fell_back);
+    try t.expectEqual(@as(u64, sizes.len), p.stats.buffers);
+    // no two buffers overlap
+    std.mem.sort([2]u64, spans.items, {}, struct {
+        fn lt(_: void, a: [2]u64, b: [2]u64) bool {
+            return a[0] < b[0];
+        }
+    }.lt);
+    for (spans.items[1..], spans.items[0 .. spans.items.len - 1]) |b, a| try t.expect(b[0] >= a[1]);
+    // slack: the segments' tails and the large buffers' own rounding, a small part of 2 MiB-rounding each buffer
+    var rounded: u64 = 0;
+    for (sizes) |s| rounded += std.mem.alignForward(u64, s, 2 << 20);
+    try t.expect(p.slack() * 10 < rounded - total);
 }

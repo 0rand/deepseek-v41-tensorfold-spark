@@ -5,7 +5,7 @@
 //! far, the snapshot's RAM measure and duplicate, the RAM tier's entries, the NVMe tier's files, the pool's free and
 //! unreserved pages. Slots interleave: a chat resumes while others hold pages, reservations and shared RAM pages.
 //! Every resume is checked row for row against what the slot that saved it wrote (a fresh prefill's rows: a function
-//! of the position's id), and the restored bounded state against the saved one.
+//! of the position's id), and the restored bounded state against the saved one. Split KV: two ranks, each its own rows.
 
 const std = @import("std");
 const testing = std.testing;
@@ -20,6 +20,8 @@ const Bounded = sessions.store.Bounded;
 const Blob = sessions.disk.Blob;
 
 const golden_json = @embedFile("sess4_golden.json");
+/// kvsplit's own store and split pool (2 ranks: their decisions alike) on 30 pages (golden.py --split 2 --pages 30)
+const split_golden_json = @embedFile("sess4_split_golden.json");
 
 const Saved = struct { at: u64, nbytes: u64, ds_rows: u64, dup: bool };
 const Step = struct {
@@ -62,6 +64,12 @@ const fams = [_]Family{
     .{ .name = "comp.2", .ratio = 2, .row_bytes = 584 },
     .{ .name = "index_k.2", .ratio = 2, .row_bytes = 132 },
     .{ .name = "comp.20", .ratio = 1, .row_bytes = 584 },
+};
+/// TF_DSV41_KV_SPLIT=1: the comp rows of a page live on the rank that owns it, the indexer's on every rank
+const split_fams = [_]Family{
+    .{ .name = "comp.2", .ratio = 2, .row_bytes = 584, .split = true },
+    .{ .name = "index_k.2", .ratio = 2, .row_bytes = 132 },
+    .{ .name = "comp.20", .ratio = 1, .row_bytes = 584, .split = true },
 };
 
 /// A snapshot's bounded state in host memory: what the slot's state at `pos` carries for the next resume (the drafter's
@@ -119,6 +127,7 @@ fn rowByte(id: i32, pos: u64, fi: usize, i: usize) u8 {
 const World = struct {
     gpa: std.mem.Allocator,
     g: Golden,
+    fams: []const Family,
     pool: Pool,
     host: sessions.HostPool,
     disk: *sessions.Disk,
@@ -138,10 +147,11 @@ const World = struct {
     /// Writes the rows of positions [from, to) of the slot's pages (each family's rows that start there).
     fn write(w: *World, s: *const Slot, ids: []const i32, from: u64, to: u64) void {
         const page = w.pool.page;
-        for (fams, 0..) |f, fi| {
+        for (w.fams, 0..) |f, fi| {
             var p = from - from % f.ratio + (if (from % f.ratio != 0) f.ratio else 0);
             while (p < to) : (p += f.ratio) {
                 const pg = s.mapped()[@intCast(p / page)];
+                if (f.split and !w.pool.owns(pg)) continue;
                 const v = w.host.pageOf(@intCast(fi), w.pool.familyPage(f, pg));
                 const at: usize = @intCast((p % page) / f.ratio * f.row_bytes);
                 for (v[at..][0..f.row_bytes], 0..) |*b, i| b.* = rowByte(ids[@intCast(p)], p, fi, i);
@@ -152,10 +162,11 @@ const World = struct {
     /// Every row below `pos` of the slot's pages holds what a fresh prefill of `ids` writes there.
     fn check(w: *World, s: *const Slot, ids: []const i32, pos: u64) !void {
         const page = w.pool.page;
-        for (fams, 0..) |f, fi| {
+        for (w.fams, 0..) |f, fi| {
             var p: u64 = 0;
             while (p + f.ratio <= pos) : (p += f.ratio) {
                 const pg = s.mapped()[@intCast(p / page)];
+                if (f.split and !w.pool.owns(pg)) continue;
                 const v = w.host.pageOf(@intCast(fi), w.pool.familyPage(f, pg));
                 const at: usize = @intCast((p % page) / f.ratio * f.row_bytes);
                 for (v[at..][0..f.row_bytes], 0..) |b, i| if (b != rowByte(ids[@intCast(p)], p, fi, i)) {
@@ -285,29 +296,22 @@ const World = struct {
     }
 };
 
-test "4 slots, interleaved resumes, spills, RAM trims and NVMe parks decide as prod's store, pool and tier" {
-    const gpa = testing.allocator;
-    var parsed = try std.json.parseFromSlice(Golden, gpa, golden_json, .{ .ignore_unknown_fields = true });
-    defer parsed.deinit();
-    const g = parsed.value;
-    try testing.expectEqual(@as(u64, sess.slack), g.slack);
-    try testing.expectEqual(sess.row_bytes, g.measure.row_bytes);
-    try testing.expectEqual(sess.keep, g.measure.keep);
-    try testing.expectEqual(sess.lookback, g.measure.lookback);
+/// The golden's steps on one rank of `world`; every step must decide as prod did (replicated or split alike).
+fn replay(gpa: std.mem.Allocator, g: Golden, families: []const Family, world: u32, rank: u32) !void {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(testing.io, "tier");
     const root = try tmp.dir.realPathFileAlloc(testing.io, "tier", gpa);
     defer gpa.free(root);
 
-    var w: World = .{ .gpa = gpa, .g = g, .pool = undefined, .host = undefined, .disk = undefined, .store = undefined, .arena = .init(gpa) };
+    var w: World = .{ .gpa = gpa, .g = g, .fams = families, .pool = undefined, .host = undefined, .disk = undefined, .store = undefined, .arena = .init(gpa) };
     defer w.arena.deinit();
     defer w.names.deinit(gpa);
-    w.pool = try Pool.init(gpa, .{ .families = &fams, .page = g.page }, @as(u64, g.pages) * g.page, 1, 0);
+    w.pool = try Pool.init(gpa, .{ .families = families, .page = g.page }, @as(u64, g.pages) * g.page, world, rank);
     defer w.pool.deinit();
     w.host = try sessions.HostPool.init(gpa, &w.pool);
     defer w.host.deinit();
-    w.disk = try sessions.Disk.open(gpa, testing.io, .{ .root = root, .compat = @splat(9), .min_tokens = g.disk_min, .chunk = 1 << 20, .staging = 4, .lanes = 2, .direct = false });
+    w.disk = try sessions.Disk.open(gpa, testing.io, .{ .root = root, .compat = @splat(9), .rank = rank, .world = world, .min_tokens = g.disk_min, .chunk = 1 << 20, .staging = 4, .lanes = 2, .direct = false });
     defer w.disk.close();
     // prod's store: its RAM budget, no residency budget, no covered-entry or delta rules (sessions_gpu.optionsFromEnv)
     w.store = try Store.init(gpa, testing.io, &w.pool, w.host.store(), w.disk, .{ .ram_bytes = g.ram_bytes, .skip_covered = false, .delta = false });
@@ -330,4 +334,28 @@ test "4 slots, interleaved resumes, spills, RAM trims and NVMe parks decide as p
     // the golden exercises what it claims: spills, both tiers' resumes, parks and drops
     try testing.expect(spills >= 2 and hits[0] >= 2 and hits[1] >= 3);
     try testing.expect(w.store.stats.parks >= 3 and w.store.stats.drops >= 2);
+}
+
+fn golden(gpa: std.mem.Allocator, text: []const u8) !std.json.Parsed(Golden) {
+    const parsed = try std.json.parseFromSlice(Golden, gpa, text, .{ .ignore_unknown_fields = true });
+    errdefer parsed.deinit();
+    const g = parsed.value;
+    try testing.expectEqual(@as(u64, sess.slack), g.slack);
+    try testing.expectEqual(sess.row_bytes, g.measure.row_bytes);
+    try testing.expectEqual(sess.keep, g.measure.keep);
+    try testing.expectEqual(sess.lookback, g.measure.lookback);
+    return parsed;
+}
+
+test "4 slots, interleaved resumes, spills, RAM trims and NVMe parks decide as prod's store, pool and tier" {
+    const parsed = try golden(testing.allocator, golden_json);
+    defer parsed.deinit();
+    try replay(testing.allocator, parsed.value, &fams, 1, 0);
+}
+
+test "split KV over 2 ranks with 4 slots: each rank decides as kvsplit's store and pool, restoring only its own rows" {
+    const parsed = try golden(testing.allocator, split_golden_json);
+    defer parsed.deinit();
+    try replay(testing.allocator, parsed.value, &split_fams, 2, 0);
+    try replay(testing.allocator, parsed.value, &split_fams, 2, 1);
 }

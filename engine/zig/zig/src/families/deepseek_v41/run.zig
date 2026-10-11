@@ -44,6 +44,10 @@ pub const Runner = struct {
     /// right after its last call that writes "w.taps", the drafter's ingests on their own stream wait on it; `armed`
     /// for the next window only (batch.zig sets it before the row window, eager or captured, and clears it after)
     taps_mark: ?TapsMark = null,
+    /// Runner.guard: the programs (programKey) whose every Triton call the AOT set resolved
+    verified: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    /// Runner.guard: each Triton function's runtime parameters (built at the first window)
+    params: ?Params = null,
 
     pub const TapsMark = struct { ev: cuda.Event, armed: bool = false, recorded: u64 = 0 };
 
@@ -76,6 +80,8 @@ pub const Runner = struct {
         var it = r.addrs.keyIterator();
         while (it.next()) |k| r.gpa.free(k.*);
         r.addrs.deinit(r.gpa);
+        r.verified.deinit(r.gpa);
+        if (r.params) |*p| freeParams(r.gpa, p);
     }
 
     /// A persistent role whose memory another owner holds (M5: the KV pool's family tensors and tables): bind leaves it.
@@ -137,24 +143,22 @@ pub const Runner = struct {
         };
     }
 
-    /// The first Triton call of `cs` the AOT set has no variant for (its function's name), null when every one has:
-    /// a program's launches resolved without issuing them (a boot-time probe), every tensor taken 16-aligned as the
-    /// runner's buffers are.
+    /// The first Triton call of `cs` with no AOT variant (its function name), else null; launches nothing (alignedOf).
     pub fn missingTriton(r: *const Runner, cs: []const calls.Call) !?[]const u8 {
-        var arena = std.heap.ArenaAllocator.init(r.gpa);
-        defer arena.deinit();
-        const a = arena.allocator();
-        for (cs) |*c| if (c.triton) {
-            var mine: std.ArrayList(cuda.aot.Spec) = .empty;
-            for (r.triton.variants) |v| if (std.mem.eql(u8, v.spec.@"fn", c.name)) try mine.append(a, v.spec);
-            const sp = tc.split(a, c, mine.items, .{ .ctx = @constCast(r), .of = alignedAddr }) catch return c.name;
-            _ = r.triton.find(c.name, sp.args, sp.consts) catch return c.name; // error.MissingTritonVariant
-        };
-        return null;
+        return missingIn(r.gpa, r.triton, cs);
     }
 
-    fn alignedAddr(_: *anyopaque, _: calls.Tensor) anyerror!u64 {
-        return 1 << 20;
+    /// Before a window's first launch: each Triton call of `cs` has a variant, else MissingTritonVariant (AOT guard).
+    pub fn guard(r: *Runner, cs: []const calls.Call) !void {
+        if (!guardOn()) return;
+        if (r.params == null) r.params = try paramsOf(r.gpa, r.triton);
+        const k = programKey(cs, &r.params.?);
+        if (r.verified.contains(k)) return;
+        if (try missingIn(r.gpa, r.triton, cs)) |name| {
+            std.log.err("aot guard: no Triton variant of {s} in this window of {d} calls: nothing issued, its request fails", .{ name, cs.len });
+            return error.MissingTritonVariant;
+        }
+        try r.verified.put(r.gpa, k, {});
     }
 
     fn addrOf(ctx: *anyopaque, t: calls.Tensor) anyerror!u64 {
@@ -294,6 +298,7 @@ pub const Runner = struct {
     /// Issues a window's calls in order. TF_DSV41_SYNC_EACH=1 (diagnosis): the stream synced after every call, and a
     /// failing call named with its index and row count (an asynchronous fault otherwise surfaces windows later).
     pub fn window(r: *Runner, cs: []const calls.Call) !void {
+        try r.guard(cs);
         if (syncEach()) return r.windowChecked(cs);
         errdefer r.dropForks(); // a failed window (or capture) leaves no fork for the next one to join
         const mark = r.markAt(cs);
@@ -308,6 +313,7 @@ pub const Runner = struct {
     /// window): a drafter program has no branch, deferral or prefetch marks, and no glue step; the runner's stream is
     /// this one while they issue. Nothing joins: the caller orders `stream` with its own events.
     pub fn windowOn(r: *Runner, stream: cuda.Stream, cs: []const calls.Call) !void {
+        try r.guard(cs);
         const main = r.stream;
         r.stream = stream;
         defer r.stream = main;
@@ -357,6 +363,7 @@ pub const Runner = struct {
     /// An eager decode window, each call timed when TF_DSV41_PROFILE is set (never inside a graph capture).
     pub fn timedWindow(r: *Runner, cs: []const calls.Call) !void {
         const p = r.prof orelse return r.window(cs);
+        try r.guard(cs);
         if (syncEach()) return r.windowChecked(cs);
         p.begin();
         errdefer r.dropForks();
@@ -386,6 +393,111 @@ pub fn lastTaps(cs: []const calls.Call) ?usize {
 }
 
 var sync_each: ?bool = null;
+/// The first Triton call of `cs` that `set` has no variant for, every role's base 16-aligned (Runner.missingTriton).
+pub fn missingIn(gpa: std.mem.Allocator, set: *const cuda.aot.Set, cs: []const calls.Call) !?[]const u8 {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for (cs) |*c| if (c.triton) {
+        var mine: std.ArrayList(cuda.aot.Spec) = .empty;
+        for (set.variants) |v| if (std.mem.eql(u8, v.spec.@"fn", c.name)) try mine.append(a, v.spec);
+        const sp = tc.split(a, c, mine.items, .{ .ctx = undefined, .of = alignedOf }) catch return c.name;
+        _ = set.find(c.name, sp.args, sp.consts) catch return c.name; // error.MissingTritonVariant
+    };
+    return null;
+}
+
+/// A tensor's address with its role's base 16-aligned (aot-needs' rule); an empty tensor or role is 0 (tensorAddr's).
+fn alignedOf(_: *anyopaque, t: calls.Tensor) anyerror!u64 {
+    return if (emptyTensor(t)) 0 else (1 << 20) + @as(u64, @intCast(t.offset));
+}
+
+fn emptyTensor(t: calls.Tensor) bool {
+    var numel: i64 = 1;
+    for (t.shape) |n| numel *= n;
+    return numel == 0 or t.role == .empty;
+}
+
+/// Each Triton function's runtime parameter names over its variants (tc.split: other ints are constexprs).
+pub const Params = std.StringHashMapUnmanaged([]const []const u8);
+
+pub fn paramsOf(gpa: std.mem.Allocator, set: *const cuda.aot.Set) !Params {
+    var specs: std.ArrayList(cuda.aot.Spec) = .empty;
+    defer specs.deinit(gpa);
+    for (set.variants) |v| try specs.append(gpa, v.spec);
+    return paramsOfSpecs(gpa, specs.items);
+}
+
+pub fn paramsOfSpecs(gpa: std.mem.Allocator, specs: []const cuda.aot.Spec) !Params {
+    var lists: std.StringArrayHashMapUnmanaged(std.ArrayList([]const u8)) = .empty;
+    defer {
+        for (lists.values()) |*l| l.deinit(gpa);
+        lists.deinit(gpa);
+    }
+    for (specs) |sp| {
+        const got = try lists.getOrPut(gpa, sp.@"fn");
+        if (!got.found_existing) got.value_ptr.* = .empty;
+        for (sp.params) |q| if (!named(got.value_ptr.items, q.name)) try got.value_ptr.append(gpa, q.name);
+    }
+    var p: Params = .empty;
+    errdefer freeParams(gpa, &p);
+    for (lists.keys(), lists.values()) |k, *l| try p.put(gpa, k, try l.toOwnedSlice(gpa));
+    return p;
+}
+
+pub fn freeParams(gpa: std.mem.Allocator, p: *Params) void {
+    var it = p.valueIterator();
+    while (it.next()) |v| gpa.free(v.*);
+    p.deinit(gpa);
+}
+
+/// A program's Triton lookups hashed as `find` tells them apart (launch ints by class, tensors by dtype and alignment).
+pub fn programKey(cs: []const calls.Call, params: *const Params) u64 {
+    var h = std.hash.Wyhash.init(0x5d41);
+    for (cs) |*c| if (c.triton) {
+        h.update(c.name);
+        const ps = params.get(c.name) orelse &.{};
+        for (c.args) |x| {
+            h.update(x.name);
+            if (x.arg == .i and named(ps, x.name)) {
+                const v = x.arg.i;
+                h.update(&.{ @intFromBool(v == 1), @intFromBool(@mod(v, 16) == 0), @intFromBool(std.math.cast(i32, v) != null) });
+            } else hashArg(&h, x.arg);
+        }
+        h.update("|");
+    };
+    return h.final();
+}
+
+fn named(ps: []const []const u8, name: []const u8) bool {
+    for (ps) |p| if (std.mem.eql(u8, p, name)) return true;
+    return false;
+}
+
+fn hashArg(h: *std.hash.Wyhash, x: calls.Arg) void {
+    h.update(&.{@backingInt(std.meta.activeTag(x))});
+    switch (x) {
+        .t, .opaque_table => |t| {
+            h.update(@tagName(t.dt));
+            h.update(&.{ @intFromBool(emptyTensor(t)), @intFromBool(@mod(t.offset, 16) == 0) });
+        },
+        .i => |v| h.update(std.mem.asBytes(&v)),
+        .f => |v| h.update(std.mem.asBytes(&v)),
+        .b => |v| h.update(&.{@intFromBool(v)}),
+        .none => {},
+        .list => |items| for (items) |y| hashArg(h, y),
+    }
+}
+
+var guard_on: ?bool = null;
+
+fn guardOn() bool {
+    if (guard_on) |v| return v;
+    const v = if (std.c.getenv("TF_DSV41_AOT_GUARD")) |x| !std.mem.eql(u8, std.mem.span(x), "0") else true;
+    guard_on = v;
+    return v;
+}
+
 fn syncEach() bool {
     if (sync_each) |v| return v;
     const v = if (std.c.getenv("TF_DSV41_SYNC_EACH")) |x| std.mem.eql(u8, std.mem.span(x), "1") else false;

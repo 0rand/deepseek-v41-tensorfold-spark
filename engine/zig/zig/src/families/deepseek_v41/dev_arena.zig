@@ -54,6 +54,7 @@ pub const Installed = struct {
     backend: Mode,
     /// TF_DSV41_ARENA=pack: open from install to the end of boot (`endBoot`)
     pack: ?cuda.pack.Pack = null,
+    vmm_open: bool = false,
 
     /// Boot's buffers are in: later ones (workspaces, images, sessions) are allocated and freed as before.
     pub fn endBoot(x: *Installed, rank: u32) void {
@@ -63,6 +64,8 @@ pub const Installed = struct {
         const slack = @as(f64, @floatFromInt(p.slack())) / (1 << 20);
         // a buffer freed during boot stays mapped to the end (`freed`): a count that should stay small
         log.info("device arena: rank {d}: {d} boot buffers packed, {d:.2} GiB in {d} mapping(s), {d:.1} MiB slack, {d} freed during boot", .{ rank, p.stats.buffers, gib, p.segments.items.len, slack, p.stats.freed });
+        if (x.vmm_open) if (x.vmm.failed) |f| log.warn("device arena: rank {d}: VMM's chunks failed ({s}: CUresult {d}); packed on cuMemAlloc segments of {d} MiB", .{ rank, f.call, f.code, p.seg_min >> 20 });
+        if (p.stats.buffers == 0) log.warn("device arena: rank {d}: TF_DSV41_ARENA=pack packed nothing: every boot buffer went to cuMemAlloc", .{rank});
     }
 };
 
@@ -80,13 +83,21 @@ pub fn install(gpa: std.mem.Allocator, ctx: *const cuda.Context, rank: u32) !?*I
     if (m == .pack) {
         var total: usize = 0;
         try d.check(d.api.cuDeviceTotalMem_v2(&total, ctx.device), "cuDeviceTotalMem");
-        // a mapping of its own, so every growth follows the last: no other user maps in between
-        x.vmm = try cuda.arena.Vmm.open(d, ctx.device, 2 * total);
         x.backend = .pack;
-        x.pack = cuda.pack.Pack.init(gpa, x.vmm.backend());
+        // a mapping of its own, so every growth follows the last; where VMM fails (logged): cuMemAlloc segments
+        if (cuda.arena.Vmm.open(d, ctx.device, 2 * total)) |v| {
+            x.vmm = v;
+            x.vmm_open = true;
+            x.pack = cuda.pack.Pack.init(gpa, x.vmm.backend());
+            x.pack.?.fallback = x.plain.backend();
+        } else |e| {
+            log.warn("device arena: rank {d}: no CUDA virtual memory ({t}): packed on cuMemAlloc segments", .{ rank, e });
+            x.pack = cuda.pack.Pack.init(gpa, x.plain.backend());
+            x.pack.?.contiguous = false;
+        }
         x.pack.?.install();
         x.pack.?.begin();
-        log.info("device arena: rank {d}: pack, {d} KiB granularity, boot's buffers back to back", .{ rank, x.vmm.granularity >> 10 });
+        log.info("device arena: rank {d}: pack, {d} KiB granularity, boot's buffers back to back", .{ rank, x.pack.?.be.granularity >> 10 });
         return x;
     }
     var be = x.plain.backend();
