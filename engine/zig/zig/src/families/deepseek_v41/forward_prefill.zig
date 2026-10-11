@@ -138,7 +138,7 @@ fn planPrograms(f: *Forward, p: *buffers.Plan, rows: u32, layers: []const u32) !
     var ra = std.heap.ArenaAllocator.init(f.gpa);
     defer ra.deinit();
     const replay = f.prefill_state.mode == .replay;
-    const runs = try block_prefill.planRuns(ra.allocator(), f.cfg, f.widths, vision_rows.planOptions(f), if (replay) try encoderLayers(f, layers) else layers, if (replay) try decoderLayers(f, layers) else null, rows, if (replay) .encoder else .whole);
+    const runs = try block_prefill.planRuns(ra.allocator(), f.cfg, f.widths, vision_rows.runOptions(f), if (replay) try encoderLayers(f, layers) else layers, if (replay) try decoderLayers(f, layers) else null, rows, if (replay) .encoder else .whole);
     for (runs.items) |cs| try p.add(cs);
 }
 
@@ -199,7 +199,7 @@ fn planWorkspace(f: *Forward, wp: *buffers.Plan, rows: u32, layers: []const u32)
     if (replay and f.opts.pf_tbo and rows >= 2 * block_prefill.tbo_min) {
         const enc = try encoderLayers(f, layers);
         const k4 = f.prefill_state.k4;
-        const op = if (k4) k4Options(vision_rows.planOptions(f)) else vision_rows.planOptions(f);
+        const op = if (k4) k4Options(vision_rows.runOptions(f)) else vision_rows.runOptions(f);
         const seg: u32 = if (k4) K4.rows else rows;
         const top = @max(0, try lastStartWith(f, op, enc, seg, .encoder) - seg); // B at the last start a segment takes
         for ([_]i64{ 0, top }) |start| {
