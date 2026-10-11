@@ -67,7 +67,7 @@ pub const Blas = struct {
     }
 
     /// ``F.linear(x [m, k], W [n, k])`` -> y [m, n] bf16: column-major y^T [n, m] = W^T' x^T (opT on W, lda = ldb = k).
-    pub fn linear(b: *const Blas, stream: ?*anyopaque, workspace: u64, x: u64, m: usize, k: usize, w: u64, n: usize, y: u64) !void {
+    pub fn linear(b: *const Blas, stream: ?*anyopaque, workspace: u64, x: u64, xt: bool, m: usize, k: usize, w: u64, n: usize, y: u64) !void {
         const api = b.api;
         try b.check(api.cublasSetStream_v2(b.handle, stream), "cublasSetStream");
         try b.check(api.cublasSetWorkspace_v2(b.handle, workspace, workspace_bytes), "cublasSetWorkspace");
@@ -76,7 +76,10 @@ pub const Blas = struct {
         const zero: f32 = 0;
         const ki: c_int = @intCast(k);
         const ni: c_int = @intCast(n);
-        try b.check(api.cublasGemmEx(b.handle, op_t, op_n, ni, @intCast(m), ki, &one, w, r_16bf, ki, x, r_16bf, ki, &zero, y, r_16bf, ni, compute_32f, gemm_default_tensor_op), "cublasGemmEx");
+        // `xt`: x a [k, m] buffer read as [m, k] (strides 1, m), as torch passes such a view: opT on x, ldb = m
+        const opx = if (xt) op_t else op_n;
+        const ldx: c_int = @intCast(if (xt) m else k);
+        try b.check(api.cublasGemmEx(b.handle, op_t, opx, ni, @intCast(m), ki, &one, w, r_16bf, ki, x, r_16bf, ldx, &zero, y, r_16bf, ni, compute_32f, gemm_default_tensor_op), "cublasGemmEx");
     }
 };
 

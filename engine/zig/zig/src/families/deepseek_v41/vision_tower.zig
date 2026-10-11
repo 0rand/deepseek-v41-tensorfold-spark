@@ -127,14 +127,15 @@ pub const Tower = struct {
 
     /// ``F.linear(x [m, k], W [n, k], b)`` -> y [m, n] bf16: addmm's cuBLASLt call with the bias epilogue, or mm's
     /// cublasGemmEx without a bias.
-    fn linear(t: *Tower, s: cuda.Stream, x: u64, m: usize, k: usize, wt: u64, bias: ?u64, n: usize, y: u64) !void {
-        const b = bias orelse return t.blas.linear(@ptrCast(s.handle), t.workspace.ptr, x, m, k, wt, n, y);
+    fn linear(t: *Tower, s: cuda.Stream, x: u64, xt: bool, m: usize, k: usize, wt: u64, bias: ?u64, n: usize, y: u64) !void {
+        const b = bias orelse return t.blas.linear(@ptrCast(s.handle), t.workspace.ptr, x, xt, m, k, wt, n, y);
         const api = t.lt.api;
         var desc: lt_mod.MatmulDesc = null;
         try t.lt.check(api.cublasLtMatmulDescCreate(&desc, lt_mod.compute_32f, .f32), "desc");
         defer _ = api.cublasLtMatmulDescDestroy(desc);
         const ta: c_int = @backingInt(lt_mod.Op.t);
-        const tb: c_int = @backingInt(lt_mod.Op.n);
+        // `xt`: x a [k, m] buffer read as [m, k] (strides 1, m), passed as cublasCommonArgs passes it: transb T, ldb m
+        const tb: c_int = @backingInt(if (xt) lt_mod.Op.t else lt_mod.Op.n);
         try t.lt.check(api.cublasLtMatmulDescSetAttribute(desc, lt_mod.desc_transa, &ta, @sizeOf(c_int)), "transa");
         try t.lt.check(api.cublasLtMatmulDescSetAttribute(desc, lt_mod.desc_transb, &tb, @sizeOf(c_int)), "transb");
         try t.lt.check(api.cublasLtMatmulDescSetAttribute(desc, epilogue_attr, &epilogue_bias, @sizeOf(u32)), "epilogue");
@@ -144,7 +145,10 @@ pub const Tower = struct {
         var lc: lt_mod.Layout = null;
         try t.lt.check(api.cublasLtMatrixLayoutCreate(&la, .bf16, k, n, @intCast(k)), "layout W");
         defer _ = api.cublasLtMatrixLayoutDestroy(la);
-        try t.lt.check(api.cublasLtMatrixLayoutCreate(&lb, .bf16, k, m, @intCast(k)), "layout X");
+        // ``CuBlasLtMatrixLayout(k, m, ldb, transb)``: a transposed operand's rows and columns swap
+        if (xt) {
+            try t.lt.check(api.cublasLtMatrixLayoutCreate(&lb, .bf16, m, k, @intCast(m)), "layout X");
+        } else try t.lt.check(api.cublasLtMatrixLayoutCreate(&lb, .bf16, k, m, @intCast(k)), "layout X");
         defer _ = api.cublasLtMatrixLayoutDestroy(lb);
         try t.lt.check(api.cublasLtMatrixLayoutCreate(&lc, .bf16, n, m, @intCast(n)), "layout Y");
         defer _ = api.cublasLtMatrixLayoutDestroy(lc);
@@ -195,7 +199,7 @@ pub const Tower = struct {
         if (lh != img.llm_h or lw != img.llm_w) return error.VisionGrid;
         const L: usize = @as(usize, lh) * lw;
         const pdim: usize = 3 * sh.patch * sh.patch;
-        // scratch: x, h, o [n, D]; qkv [n, 3D]; q k v [3, n, D]; m [n, 2I] (mm [n, I] after it); aligner [L, 9D] + [L, out] x 2
+        // scratch: x, h, o [n, D]; qkv [n, 3D]; q k v [3, n, D]; m [n, 2I] (then mm [n, I]); [9D, L] + [L, out] x 2
         const sizes = [_]usize{ n * D, n * D, n * D, n * 3 * D, 3 * n * D, n * 2 * I, n * I, L * r * r * D, L * sh.out, L * sh.out };
         var offs: [sizes.len]usize = undefined;
         var total: usize = 0;
@@ -217,7 +221,7 @@ pub const Tower = struct {
         const a1 = base + offs[8];
         const feats = base + offs[9];
         const ks = t.k.ops(s);
-        try t.linear(s, patches, n, pdim, try t.w("vision.patch_embed.proj.weight", .{}), t.wOpt("vision.patch_embed.proj.bias", .{}), D, x);
+        try t.linear(s, patches, false, n, pdim, try t.w("vision.patch_embed.proj.weight", .{}), t.wOpt("vision.patch_embed.proj.bias", .{}), D, x);
         if (tap) |tp| try tp.at(tp.ctx, s, "embed", x, n * D * 2);
         const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(D / sh.heads)));
         const scale_log2: f32 = @floatCast(@as(f64, scale) * std.math.log2e);
@@ -226,23 +230,23 @@ pub const Tower = struct {
             const t0: ?Tap = if (i == 0) tap else null;
             try ks.rms(x, try t.w("vision.blocks.{d}.norm1.weight", .{i}), h, n, D, 1e-6);
             if (t0) |tp| try tp.at(tp.ctx, s, "b0.norm1", h, n * D * 2);
-            try t.linear(s, h, n, D, try t.w("vision.blocks.{d}.attn.wqkv.weight", .{i}), t.wOpt("vision.blocks.{d}.attn.wqkv.bias", .{i}), 3 * D, qkv);
+            try t.linear(s, h, false, n, D, try t.w("vision.blocks.{d}.attn.wqkv.weight", .{i}), t.wOpt("vision.blocks.{d}.attn.wqkv.bias", .{i}), 3 * D, qkv);
             if (t0) |tp| try tp.at(tp.ctx, s, "b0.qkv", qkv, n * 3 * D * 2);
             try ks.rope(qkv, q, kk, v, n, img.vit_w, sh.heads, sh.theta);
             if (t0) |tp| try tp.at(tp.ctx, s, "b0.rope", q, 3 * n * D * 2); // q k v as [3, heads, n, 64]
             try ks.attn(q, kk, v, o, n, sh.heads, scale_log2);
             if (t0) |tp| try tp.at(tp.ctx, s, "b0.attn", o, n * D * 2);
-            try t.linear(s, o, n, D, try t.w("vision.blocks.{d}.attn.wo.weight", .{i}), t.wOpt("vision.blocks.{d}.attn.wo.bias", .{i}), D, h);
+            try t.linear(s, o, false, n, D, try t.w("vision.blocks.{d}.attn.wo.weight", .{i}), t.wOpt("vision.blocks.{d}.attn.wo.bias", .{i}), D, h);
             if (t0) |tp| try tp.at(tp.ctx, s, "b0.wo", h, n * D * 2);
             try ks.add(x, h, n * D);
             if (t0) |tp| try tp.at(tp.ctx, s, "b0.res1", x, n * D * 2);
             try ks.rms(x, try t.w("vision.blocks.{d}.norm2.weight", .{i}), h, n, D, 1e-6);
             if (t0) |tp| try tp.at(tp.ctx, s, "b0.norm2", h, n * D * 2);
-            try t.linear(s, h, n, D, try t.w("vision.blocks.{d}.mlp.w1.weight", .{i}), t.wOpt("vision.blocks.{d}.mlp.w1.bias", .{i}), 2 * I, m);
+            try t.linear(s, h, false, n, D, try t.w("vision.blocks.{d}.mlp.w1.weight", .{i}), t.wOpt("vision.blocks.{d}.mlp.w1.bias", .{i}), 2 * I, m);
             if (t0) |tp| try tp.at(tp.ctx, s, "b0.w1", m, n * 2 * I * 2);
             try ks.siluMul(m, mm, n, I);
             if (t0) |tp| try tp.at(tp.ctx, s, "b0.silu", mm, n * I * 2);
-            try t.linear(s, mm, n, I, try t.w("vision.blocks.{d}.mlp.w2.weight", .{i}), t.wOpt("vision.blocks.{d}.mlp.w2.bias", .{i}), D, h);
+            try t.linear(s, mm, false, n, I, try t.w("vision.blocks.{d}.mlp.w2.weight", .{i}), t.wOpt("vision.blocks.{d}.mlp.w2.bias", .{i}), D, h);
             if (t0) |tp| try tp.at(tp.ctx, s, "b0.w2", h, n * D * 2);
             try ks.add(x, h, n * D);
             if (tap) |tp| {
@@ -253,10 +257,12 @@ pub const Tower = struct {
         try ks.rms(x, try t.w("vision.norm.weight", .{}), h, n, D, 1e-6);
         if (tap) |tp| try tp.at(tp.ctx, s, "vit", h, n * D * 2);
         try ks.unfold(h, un, img.vit_h, img.vit_w, D, r, L);
-        try t.linear(s, un, L, r * r * D, try t.w("aligner.w1.weight", .{}), t.wOpt("aligner.w1.bias", .{}), sh.out, a1);
+        if (tap) |tp| try tp.at(tp.ctx, s, "al.unfold", un, L * r * r * D * 2); // F.unfold's [9D, L]
+        try t.linear(s, un, true, L, r * r * D, try t.w("aligner.w1.weight", .{}), t.wOpt("aligner.w1.bias", .{}), sh.out, a1);
+        if (tap) |tp| try tp.at(tp.ctx, s, "al.w1", a1, L * sh.out * 2);
         try ks.gelu(a1, L * sh.out);
         if (tap) |tp| try tp.at(tp.ctx, s, "gelu", a1, L * sh.out * 2);
-        try t.linear(s, a1, L, sh.out, try t.w("aligner.w2.weight", .{}), t.wOpt("aligner.w2.bias", .{}), sh.out, feats);
+        try t.linear(s, a1, false, L, sh.out, try t.w("aligner.w2.weight", .{}), t.wOpt("aligner.w2.bias", .{}), sh.out, feats);
         try ks.span(feats, try t.w("image_start", .{}), try t.w("image_newline", .{}), try t.w("image_end", .{}), out, lh, lw, sh.out);
     }
 };

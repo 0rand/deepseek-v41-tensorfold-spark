@@ -11,7 +11,7 @@
 # Every phase prints PASS / FAIL lines into OUT/vision-steps.txt. Knobs: PROMPTS (the prefill list, "1 2 3 4 5 6"),
 # STEPS (32), MASTER, IMAGE, CACHE_VOL (prod's: /cache/dsv41-bias-vl holds the release's gate.bias_vl).
 set -u
-RANK=${1:?rank}; OUT=${2:?outdir}; PHASE=${3:?ref|vit|prefill|generate|follow}; VARIANT=${4:-}
+RANK=${1:?rank}; OUT=${2:?outdir}; PHASE=${3:?ref|vit|tower|prefill|generate|follow}; VARIANT=${4:-}
 KIT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
 LEASE=${LEASE_FILE:-$KIT/.tensorfold-lease}
 if [[ "$RANK" == 0 && -f "$LEASE" ]]; then echo "the test-window lease is held ($LEASE): another window owns the Sparks"; exit 3; fi
@@ -65,6 +65,20 @@ case "$PHASE" in
             vision /model /out/img > "$OUT/vision-vit-ops.log" 2>&1
         grep -E "differ|bytes, Python" "$OUT/vision-vit-ops.log" | head -60
         exit 1 ;;
+    # tower [sweep]: one host, prod may serve (GPU 0, no network): the Python tower then the Zig one; dumps removed
+    tower)
+        d=tower${VARIANT:+-$VARIANT}; sw=(); [[ "$VARIANT" == sweep ]] && sw=(--sweep --light)
+        asroot "rm -rf /out/$d"
+        V=(--rm --gpus all -v "$MODEL:/model:ro" -v "$KIT:/kit:ro" -v "$OUT:/out")
+        docker run "${V[@]}" -v "$TF:/dsv41-tf:ro" -v "$CACHE_VOL:/cache:ro" -e PYTHONPATH=/dsv41-tf/src:/cache/pylib \
+            --name "zig-vtower-ref-r$RANK" --entrypoint python "$IMAGE" -u -B /kit/tools/zig/dsv41_vision/vision_ref.py \
+            --tower-only --vdir "/out/$d" --pack /model "${sw[@]}" > "$OUT/vision-$d-ref.log" 2>&1 \
+            || { res "FAIL vision $d: the Python tower (vision-$d-ref.log)"; tail -5 "$OUT/vision-$d-ref.log"; exit 1; }
+        docker run "${V[@]}" --name "zig-vtower-r$RANK" --entrypoint /kit/tf-dsv41-m1 "$IMAGE" vision /model "/out/$d" \
+            > "$OUT/vision-$d.log" 2>&1
+        rc=$?; asroot "rm -rf /out/$d"; grep -E "^vision |differ|bytes, Python|^(PASS|FAIL)" "$OUT/vision-$d.log" | tail -40
+        if (( rc == 0 )) && grep -q '^PASS vision ViT' "$OUT/vision-$d.log"; then res "PASS vision $d: $(tail -1 "$OUT/vision-$d.log")"; exit 0; fi
+        res "FAIL vision $d (rc $rc): $(tail -1 "$OUT/vision-$d.log")"; exit 1 ;;
     prefill)
         st=0
         for p in ${PROMPTS:-1 2 3 4 5 6}; do
@@ -101,5 +115,5 @@ case "$PHASE" in
         grep -E "^(PASS|FAIL) M4|\"equal\"" "$log" | tail -5
         if (( rc == 0 )) && grep -q '^PASS M4' "$log"; then res "PASS vision generate${VARIANT:+-$VARIANT} (replies == Python's)"
         else res "FAIL vision generate${VARIANT:+-$VARIANT} (rc $rc): $(tail -1 "$log")"; tail -25 "$log"; exit 1; fi ;;
-    *) echo "phase: ref | vit | prefill | generate [bias] | follow [bias]"; exit 2 ;;
+    *) echo "phase: ref | vit | tower [sweep] | prefill | generate [bias] | follow [bias]"; exit 2 ;;
 esac

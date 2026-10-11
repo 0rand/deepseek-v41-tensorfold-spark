@@ -8,7 +8,6 @@
 //              blocks last first, exp2f(s * scale - max * scale) unfused (flash built with UNFUSE_FMA), P in bf16,
 //              the row sums quad-reduced at the end)
 //   silu_mul   F.silu(g) * u on the w1 rows' halves; gelu  F.gelu (erf); add  x + y (bf16, fp32 math)
-//   unfold     the aligner's pad + 3 x 3 unfold: [h, w, C] -> [L, C * 9] (c major, then kh, kw), zeros past the edge
 //   span       the image's span rows: image_start / image_newline / image_end and the aligner rows in prompt order
 #include <cuda_bf16.h>
 #include <cstdint>
@@ -248,15 +247,16 @@ extern "C" __global__ void dsv41_vision_add(__nv_bfloat16* __restrict__ x, const
     x[i] = rn(__fadd_rn(bf(x[i]), bf(y[i])));
 }
 
-// unfold: x [h, w, C] -> out [Lh * Lw, C * r * r], column c * r * r + kh * r + kw, zero past h / w
+// unfold (the aligner's pad + unfold): x [h, w, C] -> F.unfold's [C r r, L], row c r r + kh r + kw, zero past h / w
 extern "C" __global__ void dsv41_vision_unfold(const __nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ out, int h, int w, int C, int r) {
     const int L = blockIdx.x;
+    const size_t rows = gridDim.x;
     const int lw = (w + r - 1) / r;
     const int by = L / lw, bx = L % lw;
     for (int col = threadIdx.x; col < C * r * r; col += blockDim.x) {
         const int c = col / (r * r), kh = (col / r) % r, kw = col % r;
         const int y = by * r + kh, xx = bx * r + kw;
-        out[(size_t)L * C * r * r + col] = (y < h && xx < w) ? x[((size_t)y * w + xx) * C + c] : __float2bfloat16_rn(0.f);
+        out[(size_t)col * rows + L] = (y < h && xx < w) ? x[((size_t)y * w + xx) * C + c] : __float2bfloat16_rn(0.f);
     }
 }
 

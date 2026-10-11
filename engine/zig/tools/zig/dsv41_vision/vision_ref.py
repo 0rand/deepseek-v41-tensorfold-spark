@@ -7,7 +7,8 @@
    TF_DSV41_VISION_HOLD format.
 2. The tower (rank 0, ``vision.Tower`` from the pack's vision tensors on this GPU): each image's stages as
    ``vision.Tower.vit`` / ``align`` compute them (the same helpers, so the same bits; checked against ``Tower.span``)
-   into ``<name>.<stage>.bin`` (embed, block0, block1, block15, block31, vit, gelu) and ``<name>.span.bin``.
+   into ``<name>.<stage>.bin`` (embed, block0, block1, block15, block31, vit, al.unfold, al.w1, gelu) and
+   ``<name>.span.bin``; block 0's every op as ``b0.<op>``.
 3. ``PROMPTS``: text ids around the images' spans of virtual ids; rank 0 holds the images' rows in ``vision.STORE``,
    then dsv41_m2b_ref.py's own ``one`` runs each prompt from a fresh slot (state dump, greedy steps, digests) into
    OUT/p<i>/ (``--prompts 1,2,3``: prompt i is ``PROMPTS[i - 1]``), so tf-dsv41-m1 m2b's prefill gate reads them as
@@ -26,7 +27,10 @@ Two hosts (the Sparks, spark.sh): the same with ``--rank R --master ADDR`` on ea
 ``--tower-only``: steps 1 and 2 alone on one GPU (cuda:0; the pack's vision tensors, no model load, about 2 min), for
 ``tf-dsv41-m1 vision PACK VDIR`` on the same GPU:
 
-    python -u -B vision_ref.py --tower-only --vdir VDIR --pack PACK
+    python -u -B vision_ref.py --tower-only --vdir VDIR --pack PACK [--sweep] [--light]
+
+``--sweep``: ``SWEEP``'s images instead (every aligner row count regime: L 169 .. 1,021, strips, tile edges, every
+unfold padding); ``--light``: no ``b0.*`` dumps (a sweep's disk).
 """
 from __future__ import annotations
 
@@ -46,6 +50,17 @@ IMAGES = {  # name -> (width, height, format, mode)
     "wide": (1280, 400, "PNG", "RGB"),
     "small": (200, 150, "PNG", "RGBA"),
 }
+# the tower sweep (--sweep): name "<llm h>x<llm w>p<unfold's zero rows><zero cols>" -> (width, height), PNG RGB
+SWEEP = {
+    "13x13p00": (546, 546), "1x211p01": (8848, 42), "1x257p12": (10766, 28), "1x509p02": (21350, 42),
+    "1x641p11": (26908, 28), "1x769p22": (32270, 14), "1x1019p00": (42798, 42), "1x1021p00": (42882, 42),
+    "211x1p10": (42, 8848), "257x1p21": (28, 10766), "509x1p02": (14, 21378), "511x1p00": (42, 21462),
+    "16x16p12": (644, 658), "17x15p21": (616, 686), "16x24p01": (994, 672), "16x32p20": (1344, 644),
+    "32x16p10": (672, 1330), "20x32p12": (1316, 826), "24x32p22": (1316, 980), "28x32p01": (1330, 1176),
+    "30x32p10": (1344, 1246), "31x31p00": (1302, 1302), "31x31p22": (1274, 1274), "27x36p00": (1512, 1134),
+    "36x27p00": (1134, 1512), "29x33p21": (1372, 1190), "23x41p10": (1722, 952),
+}
+SWEEP_IMAGES = {**IMAGES, **{k: (w, h, "PNG", "RGB") for k, (w, h) in SWEEP.items()}}
 # each prompt: text lengths and image names in order (ints: that many random text ids)
 PROMPTS = [[37, "photo", 21], [15, "wide", 9, "small", 30], ["small", 12]]
 STAGES = ("embed", "block0", "block1", "block15", "block31", "vit", "gelu")
@@ -55,7 +70,7 @@ def make_image(name: str):
     import numpy as np
     from PIL import Image
 
-    w, h, fmt, mode = IMAGES[name]
+    w, h, fmt, mode = SWEEP_IMAGES[name]
     rng = np.random.default_rng(sum(map(ord, name)))
     y, x = np.mgrid[0:h, 0:w]
     base = np.stack([(x * 255 // max(w - 1, 1)), (y * 255 // max(h - 1, 1)), ((x + y) * 3) % 256], -1)
@@ -71,7 +86,7 @@ def make_image(name: str):
     return b.getvalue()
 
 
-def prepare(vdir: Path, pack: Path):
+def prepare(vdir: Path, pack: Path, names=IMAGES):
     """Step 1: every image's Prepared (prod's front end) and the manifest."""
 
     from tensorfold.families.deepseek_v41.cuda import vision_prep as VP
@@ -81,7 +96,7 @@ def prepare(vdir: Path, pack: Path):
     reg = VP.Registry()
     vdir.mkdir(parents=True, exist_ok=True)
     out, man = {}, []
-    for name in IMAGES:
+    for name in names:
         raw = make_image(name)
         (vdir / f"{name}.img").write_bytes(raw)
         p = VP.preprocess(VP.decode(raw, s), s)
@@ -94,7 +109,7 @@ def prepare(vdir: Path, pack: Path):
     return out
 
 
-def tower_dumps(vdir: Path, pack: Path, images: dict, dev):
+def tower_dumps(vdir: Path, pack: Path, images: dict, dev, light: bool = False):
     """Step 2 (rank 0): the stages and span rows of every image; returns the encoder (its tower) for step 3."""
 
     import torch
@@ -117,6 +132,7 @@ def tower_dumps(vdir: Path, pack: Path, images: dict, dev):
                 p = f"vision.blocks.{i}"
                 # block 0's every op as its own stage ("b0.<op>", the Zig tower's layouts)
                 b0 = (lambda k, v: dumps.__setitem__(f"b0.{k}", v.clone())) if i == 0 else (lambda k, v: None)
+                b0 = (lambda k, v: None) if light else b0
                 h = V._rms(x, tt[f"{p}.norm1.weight"])
                 b0("norm1", h)
                 qkv = t.lin(h, f"{p}.attn.wqkv")
@@ -149,7 +165,10 @@ def tower_dumps(vdir: Path, pack: Path, images: dict, dev):
             y = vit.view(img.n_vit_h, img.n_vit_w, -1).permute(2, 0, 1)
             y = F.pad(y, (0, -img.n_vit_w % r, 0, -img.n_vit_h % r))
             y = F.unfold(y.unsqueeze(0), r, stride=r).squeeze(0).transpose(0, 1)
-            a1 = F.gelu(t.lin(y, "aligner.w1"))
+            dumps["al.unfold"] = y.t()                 # F.unfold's [9D, L]; aligner.w1 reads its transposed view
+            w1 = t.lin(y, "aligner.w1")
+            dumps["al.w1"] = w1.clone()
+            a1 = F.gelu(w1)
             dumps["gelu"] = a1
             span = t.span(img)
             staged = t.lin(a1, "aligner.w2")
@@ -243,7 +262,8 @@ def main() -> int:
 
         vdir, pack = Path(argv[argv.index("--vdir") + 1]), Path(argv[argv.index("--pack") + 1])
         os.environ.pop("TF_DSV41_BIAS_VL", None)
-        tower_dumps(vdir, pack, prepare(vdir, pack), torch.device("cuda:0"))
+        names = SWEEP_IMAGES if "--sweep" in argv else IMAGES
+        tower_dumps(vdir, pack, prepare(vdir, pack, names), torch.device("cuda:0"), "--light" in argv)
         return 0
     if "--vdir" not in argv or "--" not in argv:
         raise SystemExit(__doc__)
