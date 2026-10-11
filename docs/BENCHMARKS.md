@@ -51,6 +51,12 @@ One slot, fresh random text, after a 2K warm-up; tok/s and TTFT from the batcher
 the first token and a SHA-256 of a 32-token greedy reply at each size: the G17-G19 tables compare them across
 configurations and boots (prefill levers and row counts must not change them).
 
+**Prefix cache.** A prompt that repeats a filler document hits the prefix cache: the repeated part is not prefilled
+again, so the prefill rate comes out impossibly fast (one report: an 87K-token prompt back in about 0.4 s). Check
+`usage.prompt_tokens_details.cached_tokens` in the reply: a value close to `prompt_tokens` means the cache served the
+prompt. Use unique text per prompt for prefill numbers, as `--prefill` does. The Zig server also reports it per reply
+(`tensorfold.cached`), in `/health` (`cached_tokens_total`) and in `/metrics` (`tensorfold_cached_tokens_total`).
+
 **Top-1 agreement with the kit** (needs the kit's prompt-logprobs capture, included):
 
 ```bash

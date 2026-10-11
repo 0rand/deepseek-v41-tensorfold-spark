@@ -117,6 +117,20 @@ Host memory and stalls (G12; defaults in brackets):
   extensions beside loaded weights (`scripts/serve.sh prebuild` exists for that: G16 lost both ranks to it once).
 - Keep other workloads (desktop sessions, other containers, a second model) off both nodes.
 
+## Reported configurations
+
+- **1M context, 1 slot** (reported on this path by @ZackO2o in #5): `KV_DTYPE=fp8`, `CONTEXT=1048576`, `PARALLEL=1`
+  booted and served. `/v1/models` reported 1,048,576, retrieval at 60K tokens hit, and prefill ran at 2,048 / 2,104 /
+  1,934 tok/s for 16.6K / 135K / 270K-token prompts. Our own runs cover 4 x 300K and 4 x 196K. One slot serves one
+  request at a time.
+- **The same on the Zig path** ([ZIG-SERVE](ZIG-SERVE.md#split-kv-and-the-pool)): the profile already serves one 1M
+  request. `TF_DSV41_CONTEXT=1048576` with `TF_DSV41_KV_SPLIT=1` and `TF_DSV41_POOL_TOKENS=3000000` holds one slot's
+  whole 1M, two slots at 1M each, or four live slots at about 750K each (totals across live slots). For a dedicated
+  one-slot server set `TF_DSV41_SLOTS=1` and check the AOT set again (`scripts/run-zig.sh 0 --check-aot`); drafting
+  still runs, and `TF_DSV41_SLOT_DRAFTS` then has no effect. `rope.bin` needs `TF_DSV41_CONTEXT` + 2,048 rows. The
+  boot check refuses a pool the measured memory cannot hold, and a request whose prompt plus `max_tokens` exceeds the
+  context is refused with the context-length error.
+
 ## Watchdog and start at boot
 
 - `scripts/serve.sh watch --once` (the `dsv41-tf-watchdog.timer` tick, every minute): a tick is bad when a rank
