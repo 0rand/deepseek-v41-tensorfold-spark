@@ -190,8 +190,8 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
         log.line("WARNING: default sampling is greedy (temperature <= 0) - a client that omits `temperature` decodes greedily, which on a long agentic turn can loop in reasoning and return empty content", .{});
     // the Spark ops scripts read this line for the slot count (scripts/serve.sh check_slots)
     if (s.wire == .spark) log.line("serving: {d} slot(s) x {d} tokens; wire spark; health {t}; request log {s}; disconnect {s}", .{ srv.info.lanes, window, spark_settings.health, if (spark_settings.log) |l| l.path else "off", if (spark_settings.disconnect) "on" else "off" });
-    if (args.thinking and std.mem.indexOf(u8, s.text.templateSource(), "enable_thinking") != null)
-        log.line("thinking on (the chat template's default): replies reason in reasoning_content before the answer in content, and max_tokens counts both. --no-thinking turns it off; a request can send chat_template_kwargs {{\"enable_thinking\": false}}", .{});
+    if (thinkingHint(args.thinking, s.family != null, s.text.templateSource()))
+        log.line("thinking on by default: replies reason in reasoning_content before the answer in content, and max_tokens counts both. --no-thinking turns it off; a request can send chat_template_kwargs {{\"enable_thinking\": false}}", .{});
     live.columns_env = env(s, "COLUMNS");
     var ticker: live.Ticker = .{ .engine = s.engine };
     const drawing = live.wanted(io, if (env(s, "TENSORFOLD_NO_LIVE")) |v| std.mem.eql(u8, v, "1") else false);
@@ -278,6 +278,18 @@ fn shownSampling(a: Allocator, sampling: ?json.Value) []const u8 {
         parts.append(a, std.fmt.allocPrint(a, "{s} {s}", .{ k, text }) catch return "greedy") catch return "greedy";
     }
     return std.mem.join(a, ", ", parts.items) catch "greedy";
+}
+
+/// The thinking hint applies when thinking is on and requests can switch it: a family's rules, or a template's.
+fn thinkingHint(thinking: bool, family: bool, template_source: []const u8) bool {
+    return thinking and (family or std.mem.indexOf(u8, template_source, "enable_thinking") != null);
+}
+
+test "the thinking hint: a family (its encoding is code, no template source) or a template reading enable_thinking" {
+    try std.testing.expect(thinkingHint(true, true, ""));
+    try std.testing.expect(thinkingHint(true, false, "{%- if enable_thinking %}"));
+    try std.testing.expect(!thinkingHint(true, false, "{{ messages }}"));
+    try std.testing.expect(!thinkingHint(false, true, ""));
 }
 
 test "the targets are the hard limit, or the fallbacks under an unlimited one" {
