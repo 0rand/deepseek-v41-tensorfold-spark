@@ -69,8 +69,10 @@ docker run --rm -v "$CACHE_DIR:/cache" -e HF_HUB_OFFLINE=0 --entrypoint python <
   -m tensorfold.families.deepseek_v41.cuda.bias_vl_fetch /cache/dsv41-bias-vl
 ```
 
-If the variable names a folder without the tensors, boot fails. Unset it to serve images with the text bias; the boot
-log then says the image routing bias is missing.
+If the variable names a folder without the tensors, `scripts/run-zig.sh` refuses to start (the engine would fail its
+boot). Unset it to serve images with the text bias; the boot log then says the image routing bias is missing.
+Turning images on adds the image segments' Triton variants to the AOT set: run `scripts/run-zig.sh N --check-aot`
+on each node after changing either variable (see [ZIG-SERVE](ZIG-SERVE.md#changing-serving-settings)).
 
 ### Zig measurements
 
