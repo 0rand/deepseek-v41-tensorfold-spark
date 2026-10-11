@@ -75,9 +75,10 @@ was not repeated for this publication; the exported host build and host tests ar
    docker save tensorfold-dsv41-zig:local -o build/zig-image.tar
    ```
 
-   `check-zig-image.sh` checks that every library the engine opens at run time (NCCL, verbs and its mlx5 provider,
-   cuBLAS / cuBLASLt for image input) resolves in the image, and that cuBLAS is the release the vision tower's
-   exactness was measured on.
+   The runtime stage installs cuBLAS / cuBLASLt 13.6.0.2 (`libcublas-13-3`, held), the release the vision tower's
+   exactness was measured on, and its last step checks every library the engine opens at run time (NCCL, verbs and
+   its mlx5 provider, cuBLAS by sha256): a missing or different library fails the build. `check-zig-image.sh` runs
+   the same kind of check against an image you loaded or pulled.
 
    The image label records the recipe commit you built (set `ZIG_COMMIT` in the config to the same value); the engine source revision is in `engine/zig/SOURCE-EXPORT.md`. Transfer the tar to rank 1 and run
    `docker load -i build/zig-image.tar` there. Compare the label and root filesystem layers on both nodes with
