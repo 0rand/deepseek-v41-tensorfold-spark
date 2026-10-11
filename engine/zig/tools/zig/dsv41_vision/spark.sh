@@ -11,7 +11,7 @@
 # Every phase prints PASS / FAIL lines into OUT/vision-steps.txt. Knobs: PROMPTS (the prefill list, "1 2 3 4 5 6"),
 # STEPS (32), MASTER, IMAGE, CACHE_VOL (prod's: /cache/dsv41-bias-vl holds the release's gate.bias_vl).
 set -u
-RANK=${1:?rank}; OUT=${2:?outdir}; PHASE=${3:?ref|vit|prefill|generate|follow}; VARIANT=${4:-}
+RANK=${1:?rank}; OUT=${2:?outdir}; PHASE=${3:?ref|vit|tower|prefill|generate|follow}; VARIANT=${4:-}
 KIT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
 LEASE=${LEASE_FILE:-$KIT/.tensorfold-lease}
 if [[ "$RANK" == 0 && -f "$LEASE" ]]; then echo "the test-window lease is held ($LEASE): another window owns the Sparks"; exit 3; fi
@@ -34,6 +34,15 @@ NET=(--rm --gpus all --ipc=host --network host --device /dev/infiniband --ulimit
 ZIG=("${NET[@]}" -v "$CACHE_VOL:/cache:ro" -e TF_TP_WORLD=2 -e TF_TP_RANK="$RANK" -e TF_TP_DEVICE=0 -e TF_TP_MASTER="$MASTER"
      -e TF_COMM_BACKEND="${BACKEND:-roce}" -e TF_TP_ROCE_FALLBACK=error -e TF_TP_KERNEL_IMAGE=/kit/tp_mailbox.fatbin
      -e TF_DSV41_PLAN_TIMEOUT=1800 -e TF_DSV41_FAILFAST=0 -e TF_DSV41_IMAGES=native -e TF_DSV41_VISION_HOLD=/out/img)
+# GATE_KNOBS=prod (default): prod-zig.env's same-bits prefill / decode knobs; replay and 4K need Python's replay ref
+[[ "${GATE_KNOBS:-prod}" == prod ]] && ZIG+=(-e TF_DSV41_PF_DENSE=fused -e TF_DSV41_PF_DENSE_TABLE=/cache/pfdense-table.json
+     -e TF_DSV41_GM_V2=1 -e TF_DSV41_INDEX_BOUND=1 -e TF_DSV41_INDEX_BUDGET_MIB=64 -e TF_DSV41_PREFETCH_AHEAD=1)
+# prod's assets/aot is a capture plus the kit's fill: the reference's sets get the fill too (by hash, idempotent)
+fill() {
+    [[ -d "$KIT/triton-fill/aot" ]] || { res "FAIL vision $PHASE: the kit has no triton-fill/aot"; exit 1; }
+    local d; for d in "$@"; do docker run --rm -v "$OUT:/out" -v "$KIT:/kit:ro" --entrypoint python "$IMAGE" -B \
+        /kit/tools/zig/dsv41_aot_merge.py "/out/$d" /kit/triton-fill/aot || { res "FAIL vision $PHASE: fill into $d"; exit 1; }; done
+}
 NCCL='export TF_NCCL_LIB=$(python -c "import nvidia.nccl, os; print(os.path.join(os.path.dirname(nvidia.nccl.__file__), \"lib\", \"libnccl.so.2\"))" 2>/dev/null || echo libnccl.so.2)'
 case "$PHASE" in
     ref)
@@ -65,8 +74,22 @@ case "$PHASE" in
             vision /model /out/img > "$OUT/vision-vit-ops.log" 2>&1
         grep -E "differ|bytes, Python" "$OUT/vision-vit-ops.log" | head -60
         exit 1 ;;
+    # tower [sweep]: one host, prod may serve (GPU 0, no network): the Python tower then the Zig one; dumps removed
+    tower)
+        d=tower${VARIANT:+-$VARIANT}; sw=(); [[ "$VARIANT" == sweep ]] && sw=(--sweep --light)
+        asroot "rm -rf /out/$d"
+        V=(--rm --gpus all -v "$MODEL:/model:ro" -v "$KIT:/kit:ro" -v "$OUT:/out")
+        docker run "${V[@]}" -v "$TF:/dsv41-tf:ro" -v "$CACHE_VOL:/cache:ro" -e PYTHONPATH=/dsv41-tf/src:/cache/pylib \
+            --name "zig-vtower-ref-r$RANK" --entrypoint python "$IMAGE" -u -B /kit/tools/zig/dsv41_vision/vision_ref.py \
+            --tower-only --vdir "/out/$d" --pack /model "${sw[@]}" > "$OUT/vision-$d-ref.log" 2>&1 \
+            || { res "FAIL vision $d: the Python tower (vision-$d-ref.log)"; tail -5 "$OUT/vision-$d-ref.log"; exit 1; }
+        docker run "${V[@]}" --name "zig-vtower-r$RANK" --entrypoint /kit/tf-dsv41-m1 "$IMAGE" vision /model "/out/$d" \
+            > "$OUT/vision-$d.log" 2>&1
+        rc=$?; asroot "rm -rf /out/$d"; grep -E "^vision |differ|bytes, Python|^(PASS|FAIL)" "$OUT/vision-$d.log" | tail -40
+        if (( rc == 0 )) && grep -q '^PASS vision ViT' "$OUT/vision-$d.log"; then res "PASS vision $d: $(tail -1 "$OUT/vision-$d.log")"; exit 0; fi
+        res "FAIL vision $d (rc $rc): $(tail -1 "$OUT/vision-$d.log")"; exit 1 ;;
     prefill)
-        st=0
+        st=0; for p in ${PROMPTS:-1 2 3 4 5 6}; do fill "ref/p$p/aot"; done
         for p in ${PROMPTS:-1 2 3 4 5 6}; do
             bias=(); (( p > 3 )) && bias=(-e TF_DSV41_BIAS_VL="$BIAS")
             mkdir -p "$OUT/zig-p$p"
@@ -85,6 +108,7 @@ case "$PHASE" in
         bias=(); trace=trace.jsonl; port=29880
         if [[ "$VARIANT" == bias ]]; then bias=(-e TF_DSV41_BIAS_VL="$BIAS"); trace=trace-bias.jsonl; port=29881; fi
         [[ "$PHASE" == generate && "$RANK" != 0 ]] && { echo "generate runs on rank 0; rank 1 runs follow"; exit 2; }
+        fill ref/p1/aot
         # the served engine on the reference's layers, drafts off; the assets (rope.bin, aot/, engram-host.bin): p1's
         GEN=("${ZIG[@]}" "${bias[@]}" -v "$OUT/ref/p1:/assets:ro" -e TF_DSV41_ASSETS=/assets -e TF_TP_PORT=$port
              -e TF_DSV41_LAYERS=0-24 -e TF_DSV41_DRAFTS=0 -e TF_DSV41_EXPERT_TOPP=0.85
@@ -101,5 +125,5 @@ case "$PHASE" in
         grep -E "^(PASS|FAIL) M4|\"equal\"" "$log" | tail -5
         if (( rc == 0 )) && grep -q '^PASS M4' "$log"; then res "PASS vision generate${VARIANT:+-$VARIANT} (replies == Python's)"
         else res "FAIL vision generate${VARIANT:+-$VARIANT} (rc $rc): $(tail -1 "$log")"; tail -25 "$log"; exit 1; fi ;;
-    *) echo "phase: ref | vit | prefill | generate [bias] | follow [bias]"; exit 2 ;;
+    *) echo "phase: ref | vit | tower [sweep] | prefill | generate [bias] | follow [bias]"; exit 2 ;;
 esac

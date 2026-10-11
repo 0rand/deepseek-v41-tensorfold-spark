@@ -62,6 +62,14 @@ if (( rope_rows < need_rows )); then
     echo "    --rows $need_rows --out $ASSETS_DIR/rope.bin   (docs/ZIG-SERVE.md, Generate runtime assets)" >&2
     exit 2
 fi
+# image input with the routing bias: the folder TF_DSV41_BIAS_VL names inside /cache must hold the fetched tensors
+bias=${TF_DSV41_BIAS_VL:-}
+if [[ "${TF_DSV41_IMAGES:-}" == native && "$bias" == /cache/* ]] &&
+    ! compgen -G "$CACHE_DIR/${bias#/cache/}/*.safetensors" > /dev/null; then
+    echo "TF_DSV41_BIAS_VL=$bias: no *.safetensors in $CACHE_DIR/${bias#/cache/}; the engine would refuse to boot." >&2
+    echo "  fetch bias_vl.safetensors there (docs/IMAGES.md, The Zig serving path), or unset TF_DSV41_BIAS_VL" >&2
+    exit 2
+fi
 # the published pfdense tuning table, placed where the env points inside /cache when it is not there yet
 table=${TF_DSV41_PF_DENSE_TABLE:-}
 if [[ "$table" == /cache/* && ! -e "$CACHE_DIR/${table#/cache/}" ]]; then

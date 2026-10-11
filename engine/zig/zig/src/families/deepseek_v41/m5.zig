@@ -160,13 +160,17 @@ fn onePrompt(gpa: std.mem.Allocator, io: std.Io, a: std.mem.Allocator, m: *model
         if (mode == .park and (step == steps / 3 or step == 2 * steps / 3)) {
             const disk = step != steps / 3;
             const tr = std.Io.Clock.awake.now(io);
+            // the slot's ids: an entry parked to NVMe restores with them (its tokens leave the index with RAM)
+            const held = try gpa.alloc(u32, ss.hist[ss.cur()].items.len);
+            defer gpa.free(held);
+            for (ss.hist[ss.cur()].items, held) |t, *y| y.* = @intCast(t);
             const id = (try ss.save()) orelse return error.DuplicateEntry;
             if (disk) {
                 if (f.slot.pos < 1024) {
                     try log.print("{{\"park\": \"skipped: {d} positions, under the tier's 1,024\"}}\n", .{f.slot.pos});
                 } else _ = try ss.parkAll();
             }
-            if (!try ss.restore(id)) return error.RestoreFailed;
+            if (!try ss.restore(id, if (ss.store.entry(id).ram) null else held)) return error.RestoreFailed;
             round_trips[@intFromBool(disk)] = secs(io, tr);
         }
         const ids = [_]u32{tok};

@@ -36,6 +36,8 @@ pub fn extent(t: calls.Tensor) u64 {
 pub const Plan = struct {
     a: std.mem.Allocator,
     sizes: std.StringArrayHashMapUnmanaged(u64) = .empty,
+    /// the weights the programs read by name (forms_inplace.zig leaves those in place)
+    weights: std.StringArrayHashMapUnmanaged(void) = .empty,
 
     fn note(p: *Plan, x: calls.Arg) !void {
         switch (x) {
@@ -50,6 +52,10 @@ pub const Plan = struct {
                         g.value_ptr.* = 0;
                     }
                     g.value_ptr.* = @max(g.value_ptr.*, n);
+                },
+                .weight => |w| {
+                    const g = try p.weights.getOrPut(p.a, w);
+                    if (!g.found_existing) g.key_ptr.* = try p.a.dupe(u8, w);
                 },
                 else => {},
             },
@@ -68,7 +74,7 @@ pub const Plan = struct {
     pub fn totals(p: *const Plan) Totals {
         var t: Totals = .{};
         for (p.sizes.keys(), p.sizes.values()) |k, v| {
-            const s = @intFromEnum(scopeOf(k));
+            const s = @backingInt(scopeOf(k));
             t.roles[s] += 1;
             t.bytes[s] += std.mem.alignForward(u64, v, 256);
         }

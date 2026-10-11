@@ -25,9 +25,13 @@ const load = @import("load.zig");
 const prepared = @import("prepared.zig");
 const buffers = @import("buffers.zig");
 const forms = @import("forms.zig");
+const forms_inplace = @import("forms_inplace.zig");
+const ex_stacks = @import("ex_stacks.zig");
+const longpf = @import("longpf.zig");
 const run = @import("run.zig");
 const fwd = @import("forward.zig");
 const eh = @import("engram_host.zig");
+const boot_mem = @import("boot_mem.zig");
 const m2a = @import("m2a.zig");
 const target_mod = @import("target.zig");
 const dspark_emit = @import("dspark_emit.zig");
@@ -112,6 +116,10 @@ pub const Model = struct {
     sessions: ?*sg.Sessions = null,
     /// live slots (TF_DSV41_SLOTS; > 1: stacked state and row-mode windows, batch.zig)
     slots: u32 = 1,
+    /// TF_DSV41_ARENA's sub-allocator (dev_arena.zig), for the process's lifetime
+    dev_arena: ?*@import("dev_arena.zig").Installed = null,
+    /// the boot check's figures before the pool, for its measured end (kv_state.afterBoot)
+    boot_check: ?kvs.Boot = null,
     slot_set: ?*slots_mod.SlotSet = null,
     rows: ?*batch.Batch = null,
     /// DSpark drafts over several live slots (TF_DSV41_SLOT_DRAFTS=1 with TF_DSV41_SLOTS > 1, dspark_slots.zig)
@@ -167,7 +175,7 @@ pub const Model = struct {
             &.{};
         try m.session.open(&m.driver, m.tcfg, image);
         // TF_DSV41_ARENA: every device buffer from here on (weights, forms, roles, scratch) carved from large chunks
-        _ = try @import("dev_arena.zig").install(gpa, &m.ctx, m.tcfg.rank);
+        m.dev_arena = try @import("dev_arena.zig").install(gpa, &m.ctx, m.tcfg.rank);
         // a failure from here to serving (assets, limits, buffers): every rank down with its reason, the session closed
         // before `m` is freed (the fate thread read a freed session: Spark 2026-10-09)
         m.boot(gpa, io, pack_dir, assets, o) catch |err| {
@@ -181,6 +189,8 @@ pub const Model = struct {
     fn boot(m: *Model, gpa: std.mem.Allocator, io: std.Io, pack_dir: []const u8, assets: []const u8, o: Options) !void {
         const a = m.arena.allocator();
         const cwd = std.Io.Dir.cwd();
+        var tr = boot_mem.Trace.fromEnv();
+        tr.step("start", cuda.usage(false));
         const comm = m.session.comm();
         const world: u32 = @intCast(comm.world());
         m.cfg = try Config.read(gpa, io, pack_dir);
@@ -240,6 +250,7 @@ pub const Model = struct {
             }
         }.of;
         if (cache) |c| std.log.info("dsv41 load: weights {d:.0} ms ({d:.0} ms images, {d:.0} ms upload + digest), {d:.1} GiB; prepared {s}: {d} read ({d:.1} GiB in {d:.0} ms), {d} built, {d} written ({d:.0} ms)", .{ ms(std.Io.Clock.awake.now(io).toNanoseconds() - t_load), ms(t_build), ms(t_upload), @as(f64, @floatFromInt(m.weights.bytes)) / (1 << 30), c.root, c.stats.hits, @as(f64, @floatFromInt(c.stats.read_bytes)) / (1 << 30), ms(c.stats.read_ns), c.stats.misses, c.stats.written, ms(c.stats.write_ns) }) else std.log.info("dsv41 load: weights {d:.0} ms ({d:.0} ms images from the pack, {d:.0} ms upload + digest), {d:.1} GiB; TF_DSV41_PREPARED unset", .{ ms(std.Io.Clock.awake.now(io).toNanoseconds() - t_load), ms(t_build), ms(t_upload), @as(f64, @floatFromInt(m.weights.bytes)) / (1 << 30) });
+        tr.step("weights", cuda.usage(false));
         m.aot = try cuda.aot.Set.load(gpa, io, &m.driver, m.ctx.device, try std.fs.path.join(a, &.{ assets, "aot" }));
         m.widths = try m2a.widths(a, &m.weights, &m.pl);
         m.runner = .{ .gpa = gpa, .d = &m.driver, .stream = m.stream, .kernels = &m.kernels, .triton = &m.aot, .weights = &m.weights };
@@ -257,19 +268,21 @@ pub const Model = struct {
             m.f.opts.rope_rows = c + 2048;
         }
         try @import("prod_knobs.zig").apply(&m.f, a, io, m.tcfg.rank);
+        // TF_DSV41_IMAGES=native: on before the workspace and the buffer plan are sized (their image roles)
+        try vision_rows.bootPlan(gpa, io, &m.f, &m.driver, &m.weights);
         m.slots = try slots_mod.countFromEnv();
         if (try kvs.optionsFromEnv(@intCast(m.f.opts.limit), world)) |ko_| {
             var ko = ko_;
             ko.slots = m.slots;
             // the long-prompt stream scratch the buffer plan will hold (Python's measured terms have none)
-            ko.resident = @import("prod_knobs.zig").streamScratch(&m.cfg, m.f.opts.limit, m.f.opts.prefill_rows);
+            ko.resident = if (longpf.lazyEnv()) 0 else @import("prod_knobs.zig").streamScratch(&m.cfg, m.f.opts.limit, m.f.opts.prefill_rows);
             // TF_DSV41_PF_4K / _PF_TBO: the prefill workspace a long prompt allocates, priced on top of the worst point
             if (o.own_prefill) ko.workspace = try @import("forward_prefill.zig").workspaceBytes(&m.f, @intCast(m.f.opts.prefill_rows));
-            // a first start (this rank wrote prepared images) holds the 4K workspace off rather than refusing the pool
-            const first = if (cache) |c| c.stats.written > 0 else false;
-            if (try kvs.bootCheck(&m.ctx, &m.cfg, ko, m.tcfg.rank, world, first) == .held) m.f.prefill_state.ws_hold = true;
+            tr.step("forward", cuda.usage(false));
+            m.boot_check = try kvs.bootCheck(&m.ctx, &m.cfg, ko, m.tcfg.rank, world);
             m.f.kv = try kvs.Kv.init(gpa, &m.driver, &m.ctx, &m.cfg, ko, &m.runner, comm);
             m.f.opts.pool = m.f.kv.?.options();
+            tr.step("kv pool", cuda.usage(false));
         }
         // the buffer plan: every window up to the prefill rows (a verify window is at most a block + 1), and DSpark's
         var buckets: [64]u32 = undefined;
@@ -287,7 +300,21 @@ pub const Model = struct {
         const group = if (slot_drafts) try dspark_rows.groupFromEnv(m.cfg.dspark_block) else 1;
         if (slot_drafts) try dspark_slots.SlotPass.plan(m.f.arena.allocator(), &m.f, &bp, m.slots, group);
         if (m.f.kv) |k| try k.bind(&m.runner, &bp);
+        // TF_DSV41_STREAM_LAZY: the stream top-k's scratch out of the plan, allocated by the prompts that stream
+        if (longpf.lazyEnv()) if (bp.sizes.fetchOrderedRemove(longpf.lazy_role)) |kv| {
+            m.f.prefill_state.long.lazy = .{ .bytes = kv.value };
+        };
+        // TF_DSV41_EX_STACKS=1: the experts' suh / svh stacks read where the weights hold them (no second copy)
+        if (ex_stacks.enabled()) _ = try ex_stacks.bind(&m.runner, &m.weights, &bp);
+        // TF_DSV41_FORMS_INPLACE=1: the dense forms over their trellis (not a second copy), unless a program reads it
+        if (forms_inplace.enabled()) {
+            const ws = &m.f.prefill_state.k4ws.plan;
+            _ = try forms_inplace.bind(gpa, &m.runner, &m.weights, if (ws.*) |*w| &.{ &bp, w } else &.{&bp});
+        }
+        tr.plan(bp.totals());
         try m.runner.bind(&bp);
+        try vision_rows.checkPlan(&m.f, &bp);
+        tr.step("buffer plan", cuda.usage(false));
         const src: forms.Source = .{ .d = &m.driver, .weights = &m.weights, .plan = &m.pl };
         for (bp.sizes.keys()) |role| {
             if (buffers.scopeOf(role) != .persistent) continue;
@@ -296,21 +323,31 @@ pub const Model = struct {
             const bytes = (try forms.build(ra.allocator(), &src, role)) orelse continue;
             try cuda.DeviceBuffer.upload(.{ .d = &m.driver, .ptr = m.runner.addressOf(role).?, .len = bytes.len }, 0, bytes);
         }
+        tr.step("forms", cuda.usage(false));
         // TF_DSV41_L2PF: the prefetch tables from the bound weights and forms (the expert tables above), every rank
         m.l2pf = try l2pf_mod.install(gpa, &m.f, &m.weights);
         // no size cap: prod's 1M limit + 2,048 rows is 538 MB (a 256 MiB cap failed every rank's load with StreamTooLong)
-        const rope = try cwd.readFileAlloc(io, try std.fs.path.join(a, &.{ assets, "rope.bin" }), a, .unlimited);
-        const half = (rope.len - 16) / 2;
-        // rope.bin must hold the limit's rows (f32 [rows, 64] a table): a shorter one would leave positions unrotated
         const want: usize = @intCast(m.f.opts.rope_rows * 64 * 4);
-        if (half < want) {
-            const rows = m.f.opts.rope_rows;
-            std.log.scoped(.dsv41).err("{s}/rope.bin holds {d} positions; TF_DSV41_CONTEXT {d} needs {d} (the context + 2,048 prefill rows)", .{ assets, half / 256, m.f.opts.limit, rows });
-            std.log.scoped(.dsv41).err("regenerate it on every rank, with this env sourced: python tools/zig/dsv41_rope_tables.py --config <model dir>/config.json --rows {d} --out <assets dir>/rope.bin", .{rows});
-            return error.RopeTooShort;
-        }
-        for ([_][]const u8{ "s.rope.main", "s.rope.comp" }, 0..) |role, i| if (m.runner.addressOf(role)) |p|
-            try cuda.DeviceBuffer.upload(.{ .d = &m.driver, .ptr = p, .len = want }, 0, rope[16 + i * half ..][0..want]);
+        const RopeSink = struct {
+            m: *Model,
+            pub fn table(s: @This(), i: usize, bytes: []const u8) !void {
+                const role = ([_][]const u8{ "s.rope.main", "s.rope.comp" })[i];
+                const p = s.m.runner.addressOf(role) orelse return;
+                try cuda.DeviceBuffer.upload(.{ .d = &s.m.driver, .ptr = p, .len = bytes.len }, 0, bytes);
+            }
+            pub fn done(s: @This()) !void {
+                try s.m.driver.check(s.m.driver.api.cuCtxSynchronize(), "cuCtxSynchronize");
+            }
+        };
+        boot_mem.uploadRope(gpa, io, try std.fs.path.join(a, &.{ assets, "rope.bin" }), want, RopeSink{ .m = m }) catch |e| {
+            if (e == error.RopeTooShort) {
+                const rows = m.f.opts.rope_rows;
+                std.log.scoped(.dsv41).err("TF_DSV41_CONTEXT {d} needs {d} rope rows (the context + 2,048 prefill rows)", .{ m.f.opts.limit, rows });
+                std.log.scoped(.dsv41).err("regenerate it on every rank, with this env sourced: python tools/zig/dsv41_rope_tables.py --config <model dir>/config.json --rows {d} --out <assets dir>/rope.bin", .{rows});
+            }
+            return e;
+        };
+        tr.step("l2pf and rope", cuda.usage(false));
         const ehb = try cwd.readFileAllocOptions(io, try std.fs.path.join(a, &.{ assets, "engram-host.bin" }), a, .limited(1 << 26), .@"4", null);
         m.host = try eh.Host.load(ehb, m.cfg.engram_heads, m.cfg.engram_pad, m.cfg.engram_vocab, &m.lbuf);
         m.f.engram = &m.host;
@@ -328,6 +365,7 @@ pub const Model = struct {
             const ds_blocks: u32 = if (o.drafts) @intCast(dspark_emit.blocks(&m.cfg, &dsb).len) else 0;
             m.sessions = try sg.Sessions.init(gpa, io, &m.f, &bp, so, .{ .slots = m.slots, .ds_blocks = ds_blocks });
         }
+        tr.step("engram host and sessions", cuda.usage(false));
         m.gt = .{ .f = &m.f, .prefill_rows = o.prefill_rows, .max_rows = nb, .own_prefill = o.own_prefill, .sessions = m.sessions };
         // TF_DSV41_PROMPT_TAIL (prod_knobs.promptTail): the prompt's last token as the first decode row, as Python's server
         m.gt.prompt_tail = try @import("prod_knobs.zig").promptTail(&@import("prod_knobs.zig").env);
@@ -353,11 +391,12 @@ pub const Model = struct {
         // full mode: a restored entry's drafter rings start the pass's context where prod's restore does
         if (m.sessions) |x| x.ds_set = .{ .ctx = m, .set = setDsValid };
         m.gt.ingest_window = m.cfg.window;
+        tr.step("drafts and rows", cuda.usage(false));
         // TF_DSV41_SAMPLING=1: keyed sampling (T > 0) on every rank; off: such requests are refused (error.Sampling)
         m.sampler = if (samp.enabled()) try samp.GpuSampler.init(gpa, &m.f) else null;
         m.gt.sampler = m.sampler;
-        // TF_DSV41_IMAGES=native (vision_rows.zig): Engram's keep at image positions on every rank, the tower on rank 0
-        try vision_rows.boot(gpa, io, &m.f, &m.pack, &m.driver, m.tcfg.rank, &m.weights);
+        // TF_DSV41_IMAGES=native (vision_rows.zig): the tower on rank 0 (the keep and the bias: bootPlan)
+        try vision_rows.bootTower(gpa, io, &m.f, &m.pack, &m.driver, m.tcfg.rank);
         // TF_DSV41_GRAMMAR=1: the checkpoint's grammar compilers on every rank (tokenizer.json from the pack, or
         // TF_DSV41_GRAMMAR_TOKENIZER's dir); masks for up to 64 rows a pick (Python's row cap)
         if (try grammar_gpu.enabled()) {
@@ -365,6 +404,11 @@ pub const Model = struct {
             m.grammar = try grammar_gpu.Masks.init(gpa, io, &m.f, tok_dir, m.slots, 64);
         }
         try m.driver.check(m.driver.api.cuCtxSynchronize(), "cuCtxSynchronize");
+        tr.step("end", cuda.usage(false));
+        tr.trim();
+        if (m.dev_arena) |x| x.endBoot(m.tcfg.rank); // TF_DSV41_ARENA=pack: boot's buffers in, the rest as before
+        // the boot check on the boot's own figures: what it took, the dip below idle, the hard floor
+        if (m.boot_check) |b| try kvs.afterBoot(b);
         try comm.barrier();
     }
 

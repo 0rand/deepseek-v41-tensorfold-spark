@@ -183,3 +183,34 @@ test "split KV: an exchanged attention in row blocks moves the row-indexed tenso
     // the compressed layers attend the exchange, the SWA-only layers their ring
     try testing.expect(exchanged > 0 and local > 0);
 }
+
+test "TF_DSV41_STREAM_LAZY: no graphed program names the stream scratch; a long segment does" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const w = try widths(a);
+    const cfg: Config = .{};
+    var layers: [64]u32 = undefined;
+    for (layers[0..cfg.layers], 0..) |*l, i| l.* = @intCast(i);
+    for ([_]bool{ false, true }) |split| {
+        const o: block.Options = .{ .limit = limit, .rope_rows = limit + 2048, .pool = poolOf(split) };
+        // decode windows (one slot, every row bucket) and row windows at the slot's last position: graph-captured
+        var r: i64 = 1;
+        while (r <= 64) : (r += 1) {
+            // (a one-slot window the emitter refuses at this position never runs: block.zig's stream guard)
+            if (r <= 17) if (block.emit(a, &cfg, &w, o, layers[0..cfg.layers], r, limit - r, true)) |cs|
+                try testing.expect(!longpf.names(cs, longpf.lazy_role))
+            else |e|
+                try testing.expectEqual(error.Unsupported, e);
+            var ro = o;
+            ro.rows = true;
+            try testing.expect(!longpf.names(try block.emit(a, &cfg, &w, ro, layers[0..cfg.layers], r, limit - r, true), longpf.lazy_role));
+        }
+        // a prompt segment past the threshold streams
+        const seg = try block_prefill.emitPrefill(a, &cfg, &w, o, layers[0..cfg.layers], n, limit - n, true);
+        try testing.expect(longpf.names(seg, longpf.lazy_role));
+        // and one below it does not (the scratch is never allocated for a short prompt)
+        const short = try block_prefill.emitPrefill(a, &cfg, &w, o, layers[0..cfg.layers], n, 0, true);
+        try testing.expect(!longpf.names(short, longpf.lazy_role));
+    }
+}

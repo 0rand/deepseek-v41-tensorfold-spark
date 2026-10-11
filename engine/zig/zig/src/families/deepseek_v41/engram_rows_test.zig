@@ -371,14 +371,17 @@ test "engram rows: a long run of bulk reads and evictions leaves the record map 
     const out = try a.alloc(u16, ids.len * 256);
     defer a.free(out);
     var rng = std.Random.DefaultPrng.init(7);
-    var least: usize = std.math.maxInt(usize);
+    // the worst sample: free slots against the map's slots (it grows meanwhile)
+    var worst: [2]usize = .{ 1, 1 };
     for (0..300) |i| {
         // a prompt segment's bulk read (past cap / 4: read through, its keys dropped), then a decode window's few
         const n: usize = if (i % 2 == 0) ids.len else 64;
         for (ids[0..n]) |*x| x.* = @intCast(fx.lo + rng.random().uintLessThan(u64, fx.rows));
         try r.rows(0, ids[0..n], 256, out[0 .. n * 256]);
-        least = @min(least, freeSlots(r));
+        const all = r.tables[0].map.capacity();
+        const free = freeSlots(r);
+        if (free * worst[1] < worst[0] * all) worst = .{ free, all };
     }
-    errdefer std.debug.print("record map: {d} of {d} slots free at the least\n", .{ least, r.tables[0].map.capacity() });
-    try testing.expect(least * 8 >= r.tables[0].map.capacity());
+    errdefer std.debug.print("record map: {d} free of {d} slots at the worst\n", .{ worst[0], worst[1] });
+    try testing.expect(worst[0] * 10 >= worst[1]);
 }

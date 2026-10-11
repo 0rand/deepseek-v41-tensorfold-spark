@@ -47,6 +47,10 @@ pub const Settings = struct {
     drain_s: f64 = 20,
     /// TF_DSV41_SSE_KEEPALIVE_S / GLM53_TF_SSE_KEEPALIVE_S: a silent stream's keepalive period (0: none)
     keepalive_s: f64 = 15,
+    /// TF_DSV41_STALL_ROUND_S / GLM53_TF_STALL_ROUND_S: /health 503 when work is in flight and no round ended this long
+    stall_round_s: f64 = 120,
+    /// TF_DSV41_STALL_SLOW_S / GLM53_TF_STALL_SLOW_S: /health 503 when the rounds' pace has been slow this long
+    stall_slow_s: f64 = 180,
 
     /// The knobs from ``env``; ``problem`` names a bad one.
     pub fn fromEnv(env: ?*const std.process.Environ.Map, problem: *[]const u8) error{Invalid}!Settings {
@@ -62,6 +66,8 @@ pub const Settings = struct {
             s.health = if (std.ascii.eqlIgnoreCase(t, "basic")) .basic else if (std.ascii.eqlIgnoreCase(t, "strict")) .strict else return bad(problem, "GLM53_TF_HEALTH / TF_DSV41_HEALTH: expected one of basic, strict");
         }
         if (knob(m, "STALL_S")) |v| s.stall_s = try nonNegative(v, 0, problem, "GLM53_TF_STALL_S: must be a number >= 0");
+        if (knob(m, "STALL_ROUND_S")) |v| s.stall_round_s = try nonNegative(v, 120, problem, "TF_DSV41_STALL_ROUND_S / GLM53_TF_STALL_ROUND_S: seconds, a number >= 0");
+        if (knob(m, "STALL_SLOW_S")) |v| s.stall_slow_s = try nonNegative(v, 180, problem, "TF_DSV41_STALL_SLOW_S / GLM53_TF_STALL_SLOW_S: seconds, a number >= 0");
         if (knob(m, "SSE_KEEPALIVE_S")) |v| s.keepalive_s = try nonNegative(v, 15, problem, "TF_DSV41_SSE_KEEPALIVE_S / GLM53_TF_SSE_KEEPALIVE_S: seconds, a number >= 0");
         if (knob(m, "DRAIN_S")) |v| s.drain_s = try nonNegative(v, 20, problem, "TF_DSV41_DRAIN_S / GLM53_TF_DRAIN_S: seconds, a number >= 0");
         if (m.get("GLM53_TF_STALL_PREFILL_TPS")) |v| s.stall_prefill_tps = try nonNegative(v, 200, problem, "GLM53_TF_STALL_PREFILL_TPS: must be a number >= 0");
@@ -159,6 +165,8 @@ pub const Health = struct {
     mode: Mode,
     stall_s: f64,
     prefill_tps: f64,
+    stall_round_s: f64,
+    stall_slow_s: f64,
     started: i96,
     mutex: std.Io.Mutex = .init,
     fatal: ?[]u8 = null,
@@ -176,7 +184,7 @@ pub const Health = struct {
     pub const End = union(enum) { ok: Outcome, failed: struct { value_error: bool, message: []const u8 } };
 
     pub fn init(gpa: Allocator, io: std.Io, s: Settings) Health {
-        return .{ .gpa = gpa, .io = io, .mode = s.health, .stall_s = s.stall_s, .prefill_tps = s.stall_prefill_tps, .started = now(io) };
+        return .{ .gpa = gpa, .io = io, .mode = s.health, .stall_s = s.stall_s, .prefill_tps = s.stall_prefill_tps, .stall_round_s = s.stall_round_s, .stall_slow_s = s.stall_slow_s, .started = now(io) };
     }
 
     pub fn deinit(h: *Health) void {
@@ -267,6 +275,17 @@ pub const Health = struct {
             if (quiet > allow) try out.append(a, .{ .prompt = e.prompt, .quiet_s = round(quiet, 1), .allowed_s = round(allow, 1) });
         }
         return out.items;
+    }
+
+    /// Why the engine is stuck (no round with work in flight, or a slow pace held too long), or null.
+    pub fn stuck(h: *const Health, a: Allocator, st: api.Status, inflight: usize) Allocator.Error!?[]const u8 {
+        const p = st.pace orelse return null;
+        const busy = inflight > 0 or st.running > 0 or st.waiting > 0;
+        if (busy and h.stall_round_s > 0) if (p.last_round_age_s) |age| if (age > h.stall_round_s)
+            return try std.fmt.allocPrint(a, "no round for {d:.0} s with work in flight", .{age});
+        if (h.stall_slow_s > 0 and p.slow_s > h.stall_slow_s)
+            return try std.fmt.allocPrint(a, "rounds slower than their baseline for {d:.0} s (decode {d:.3} s vs {d:.3}; prefill {d:.0} vs {d:.0} rows/s)", .{ p.slow_s, p.decode_s, p.decode_base_s, p.prefill_rows_s, p.prefill_base_rows_s });
+        return null;
     }
 
     /// ``GET /health``: the status code and body. ``streams``: the engine's slots (null: not a batch engine).
@@ -760,4 +779,26 @@ test "the request log's hash is Python's blake2b(digest_size=8) of int32 ids" {
     try std.testing.expectEqualStrings("99a5826197698e6d", &l.hash(&.{ 0, 1, 2 }));
     l.s.salt = "salt";
     try std.testing.expectEqualStrings("c90ad2de02f9487a", &l.hash(&.{ 0, 1, 2 }));
+}
+
+test "health: stuck when work is in flight and no round ended for the limit, or the pace has been slow too long" {
+    const a = std.testing.allocator;
+    var h = Health.init(a, std.testing.io, .{});
+    defer h.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const x = arena.allocator();
+    // healthy: rounds a moment ago, at their baseline
+    var st: api.Status = .{ .running = 1, .pace = .{ .last_round_age_s = 0.2, .decode_s = 0.07, .decode_base_s = 0.07 } };
+    try std.testing.expect((try h.stuck(x, st, 1)) == null);
+    // no round for longer than the limit with work in flight; idle (nothing in flight) is not stuck
+    st.pace.?.last_round_age_s = 121;
+    try std.testing.expect(std.mem.startsWith(u8, (try h.stuck(x, st, 1)).?, "no round for 121 s"));
+    st.running = 0;
+    try std.testing.expect((try h.stuck(x, st, 0)) == null);
+    // a measured stall: 380 ms rounds against 73 ms, slow for over three minutes
+    st.pace = .{ .last_round_age_s = 0.4, .decode_s = 0.38, .decode_base_s = 0.073, .slow_s = 181 };
+    try std.testing.expect(std.mem.startsWith(u8, (try h.stuck(x, st, 1)).?, "rounds slower than their baseline for 181 s"));
+    // an engine that keeps no pace is never called stuck
+    try std.testing.expect((try h.stuck(x, .{ .running = 3 }, 3)) == null);
 }

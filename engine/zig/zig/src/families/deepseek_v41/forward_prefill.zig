@@ -69,8 +69,6 @@ pub const State = struct {
     /// workspace above the hard floor (wsAgreed, one collective a call); false: this call runs 2,048-row segments, the
     /// same bits (segmentation-invariant), never a failure. True until a call decides (the planner reads it at boot)
     ws_ok: bool = true,
-    /// kv_state.bootCheck's `.held` (a first start short of the workspace): this rank votes no in every wsAgreed
-    ws_hold: bool = false,
     ws_fallbacks: u64 = 0,
     agreement: ?graphs.Agreement = null,
     /// the next prompt piece's ids (Forward.prefillAhead, op 60: the round planner's next piece of this prompt, as
@@ -130,7 +128,9 @@ fn planPrograms(f: *Forward, p: *buffers.Plan, rows: u32, layers: []const u32) !
         for ([_]i64{ 0, top }) |start| {
             var ea = std.heap.ArenaAllocator.init(f.gpa);
             defer ea.deinit();
-            try p.add(try block_prefill.emitPrefill(ea.allocator(), f.cfg, f.widths, vision_rows.planOptions(f), layers, n, start, true));
+            // replay's segments run the encoder (no head): its whole programs plan no head, w.logits not 2,048 rows
+            const head = f.prefill_state.mode != .replay;
+            try p.add(try block_prefill.emitPrefill(ea.allocator(), f.cfg, f.widths, vision_rows.planOptions(f), layers, n, start, head));
         }
     }
     if (f.prefill_state.mode == .replay) try planReplay(f, p, rows, layers);
@@ -347,10 +347,10 @@ fn wsAgreed(f: *Forward) !bool {
     const avail = graphs.memAvailableGiB();
     const left = if (avail) |v| v - @as(f64, @floatFromInt(bytes)) / (1 << 30) else hard;
     if (st.agreement == null) st.agreement = try graphs.Agreement.init(f.runner.d, f.comm, f.runner.stream);
-    const ok = try st.agreement.?.agree().all(st.agreement.?.agree().ctx, left >= hard and !st.ws_hold);
+    const ok = try st.agreement.?.agree().all(st.agreement.?.agree().ctx, left >= hard);
     if (!ok) {
         st.ws_fallbacks += 1;
-        if (!st.ws_hold and (st.ws_fallbacks <= 4 or st.ws_fallbacks % 64 == 0))
+        if (st.ws_fallbacks <= 4 or st.ws_fallbacks % 64 == 0)
             log.warn("prefill workspace: {d} MiB does not fit on every rank (rank {d}: {d:.2} GiB MemAvailable leaves {d:.2}, floor {d:.1} GiB, TF_DSV41_PF_WS_FLOOR_GIB): this prompt piece runs 2,048-row segments (fallback {d})", .{ bytes >> 20, f.comm.rank(), avail orelse -1, left, hard, st.ws_fallbacks });
     }
     return ok;
@@ -846,6 +846,7 @@ pub fn finishMulti(f: *Forward, slots: []const u32, out: []Replayed) !void {
     }
     f.last_rows = 0;
     try k4Release(f); // TF_DSV41_PF_4K: these prompts are prefilled
+    try longpf.release(&st.long, f.runner); // TF_DSV41_STREAM_LAZY: their stream scratch too
 }
 
 /// The glue's view of the whole run (Forward.multi): the first segment's slot, every row's ids, the run's rows pending.
@@ -917,8 +918,9 @@ pub fn finish(f: *Forward) !void {
     try longpf.window(&st.long, f.gpa, f.runner, f.kv, t.r0, cs);
     if (f.runner.prof) |pr| pr.prefillRows(@intCast(t.m), true);
     f.last_rows = 0;
-    // TF_DSV41_PF_4K: the prompt is prefilled, its workspace goes back
+    // TF_DSV41_PF_4K: the prompt is prefilled, its workspace goes back (TF_DSV41_STREAM_LAZY: and its stream scratch)
     try k4Release(f);
+    try longpf.release(&st.long, f.runner);
     // the drafter's context rows: the tail's taps (replay.finish's, which slots.finish_prompt hands to `replayed`)
     st.taps_at = t.r0;
     st.taps_rows = t.m;

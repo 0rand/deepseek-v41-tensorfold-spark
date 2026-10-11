@@ -46,12 +46,15 @@ pub const Fake = struct {
     drafts_most: usize = 0,
     fail_runs: usize = 0, // the next this many `pieces` calls fail with error.Unbound (`runBackend`)
     runs: usize = 0, // `pieces` calls that ran
+    saves: std.ArrayList([]u32) = .empty, // prompt prefixes a `piece` kept (its `snapshot`); `begin` resumes the longest
 
     pub fn deinit(x: *Fake) void {
         var it = x.lanes.valueIterator();
         while (it.next()) |l| freeLane(x.gpa, l);
         x.lanes.deinit(x.gpa);
         x.drawn.deinit(x.gpa);
+        for (x.saves.items) |v| x.gpa.free(v);
+        x.saves.deinit(x.gpa);
     }
 
     fn freeLane(gpa: Allocator, l: *Lane) void {
@@ -101,11 +104,16 @@ pub const Fake = struct {
         const got = try x.lanes.getOrPut(x.gpa, s);
         if (got.found_existing) freeLane(x.gpa, got.value_ptr);
         got.value_ptr.* = .{};
-        return .{};
+        // the longest kept prefix of this prompt, strictly shorter than it, as a session store's find
+        var best: []const u32 = &.{};
+        for (x.saves.items) |v| if (v.len > best.len and v.len < s.prompt_len and std.mem.startsWith(u32, s.prompt(), v)) {
+            best = v;
+        };
+        try got.value_ptr.history.appendSlice(x.gpa, best);
+        return .{ .cached = best.len };
     }
 
     fn piece(ptr: *anyopaque, s: *Stream, start: u64, end: u64, snapshot: bool) anyerror!void {
-        _ = snapshot;
         const x = self(ptr);
         if (x.fail_pieces > 0) {
             x.fail_pieces -= 1;
@@ -114,7 +122,8 @@ pub const Fake = struct {
         const h = &x.lane(s).history;
         if (h.items.len != start or end + 1 > s.prompt_len) return error.PositionMismatch;
         try h.appendSlice(x.gpa, s.prompt()[start..end]);
-        x.pieces_run += 1;
+        if (start < end) x.pieces_run += 1;
+        if (snapshot) try x.saves.append(x.gpa, try x.gpa.dupe(u32, h.items));
     }
 
     fn finish(ptr: *anyopaque, s: *Stream) anyerror!void {

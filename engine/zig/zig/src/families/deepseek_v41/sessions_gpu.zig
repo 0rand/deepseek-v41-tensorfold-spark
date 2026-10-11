@@ -43,6 +43,7 @@ const ced = @import("ced.zig");
 const rowmode = @import("rowmode.zig");
 const slots_mod = @import("slots.zig");
 const graphs = @import("graphs.zig");
+const lockstep = @import("lockstep.zig");
 const dspark_emit = @import("dspark_emit.zig");
 
 const sessions = kv.sessions;
@@ -242,9 +243,12 @@ pub const Sessions = struct {
         try s.reset();
     }
 
-    fn restoreFn(ptr: *anyopaque, id: u32) anyerror!void {
+    fn restoreFn(ptr: *anyopaque, id: u32, ids: []const i64) anyerror!void {
         const s: *Sessions = @ptrCast(@alignCast(ptr));
-        _ = try s.restore(id);
+        const p = try s.gpa.alloc(u32, ids.len);
+        defer s.gpa.free(p);
+        for (ids, p) |t, *y| y.* = @intCast(t);
+        _ = try s.restore(id, if (ids.len > 0) p else null);
     }
 
     /// A follower: the leader's admission (forward.zig op_sess_admit: [op, need, n, spilled ids...]).
@@ -270,7 +274,7 @@ pub const Sessions = struct {
     }
 
     /// The slot the one-slot operations run on (the pool's current slot: slots.zig `activate`).
-    fn cur(s: *const Sessions) u32 {
+    pub fn cur(s: *const Sessions) u32 {
         return s.kx.slot.id;
     }
 
@@ -483,7 +487,7 @@ pub const Sessions = struct {
         const hit = try s.find(prompt);
         if (max_new) |mn| try s.admit(hit, prompt.len, mn);
         s.ds_valid[s.cur()] = 0;
-        return (try s.resumeHit(prompt.len, hit)).at;
+        return (try s.resumeHit(prompt, hit)).at;
     }
 
     /// The longest saved entry that strictly prefixes `prompt` (a row must remain to prefill), null: none.
@@ -504,19 +508,22 @@ pub const Sessions = struct {
 
     /// The round planner's admission into the (empty) slot (rounds.py `_admit`): `spills` evicted (the round's, with
     /// its first admission), `need` pages reserved, then `hit` restored. Every rank, in the leader's order.
-    pub fn resumePlanned(s: *Sessions, n: u64, need: u32, hit: ?sessions.store.Hit, spills: []const u32) !Resumed {
+    pub fn resumePlanned(s: *Sessions, prompt: []const u32, need: u32, hit: ?sessions.store.Hit, spills: []const u32) !Resumed {
         if (s.f.slot.pos != 0 or s.kx.slot.len != 0) return error.SlotNotEmpty;
         s.stats.admits += 1;
         try s.f.sendSessAdmit(need, spills);
         try s.applyAdmit(need, spills);
         s.ds_valid[s.cur()] = 0;
-        return s.resumeHit(n, hit);
+        return s.resumeHit(prompt, hit);
     }
 
-    fn resumeHit(s: *Sessions, n: u64, hit: ?sessions.store.Hit) !Resumed {
+    fn resumeHit(s: *Sessions, prompt: []const u32, hit: ?sessions.store.Hit) !Resumed {
         const h = hit orelse return .{};
-        try s.f.sendSess(.restore, h.id);
-        if (!try s.restore(h.id)) return .{ .damaged = true };
+        const n = prompt.len;
+        // out of RAM no tokens are indexed: the history is the prompt's prefix (rounds.py `_admit`)
+        const ids: ?[]const u32 = if (s.store.entry(h.id).ram) null else prompt[0..@intCast(h.pos)];
+        try s.f.sendRestore(h.id, ids);
+        if (!try s.restore(h.id, ids)) return .{ .damaged = true };
         std.log.scoped(.dsv41).info("sessions: slot {d} resumed {d} of {d} prompt tokens from {s}", .{ s.cur(), h.pos, n, if (h.ram) "RAM" else "NVMe" });
         return .{ .at = h.pos };
     }
@@ -547,44 +554,49 @@ pub const Sessions = struct {
         s.kx.slot.reserve(need);
     }
 
-    /// Entry `id` into the empty slot (every rank: the leader found it): from RAM (pages shared, the partial last page
-    /// copied) or NVMe (streamed into fresh pages), its bounded state and committed ids. False: its file did not read
-    /// back on some rank (a damaged NVMe entry: rounds.py `_admit`'s `except (ValueError, KeyError)`): every rank's slot
-    /// is empty again with its reservation, the entry is forgotten (prod's sessdisk deletes the file), and the caller
-    /// prefills the prompt from 0.
-    pub fn restore(s: *Sessions, id: u32) !bool {
+    /// Entry `id` into the empty slot, agreed (lockstep.zig); false: not back on some rank, so a miss everywhere.
+    pub fn restore(s: *Sessions, id: u32, ids: ?[]const u32) !bool {
         if (s.f.slot.pos != 0 or s.kx.slot.len != 0) return error.SlotNotEmpty;
         try s.active();
-        const e = s.store.entry(id);
-        const pos = e.pos;
-        var ok = true;
-        if (e.ram) {
-            const b = try s.store.restoreRam(id, s.kx.slot);
-            try s.uploadSnap(@ptrCast(@alignCast(b.ptr)));
-        } else s.restoreDisk(id) catch |err| {
-            if (err == error.OutOfMemory) return err;
-            std.log.scoped(.dsv41).warn("sessions: slot {d}: the NVMe entry of {d} tokens did not read back ({t}); its prompt prefills from 0", .{ s.cur(), pos, err });
-            ok = false;
-        };
-        if (ok and s.f.slot.pos != pos) ok = false;
-        if (s.agreement) |*a| {
-            const g = a.agree();
-            ok = try g.all(g.ctx, ok);
-        }
-        if (!ok) {
+        const pos = s.store.entry(id).pos;
+        const g: ?lockstep.Agree = if (s.agreement) |*a| blk: {
+            const x = a.agree();
+            break :blk .{ .ctx = x.ctx, .all = x.all };
+        } else null;
+        if (!try lockstep.agreed(g, s.restoreOn(id, ids), "a session restore", s.f.comm.rank())) {
             try s.kx.truncate(0);
             s.f.slot = .{};
             s.hist[s.cur()].clearRetainingCapacity();
             s.ds_valid[s.cur()] = 0;
-            try s.store.forget(id);
+            // a cache miss from here: the entry out of RAM and its file deleted, on every rank alike
+            if (s.store.entry(id).ram) try s.store.drop(id);
+            if (s.store.entry(id).live) try s.store.forget(id); // drop removed an entry no file holds
             s.stats.damaged += 1;
+            std.log.scoped(.dsv41).warn("sessions: slot {d}: the entry of {d} tokens did not come back; its prompt prefills from 0", .{ s.cur(), pos });
             return false;
         }
         try s.kx.dev.syncTables();
+        return true;
+    }
+
+    /// This rank's restore of `id`: pages and bounded state (RAM or NVMe), the position, the slot's history.
+    fn restoreOn(s: *Sessions, id: u32, ids: ?[]const u32) !void {
+        const e = s.store.entry(id);
+        const pos = e.pos;
+        if (e.ram) {
+            const b = try s.store.restoreRam(id, s.kx.slot);
+            try s.uploadSnap(@ptrCast(@alignCast(b.ptr)));
+        } else try s.restoreDisk(id);
+        if (s.f.slot.pos != pos) return error.RestoredPosition;
         const h = &s.hist[s.cur()];
         try h.resize(s.gpa, pos);
-        try s.store.index.idsOf(id, h.items);
-        return true;
+        // RAM: the path's indexed tokens; NVMe: the ids the leader sent (its prompt's prefix), as Python's history
+        const given: ?[]i32 = if (ids) |x| try s.gpa.alloc(i32, x.len) else null;
+        defer if (given) |gv| s.gpa.free(gv);
+        if (given) |gv| for (ids.?, gv) |t, *y| {
+            y.* = @intCast(t);
+        };
+        try s.store.historyOf(id, given, h.items);
     }
 
     fn restoreDisk(s: *Sessions, id: u32) !void {

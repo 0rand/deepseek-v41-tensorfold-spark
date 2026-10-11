@@ -19,7 +19,7 @@
 //!   and longpf.zig runs the segment's attention in those row blocks, each block's rows exchanged right before it
 //!   (Python's _attend_blocks), for the index layer and its reuse layers alike.
 //!
-//! Not here yet: row mode (several live slots in one window).
+//! Row mode (several slots in one window): the dense exchange reads the stacked split table (batch.zig `exchange`).
 
 const std = @import("std");
 const cuda = @import("cuda");
@@ -66,21 +66,19 @@ pub fn optionsFromEnv(capacity: u64, world: u32) !?Options {
     return .{ .tokens = (tokens + unit - 1) / unit * unit, .split = split, .capacity = capacity, .union_cap = mib << 20 };
 }
 
-/// The workspace after the boot check: `.held` = a first start short of it runs 2,048-row segments this process.
-pub const Workspace = enum { fits, held };
+/// The boot check's figures for the measured check at the end of boot (`afterBoot`).
+pub const Boot = struct { rank: u32, at_check: f64, pool_gib: f64, pool_tokens: u64, bytes_a_token: f64, reserve: f64, dip: f64, hard: f64, target: f64, workspace: u64 };
 
-/// The measured boot check (memory.py serve_check, kv/budget.zig) before the pool is allocated: MemAvailable now - the pool
-/// (split counted) - the measured boot growth - the worst serving dip >= the hard floor (TF_DSV41_FLOOR_HARD_GIB). It runs
-/// where the GPU allocates from host memory (GB10; TF_DSV41_BOOT_MEASURED forces it); a refusal names the largest pool.
-pub fn bootCheck(ctx: *const cuda.Context, cfg: *const Config, o: Options, rank: u32, world: u32, first_start: bool) !Workspace {
+/// Before the pool (GB10): refuses a pool that cannot fit at all; growth is measured at boot's end (null: not GB10).
+pub fn bootCheck(ctx: *const cuda.Context, cfg: *const Config, o: Options, rank: u32, world: u32) !?Boot {
     const budget = kv.budget;
     const mi = budget.meminfo() catch |e| {
         std.log.warn("kv: no /proc/meminfo ({t}): the measured boot check is skipped", .{e});
-        return .fits;
+        return null;
     };
     const dev = try ctx.memInfo();
     const integrated = (ctx.attribute(.integrated) catch 0) != 0;
-    if (!budget.measuredApplies(budget.modeFromEnv(), integrated, dev.total, mi.total)) return .fits;
+    if (!budget.measuredApplies(budget.modeFromEnv(), integrated, dev.total, mi.total)) return null;
     var knobs: budget.Knobs = .{};
     if (std.c.getenv("TF_DSV41_FLOOR_HARD_GIB")) |v| knobs.hard_gib = try std.fmt.parseFloat(f64, std.mem.span(v));
     // TF_DSV41_FLOOR_GIB (5): the floor target the load plans for (memory.py floor_settings: 0 < hard <= target)
@@ -89,43 +87,38 @@ pub fn bootCheck(ctx: *const cuda.Context, cfg: *const Config, o: Options, rank:
         std.log.err("kv: TF_DSV41_FLOOR_HARD_GIB={d} / TF_DSV41_FLOOR_GIB={d}: expected 0 < hard <= target", .{ knobs.hard_gib, target });
         return error.BadFloor;
     }
-    // the prefill price's knobs by prod's names (TF_DSV41_PREFILL_ROWS, TF_DSV41_INDEX_BUDGET_MIB)
-    if (std.c.getenv("TF_DSV41_PREFILL_ROWS")) |v| knobs.prefill_rows = try std.fmt.parseInt(u32, std.mem.span(v), 10);
-    // TF_DSV41_PF_4K: 4,096-row segments, priced as such (memory.py's chunk_gib scales by the window)
-    const pk = @import("prod_knobs.zig");
-    if (try pk.pf4k(&pk.env)) knobs.prefill_rows = pk.pf4k_rows;
-    // TF_DSV41_PF_TBO: a pair of segments in flight at once
-    if (try pk.pfTbo(&pk.env)) knobs.prefill_rows *= 2;
-    if (std.c.getenv("TF_DSV41_INDEX_BUDGET_MIB")) |v| knobs.index_budget_mib = try std.fmt.parseInt(u32, std.mem.span(v), 10);
     var layout = try kv.Layout.fromConfig(cfg, .{ .split = o.split and world > 1 });
-    var terms = try budget.Serve.fromEnv(rank);
+    // Zig's terms, not Python's: its plan holds from boot what Python's caching allocator takes while serving
+    var terms = try budget.zigFromEnv();
     terms.growth += @as(f64, @floatFromInt(o.resident)) / budget.GiB;
-    if (o.resident > 0) std.log.info("kv: boot growth + {d:.3} GiB the plan holds resident (the long-prompt stream top-k's scratch)", .{@as(f64, @floatFromInt(o.resident)) / budget.GiB});
     const r = budget.serveCheck(knobs, .{ .rank = rank, .avail_gib = @as(f64, @floatFromInt(mi.available)) / budget.GiB, .terms = terms }, layout.pool(), world, o.tokens);
     var buf: [1024]u8 = undefined;
     if (!r.ok) {
         std.log.err("kv: {s}", .{r.message(&buf)});
         return error.PoolDoesNotFit;
     }
-    std.log.info("kv: {s}", .{r.message(&buf)});
-    // the workspace on top of the worst serving point: the 4K / TBO path's transient the measured terms never held
-    if (o.workspace > 0) {
-        const ws = @as(f64, @floatFromInt(o.workspace)) / budget.GiB;
-        const left = r.worst - ws;
-        if (left < r.hard and first_start) {
-            // a first start measures less MemAvailable than later starts: no 4K this run
-            std.log.warn("kv: rank {d}: first start (prepared images written this boot): the prefill workspace ({d:.2} GiB) on top of the predicted worst MemAvailable {d:.2} GiB leaves {d:.2} GiB, under the {d:.1} GiB hard floor; this run uses 2,048-row prefill segments, restart to use 4K", .{ rank, ws, r.worst, left, r.hard });
-            return .held;
-        }
-        if (left < r.hard) {
-            std.log.err("kv: rank {d}: the prefill workspace ({d:.2} GiB, TF_DSV41_PF_4K / TF_DSV41_PF_TBO) on top of the predicted worst MemAvailable {d:.2} GiB leaves {d:.2} GiB, under the {d:.1} GiB hard floor (TF_DSV41_FLOOR_HARD_GIB): lower TF_DSV41_POOL_TOKENS by about {d:.0} tokens, or drop TF_DSV41_PF_TBO (4K alone holds half of 4K + TBO's)", .{ rank, ws, r.worst, left, r.hard, (r.hard - left) * budget.GiB / @max(1.0, r.bytes_a_token) });
-            return error.PoolDoesNotFit;
-        }
-        std.log.info("kv: rank {d}: prefill workspace {d:.2} GiB at a long prompt: worst MemAvailable {d:.2} GiB with it (hard floor {d:.1})", .{ rank, ws, left, r.hard });
-        if (left < target) std.log.warn("kv: memory: with the prefill workspace the floor {d:.2} GiB is under the {d} GiB target (TF_DSV41_FLOOR_GIB)", .{ left, target });
+    std.log.info("kv: before the pool: {s}; the boot's growth is measured at its end", .{r.message(&buf)});
+    return .{ .rank = rank, .at_check = r.avail_gib, .pool_gib = r.pool_gib, .pool_tokens = o.tokens, .bytes_a_token = r.bytes_a_token, .reserve = try budget.reserveFromEnv(), .dip = terms.dip, .hard = r.hard, .target = target, .workspace = o.workspace };
+}
+
+/// At boot's end: idle - dip >= the hard floor or the pool is refused; a 4K workspace past it warns (wsAgreed).
+pub fn afterBoot(b: Boot) !void {
+    const budget = kv.budget;
+    const idle = @as(f64, @floatFromInt((try budget.meminfo()).available)) / budget.GiB;
+    const x = budget.afterBoot(b.at_check, b.pool_gib, idle, b.reserve, b.dip, b.hard, b.pool_tokens, b.bytes_a_token);
+    const msg = "kv: rank {d}: boot growth {d:.2} GiB measured (MemAvailable {d:.2} at the check - pool {d:.2} - {d:.2} now); worst serving point {d:.2} GiB (post-boot reserve {d:.2}, TF_DSV41_POST_BOOT_GIB; dip {d:.2}, TF_DSV41_SERVE_DIP_GIB; hard floor {d:.1})";
+    const args = .{ b.rank, x.growth, b.at_check, b.pool_gib, idle, x.worst, b.reserve, b.dip, b.hard };
+    if (!x.ok) {
+        std.log.err(msg ++ ": the pool does not fit; the largest that does: TF_DSV41_POOL_TOKENS={d}", args ++ .{x.largest});
+        return error.PoolDoesNotFit;
     }
-    if (r.worst < target) std.log.warn("kv: memory: floor {d:.2} GiB is under the {d} GiB target (TF_DSV41_FLOOR_GIB)", .{ r.worst, target });
-    return .fits;
+    std.log.info(msg, args);
+    if (b.workspace > 0) {
+        const ws = @as(f64, @floatFromInt(b.workspace)) / budget.GiB;
+        const left = x.worst - ws;
+        if (left < b.hard) std.log.warn("kv: rank {d}: the prefill workspace ({d:.2} GiB, TF_DSV41_PF_4K / TF_DSV41_PF_TBO) at the worst point leaves {d:.2} GiB, under the {d:.1} GiB hard floor: long prompts there run 2,048-row segments", .{ b.rank, ws, left, b.hard });
+    }
+    if (x.worst < b.target) std.log.warn("kv: memory: floor {d:.2} GiB is under the {d} GiB target (TF_DSV41_FLOOR_GIB)", .{ x.worst, b.target });
 }
 
 pub const Kv = struct {
@@ -149,12 +142,19 @@ pub const Kv = struct {
     x: kv.split.Exchange = undefined,
     ops: Ops = undefined,
     lens: ?cuda.DeviceBuffer = null,
+    /// TF_DSV41_KV_SPLIT_DEDUP's map and scratch (kv/split.zig Dedup)
+    dedup: ?cuda.DeviceBuffer = null,
+    /// TF_DSV41_KV_SPLIT_HISTORY: a union that fits the cap sends the slot's owned rows (kv/split.zig HistArgs)
+    hist: bool = false,
     stats: Stats = .{},
     /// the last union when it took several row blocks (empty: one block, already exchanged): each block's rows
     /// sit in `phys` at its offset, its tokens in the call's token rows; longpf.zig exchanges them block by block
     blocks: std.ArrayList(kv.split.Block) = .empty,
     block_phys: std.ArrayList(u32) = .empty,
     union_at: struct { comp: u64 = 0, send: u64 = 0, recv: u64 = 0 } = .{},
+    /// a union's pinned staging: the selection read back, the tokens and rows sent up (reused after the next drain)
+    pin_sel: ?cuda.HostBuffer = null,
+    pin_up: ?cuda.HostBuffer = null,
 
     pub const Stats = struct { dense: u64 = 0, unions: u64 = 0, union_rows_max: u64 = 0, bytes: u64 = 0 };
 
@@ -176,8 +176,33 @@ pub const Kv = struct {
             k.lens = try cuda.DeviceBuffer.alloc(d, 4 * @as(usize, world));
             // the compact mode's transport agreement happens here, once, outside any graph
             k.x = try kv.split.Exchange.init(comm, k.ops.kernels(), try kv.split.compactMode());
+            if (kv.split.dedupOn()) try k.initDedup(d, cfg.index_topk);
+            if (kv.split.historyOn()) {
+                if (runner.kernels.ops.kv_hist == null) {
+                    std.log.err("[tensorfold] TF_DSV41_KV_SPLIT_HISTORY=1: the kvsplit fatbin has no history kernels (rebuild it)", .{});
+                    return error.MissingKernel;
+                }
+                k.hist = true;
+            }
         }
         return k;
+    }
+
+    /// The dedup scratch: a key map over every slot's rows (ratio 1), INT_MAX; entries for 64 rows (wider: no dedup).
+    fn initDedup(k: *Kv, d: *const cuda.Driver, topk: u32) !void {
+        if (k.runner.kernels.ops.kv_dedup == null) {
+            std.log.err("[tensorfold] TF_DSV41_KV_SPLIT_DEDUP=1: the kvsplit fatbin has no dedup kernels (rebuild it)", .{});
+            return error.MissingKernel;
+        }
+        const slot_rows = @as(u64, k.slot.max_pages) * block.Pool.page;
+        const map_rows = slot_rows * k.slots.len;
+        const entries = 64 * @as(u64, topk);
+        const bcnt = (entries + 255) / 256 * kv.split.max_world;
+        const buf = try cuda.DeviceBuffer.alloc(d, @intCast(4 * (map_rows + 2 * entries + bcnt)));
+        k.dedup = buf;
+        try buf.fill32(std.math.maxInt(i32), null);
+        k.x.dedup = .{ .map = buf.ptr, .map_rows = map_rows, .first = buf.ptr + 4 * map_rows, .place = buf.ptr + 4 * (map_rows + entries), .bcnt = buf.ptr + 4 * (map_rows + 2 * entries), .entries = entries, .slots = @intCast(k.slots.len) };
+        if (k.rank == 0) std.log.info("[tensorfold] split KV dedup: {d} MiB (map {d} rows, {d} entries)", .{ buf.len >> 20, map_rows, entries });
     }
 
     pub fn deinit(k: *Kv) void {
@@ -186,6 +211,9 @@ pub const Kv = struct {
         k.block_phys.deinit(k.gpa);
         if (k.phys) |*b| b.free();
         if (k.lens) |*b| b.free();
+        if (k.dedup) |*b| b.free();
+        if (k.pin_sel) |*b| b.free();
+        if (k.pin_up) |*b| b.free();
         k.dev.deinit();
         k.pool.deinit();
         k.gpa.free(k.slots);
@@ -205,6 +233,7 @@ pub const Kv = struct {
             .ik_pages = k.pool.familyTensorPages(fams[1]),
             .pts = k.slot.max_pages,
             .split = k.layout.opts.split,
+            .early = k.layout.opts.split and kv.split.earlyOn(),
             .union_cap = @intCast(k.opts.union_cap),
         };
     }
@@ -276,8 +305,18 @@ pub const Kv = struct {
         const rows: u32 = @intCast(a.sel.shape[0]);
         const kk: u32 = @intCast(a.sel.shape[1]);
         const da: kv.split.DenseArgs = .{
-            .sel = try r.tensorAddr(a.sel), .rows = rows, .k = kk, .table = a.table, .pts = 0, .rslot = 0, .psh = a.psh,
-            .base = a.comp, .row_bytes = block.Pool.row_bytes, .world = k.world, .send = a.send, .tok = a.tok,
+            .sel = try r.tensorAddr(a.sel),
+            .rows = rows,
+            .k = kk,
+            .table = a.table,
+            .pts = 0,
+            .rslot = 0,
+            .psh = a.psh,
+            .base = a.comp,
+            .row_bytes = block.Pool.row_bytes,
+            .world = k.world,
+            .send = a.send,
+            .tok = a.tok,
         };
         const bytes = @as(usize, rows) * kk * block.Pool.row_bytes;
         // packed where the compact mode and the transport take it (the same answer on every rank), else dense
@@ -292,9 +331,13 @@ pub const Kv = struct {
         const a = try args(r, c);
         const n: usize = @intCast(a.sel.shape[0]);
         const kk: u32 = @intCast(a.sel.shape[1]);
-        const sel = try k.gpa.alloc(i32, n * kk);
-        defer k.gpa.free(sel);
+        if (k.hist) {
+            const m = kv.split.historyRows(k.slot.len, a.psh, k.world);
+            if (m > 0 and m <= k.opts.union_cap / ((@as(u64, k.world) + 1) * block.Pool.row_bytes)) return k.historyOf(r, a, n, kk, m);
+        }
+        // the drain also ends the last union's async uploads, so its pinned staging is free again
         try r.stream.synchronize();
+        const sel = (try pinned(r.d, &k.pin_sel, n * kk * 4)).slice(i32)[0 .. n * kk];
         try cuda.DeviceBuffer.download(.{ .d = r.d, .ptr = try r.tensorAddr(a.sel), .len = sel.len * 4 }, 0, std.mem.sliceAsBytes(sel));
         const table = try k.gpa.alloc(u32, k.slot.max_pages);
         defer k.gpa.free(table);
@@ -311,12 +354,47 @@ pub const Kv = struct {
             if (k.phys) |*p| p.free();
             k.phys = try cuda.DeviceBuffer.alloc(r.d, @max(4 * b.phys.len, 256));
         }
-        try cuda.DeviceBuffer.upload(k.phys.?, 0, std.mem.sliceAsBytes(b.phys));
-        try cuda.DeviceBuffer.upload(.{ .d = r.d, .ptr = a.tok, .len = 4 * b.tokens.len }, 0, std.mem.sliceAsBytes(b.tokens));
+        const up = (try pinned(r.d, &k.pin_up, 4 * (b.phys.len + b.tokens.len))).slice(u32);
+        @memcpy(up[0..b.phys.len], b.phys);
+        @memcpy(up[b.phys.len..][0..b.tokens.len], std.mem.bytesAsSlice(u32, std.mem.sliceAsBytes(b.tokens)));
+        try cuda.DeviceBuffer.uploadAsync(k.phys.?, 0, std.mem.sliceAsBytes(up[0..b.phys.len]), r.stream.handle);
+        try cuda.DeviceBuffer.uploadAsync(.{ .d = r.d, .ptr = a.tok, .len = 4 * b.tokens.len }, 0, std.mem.sliceAsBytes(up[b.phys.len..][0..b.tokens.len]), r.stream.handle);
         try k.x.unionBlock(a.comp, block.Pool.row_bytes, k.phys.?.ptr, b.m, a.send, a.recv, r.stream.handle);
         k.stats.unions += 1;
         k.stats.union_rows_max = @max(k.stats.union_rows_max, @as(u64, b.m) * k.world);
         k.stats.bytes += @as(u64, b.m) * block.Pool.row_bytes * k.world;
+    }
+
+    /// The union by history (TF_DSV41_KV_SPLIT_HISTORY): no selection read back, no plan, no drain; M rows an owner.
+    fn historyOf(k: *Kv, r: *run.Runner, a: anytype, n: usize, kk: u32, m: u32) !void {
+        const h: kv.split.HistArgs = .{
+            .sel = try r.tensorAddr(a.sel),
+            .rows = @intCast(n),
+            .k = kk,
+            .table = a.table,
+            .pages = k.slot.len,
+            .psh = a.psh,
+            .rank = k.rank,
+            .world = k.world,
+            .m = m,
+            .row_bytes = block.Pool.row_bytes,
+            .base = a.comp,
+            .send = a.send,
+            .tok = a.tok,
+        };
+        try k.x.history(h, a.recv, r.stream.handle);
+        k.stats.unions += 1;
+        k.stats.union_rows_max = @max(k.stats.union_rows_max, @as(u64, m) * k.world);
+        k.stats.bytes += @as(u64, m) * block.Pool.row_bytes * k.world;
+    }
+
+    /// A pinned staging buffer of at least `len` bytes (grown, never shrunk).
+    fn pinned(d: *const cuda.Driver, b: *?cuda.HostBuffer, len: usize) !cuda.HostBuffer {
+        if (b.*) |x| if (x.bytes.len >= len) return x;
+        if (b.*) |*x| x.free();
+        b.* = null;
+        b.* = try cuda.HostBuffer.alloc(d, @max(len, 256));
+        return b.*.?;
     }
 
     fn dropBlocks(k: *Kv) void {
@@ -359,7 +437,7 @@ const Ops = struct {
     r: *run.Runner,
 
     fn kernels(o: *Ops) kv.split.Kernels {
-        return .{ .ptr = o, .vtable = &.{ .dense = dense, .gather = gather, .pack = pack } };
+        return .{ .ptr = o, .vtable = &.{ .dense = dense, .gather = gather, .pack = pack, .dedup = dedup, .history = history } };
     }
 
     fn self(ptr: *anyopaque) *Ops {
@@ -379,5 +457,22 @@ const Ops = struct {
     fn pack(ptr: *anyopaque, a: kv.split.PackArgs, _: tp.collective.Stream) anyerror!void {
         const r = self(ptr).r;
         try r.kernels.others(r.stream).kvPack(.{ .sel = a.sel, .rows = a.rows, .k = a.k, .table = a.table, .pts = a.pts, .rslot = a.rslot, .psh = a.psh, .rank = a.rank, .base = a.base, .row_bytes = a.row_bytes, .world = a.world, .send = a.send, .tok = a.tok, .lens = a.lens });
+    }
+
+    fn history(ptr: *anyopaque, a: kv.split.HistArgs, _: tp.collective.Stream) anyerror!void {
+        const r = self(ptr).r;
+        try r.kernels.others(r.stream).kvHistory(.{ .sel = a.sel, .rows = a.rows, .k = a.k, .table = a.table, .pages = a.pages, .psh = a.psh, .rank = a.rank, .world = a.world, .m = a.m, .row_bytes = a.row_bytes, .base = a.base, .send = a.send, .tok = a.tok });
+    }
+
+    fn dedup(ptr: *anyopaque, a: kv.split.DedupArgs, _: tp.collective.Stream) anyerror!void {
+        const r = self(ptr).r;
+        const p = a.p;
+        try r.kernels.others(r.stream).kvDedup(.{
+            .p = .{ .sel = p.sel, .rows = p.rows, .k = p.k, .table = p.table, .pts = p.pts, .rslot = p.rslot, .psh = p.psh, .rank = p.rank, .base = p.base, .row_bytes = p.row_bytes, .world = p.world, .send = p.send, .tok = p.tok, .lens = p.lens },
+            .map = a.map,
+            .first = a.first,
+            .place = a.place,
+            .bcnt = a.bcnt,
+        });
     }
 };

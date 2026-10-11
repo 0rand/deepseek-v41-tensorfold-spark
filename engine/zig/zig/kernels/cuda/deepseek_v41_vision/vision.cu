@@ -8,7 +8,6 @@
 //              blocks last first, exp2f(s * scale - max * scale) unfused (flash built with UNFUSE_FMA), P in bf16,
 //              the row sums quad-reduced at the end)
 //   silu_mul   F.silu(g) * u on the w1 rows' halves; gelu  F.gelu (erf); add  x + y (bf16, fp32 math)
-//   unfold     the aligner's pad + 3 x 3 unfold: [h, w, C] -> [L, C * 9] (c major, then kh, kw), zeros past the edge
 //   span       the image's span rows: image_start / image_newline / image_end and the aligner rows in prompt order
 #include <cuda_bf16.h>
 #include <cstdint>
@@ -158,11 +157,11 @@ extern "C" __global__ void __launch_bounds__(128) dsv41_vision_attn(const __nv_b
                         if (!(first && ni == 0 && e == 0)) mx = fmaxf(mx, s[ni][hr * 2 + e]);
                 mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 2));
                 mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 1));
+                float sc = 1.f;
                 if (!first) {
                     const float prev = row_max[mi][hr];
                     const float cur = mx == -INFINITY ? 0.f : mx;
-                    const float sc = exp2f(__fmul_rn(__fsub_rn(prev, cur), scale_log2));
-                    row_sum[mi][hr] = __fmul_rn(row_sum[mi][hr], sc);
+                    sc = exp2f(__fmul_rn(__fsub_rn(prev, cur), scale_log2));
 #pragma unroll
                     for (int d = 0; d < 8; d++) {
                         acc_o[mi][d][hr * 2] = __fmul_rn(acc_o[mi][d][hr * 2], sc);
@@ -171,16 +170,16 @@ extern "C" __global__ void __launch_bounds__(128) dsv41_vision_attn(const __nv_b
                 }
                 row_max[mi][hr] = mx;
                 const float ms = mx == -INFINITY ? 0.f : __fmul_rn(mx, scale_log2);
-                float sum = first ? 0.f : row_sum[mi][hr];
-                bool init = first;
+                // FA2's row_sum *= scale and the first add are one FFMA (UNFUSE_FMA guards only exp)
+                float sum = 0.f;
 #pragma unroll
                 for (int ni = 0; ni < 16; ni++)
 #pragma unroll
                     for (int e = 0; e < 2; e++) {
                         const float p = exp2f(__fsub_rn(__fmul_rn(s[ni][hr * 2 + e], scale_log2), ms));
                         s[ni][hr * 2 + e] = p;
-                        sum = init ? p : __fadd_rn(sum, p);
-                        init = false;
+                        if (ni == 0 && e == 0) sum = first ? p : __fmaf_rn(row_sum[mi][hr], sc, p);
+                        else sum = __fadd_rn(sum, p);
                     }
                 row_sum[mi][hr] = sum;
             }
@@ -248,15 +247,16 @@ extern "C" __global__ void dsv41_vision_add(__nv_bfloat16* __restrict__ x, const
     x[i] = rn(__fadd_rn(bf(x[i]), bf(y[i])));
 }
 
-// unfold: x [h, w, C] -> out [Lh * Lw, C * r * r], column c * r * r + kh * r + kw, zero past h / w
+// unfold (the aligner's pad + unfold): x [h, w, C] -> F.unfold's [C r r, L], row c r r + kh r + kw, zero past h / w
 extern "C" __global__ void dsv41_vision_unfold(const __nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ out, int h, int w, int C, int r) {
     const int L = blockIdx.x;
+    const size_t rows = gridDim.x;
     const int lw = (w + r - 1) / r;
     const int by = L / lw, bx = L % lw;
     for (int col = threadIdx.x; col < C * r * r; col += blockDim.x) {
         const int c = col / (r * r), kh = (col / r) % r, kw = col % r;
         const int y = by * r + kh, xx = bx * r + kw;
-        out[(size_t)L * C * r * r + col] = (y < h && xx < w) ? x[((size_t)y * w + xx) * C + c] : __float2bfloat16_rn(0.f);
+        out[(size_t)col * rows + L] = (y < h && xx < w) ? x[((size_t)y * w + xx) * C + c] : __float2bfloat16_rn(0.f);
     }
 }
 

@@ -266,6 +266,8 @@ pub const Forward = struct {
         }
         const ids = f.ids_own.items;
         if (ids.len == 0 or f.slot.pending != null) return error.BadWindow;
+        // no embed of a window fills image rows (graphed: never; eager: no keep or bias), so image ids fail here
+        try vision_rows.checkWindow(ids);
         // the pool's pages for the window's positions, their table entries up before the launches (every rank alike)
         if (f.kv) |kx| try kx.reserve(f.slot.pos + ids.len);
         if (f.leads()) {
@@ -565,7 +567,8 @@ pub const Forward = struct {
         ptr: *anyopaque,
         commit: *const fn (ptr: *anyopaque, ids: []const u32) anyerror!void,
         save: *const fn (ptr: *anyopaque) anyerror!void,
-        restore: *const fn (ptr: *anyopaque, id: u32) anyerror!void,
+        /// `ids`: an NVMe entry's ids (the leader's prompt prefix: its tokens are not indexed)
+        restore: *const fn (ptr: *anyopaque, id: u32, ids: []const i64) anyerror!void,
         /// CED replay's prompt snapshot: an entry at the slot's position, the slot keeps going (sessions_gpu.zig)
         prompt: *const fn (ptr: *anyopaque) anyerror!void,
         /// the slot empty: its pages back, the committed ids cleared
@@ -646,6 +649,20 @@ pub const Forward = struct {
         f.slot = .{};
     }
 
+    /// Rank 0: a restore to the followers, with the entry's ids when it is not in RAM ([op, id, ids...]).
+    pub fn sendRestore(f: *Forward, id: u32, ids: ?[]const u32) !void {
+        if (!f.leads()) return;
+        const extra = if (ids) |x| x.len else 0;
+        const msg = try f.gpa.alloc(i64, 2 + extra);
+        defer f.gpa.free(msg);
+        msg[0] = op_sess_restore;
+        msg[1] = id;
+        if (ids) |x| for (x, msg[2..]) |t, *y| {
+            y.* = t;
+        };
+        try f.link.?.send(msg);
+    }
+
     /// Rank 0: a session operation to the followers (before running it).
     pub fn sendSess(f: *Forward, op: enum { save, restore, prompt }, id: u32) !void {
         if (f.leads()) try f.link.?.send(&.{ switch (op) {
@@ -720,118 +737,131 @@ pub const Forward = struct {
         while (true) {
             const msg = try f.link.?.recvGrow(f.gpa, &buf);
             if (msg.len == 0) return error.BadPlan;
-            switch (msg[0]) {
-                op_window => {
-                    const n: usize = @intCast(msg[1]);
-                    ids.clearRetainingCapacity();
-                    for (msg[2 .. 2 + n]) |t| try ids.append(f.gpa, @intCast(t));
-                    try f.window(ids.items);
-                },
-                op_greedy => {
-                    try picks.resize(f.gpa, @intCast(msg[1]));
-                    try f.greedy(picks.items);
-                },
-                op_prefill => {
-                    const total: usize = @intCast(msg[1]);
-                    const at: usize = @intCast(msg[2]);
-                    if (at == 0) prompt.clearRetainingCapacity();
-                    if (at != prompt.items.len) return error.BadPlan;
-                    for (msg[3..]) |t| try prompt.append(f.gpa, @intCast(t));
-                    if (prompt.items.len > total) return error.BadPlan;
-                    if (prompt.items.len == total) try f.prefill(prompt.items);
-                },
-                op_ahead => {
-                    var nx: std.ArrayList(u32) = .empty;
-                    defer nx.deinit(f.gpa);
-                    for (msg[1..]) |t| try nx.append(f.gpa, @intCast(t));
-                    try f.prefillAhead(nx.items);
-                },
-                op_keep => try f.keep(@intCast(msg[1])),
-                op_release => try f.release(),
-                op_tree_drop => try f.drop(),
-                op_calib_mark => {
-                    const d = f.runner.d;
-                    try d.check(d.api.cuCtxSynchronize(), "cuCtxSynchronize");
-                    try f.calib_marks.append(f.gpa, ph.nowNs());
-                },
-                op_calib_gather => {
-                    if (msg.len != 2 or msg[1] < 0) return error.BadPlan;
-                    try f.followCalib(@intCast(msg[1]));
-                },
-                op_stop => return,
-                op_sess_save => {
-                    const x = f.sess orelse return error.BadPlan;
-                    try x.save(x.ptr);
-                },
-                op_sess_restore => {
-                    const x = f.sess orelse return error.BadPlan;
-                    try x.restore(x.ptr, @intCast(msg[1]));
-                },
-                op_sess_prompt => {
-                    const x = f.sess orelse return error.BadPlan;
-                    try x.prompt(x.ptr);
-                },
-                op_sess_admit => {
-                    const x = f.sess orelse return error.BadPlan;
-                    const run_ = x.admit orelse return error.BadPlan;
-                    try run_(x.ptr, msg);
-                },
-                op_pf_multi => {
-                    const ns: usize = @intCast(msg[1]);
-                    if (ns == 0 or ns > 16 or msg.len < 2 + 3 * ns) return error.BadPlan;
-                    var segs: [16]pf.MultiSeg = undefined;
-                    prompt.clearRetainingCapacity();
-                    for (msg[2 + 3 * ns ..]) |t| try prompt.append(f.gpa, @intCast(t));
-                    var at: usize = 0;
-                    for (segs[0..ns], 0..) |*sg, j| {
-                        const n: usize = @intCast(msg[4 + 3 * j]);
-                        if (at + n > prompt.items.len) return error.BadPlan;
-                        sg.* = .{ .slot = @intCast(msg[2 + 3 * j]), .start = @intCast(msg[3 + 3 * j]), .ids = prompt.items[at .. at + n] };
-                        at += n;
-                    }
-                    if (at != prompt.items.len) return error.BadPlan;
-                    try f.prefillMulti(segs[0..ns]);
-                },
-                op_ced_multi => {
-                    const ns: usize = @intCast(msg[1]);
-                    if (ns < 2 or ns > 16 or msg.len != 2 + ns) return error.BadPlan;
-                    var slots: [16]u32 = undefined;
-                    for (msg[2..], slots[0..ns]) |x, *y| y.* = @intCast(x);
-                    var out: [16]pf.Replayed = undefined;
-                    try f.replayMulti(slots[0..ns], &out);
-                },
-                op_ced_finish => {
-                    // the leader's slot ends where this one does, and both run replay (the same TF_DSV41_PREFILL)
-                    if (f.prefill_state.mode != .replay or msg.len < 2 or msg[1] != f.slot.pos) return error.BadPlan;
-                    try pf.finish(f);
-                },
-                op_ds_ingest => {
-                    const d = f.drafter orelse return error.BadPlan;
-                    try d.ingest(d.ptr, @intCast(msg[1]), @intCast(msg[2]), @intCast(msg[3]), @intCast(msg[4]));
-                },
-                op_ds_reset => {
-                    const d = f.drafter orelse return error.BadPlan;
-                    d.reset(d.ptr);
-                },
-                op_ds_propose => {
-                    const d = f.drafter orelse return error.BadPlan;
-                    f.prefetchEngram(@intCast(msg[2]), &.{@intCast(msg[1])});
-                    try d.propose(d.ptr, @intCast(msg[1]), @intCast(msg[2]));
-                },
-                op_sample, op_sample_many => {
-                    const x = f.sampler orelse return error.BadPlan;
-                    try x.follow(x.ptr, msg);
-                },
-                op_grammar => {
-                    const x = f.grammar orelse return error.BadPlan;
-                    try x.follow(x.ptr, msg);
-                },
-                else => {
-                    const x = f.ext orelse return error.BadPlan;
-                    try x.run(x.ptr, msg);
-                },
-            }
+            const ended = f.followOp(msg, &ids, &prompt, &picks) catch |e| {
+                // Runner.guard failed the leader's same window before any launch: only its request fails
+                if (e != error.MissingTritonVariant) return e;
+                std.log.scoped(.dsv41).warn("rank {d}: operation {d} failed ({t}), as on rank 0: the next one", .{ f.comm.rank(), msg[0], e });
+                continue;
+            };
+            if (ended) return;
         }
+    }
+
+    /// One of the leader's operations (follow); true: `stop`.
+    fn followOp(f: *Forward, msg: []const i64, ids: *std.ArrayList(u32), prompt: *std.ArrayList(u32), picks: *std.ArrayList(u32)) !bool {
+        switch (msg[0]) {
+            op_window => {
+                const n: usize = @intCast(msg[1]);
+                ids.clearRetainingCapacity();
+                for (msg[2 .. 2 + n]) |t| try ids.append(f.gpa, @intCast(t));
+                try f.window(ids.items);
+            },
+            op_greedy => {
+                try picks.resize(f.gpa, @intCast(msg[1]));
+                try f.greedy(picks.items);
+            },
+            op_prefill => {
+                const total: usize = @intCast(msg[1]);
+                const at: usize = @intCast(msg[2]);
+                if (at == 0) prompt.clearRetainingCapacity();
+                if (at != prompt.items.len) return error.BadPlan;
+                for (msg[3..]) |t| try prompt.append(f.gpa, @intCast(t));
+                if (prompt.items.len > total) return error.BadPlan;
+                if (prompt.items.len == total) try f.prefill(prompt.items);
+            },
+            op_ahead => {
+                var nx: std.ArrayList(u32) = .empty;
+                defer nx.deinit(f.gpa);
+                for (msg[1..]) |t| try nx.append(f.gpa, @intCast(t));
+                try f.prefillAhead(nx.items);
+            },
+            op_keep => try f.keep(@intCast(msg[1])),
+            op_release => try f.release(),
+            op_tree_drop => try f.drop(),
+            op_calib_mark => {
+                const d = f.runner.d;
+                try d.check(d.api.cuCtxSynchronize(), "cuCtxSynchronize");
+                try f.calib_marks.append(f.gpa, ph.nowNs());
+            },
+            op_calib_gather => {
+                if (msg.len != 2 or msg[1] < 0) return error.BadPlan;
+                try f.followCalib(@intCast(msg[1]));
+            },
+            op_stop => return true,
+            op_sess_save => {
+                const x = f.sess orelse return error.BadPlan;
+                try x.save(x.ptr);
+            },
+            op_sess_restore => {
+                const x = f.sess orelse return error.BadPlan;
+                if (msg.len < 2) return error.BadPlan;
+                try x.restore(x.ptr, @intCast(msg[1]), msg[2..]);
+            },
+            op_sess_prompt => {
+                const x = f.sess orelse return error.BadPlan;
+                try x.prompt(x.ptr);
+            },
+            op_sess_admit => {
+                const x = f.sess orelse return error.BadPlan;
+                const run_ = x.admit orelse return error.BadPlan;
+                try run_(x.ptr, msg);
+            },
+            op_pf_multi => {
+                const ns: usize = @intCast(msg[1]);
+                if (ns == 0 or ns > 16 or msg.len < 2 + 3 * ns) return error.BadPlan;
+                var segs: [16]pf.MultiSeg = undefined;
+                prompt.clearRetainingCapacity();
+                for (msg[2 + 3 * ns ..]) |t| try prompt.append(f.gpa, @intCast(t));
+                var at: usize = 0;
+                for (segs[0..ns], 0..) |*sg, j| {
+                    const n: usize = @intCast(msg[4 + 3 * j]);
+                    if (at + n > prompt.items.len) return error.BadPlan;
+                    sg.* = .{ .slot = @intCast(msg[2 + 3 * j]), .start = @intCast(msg[3 + 3 * j]), .ids = prompt.items[at .. at + n] };
+                    at += n;
+                }
+                if (at != prompt.items.len) return error.BadPlan;
+                try f.prefillMulti(segs[0..ns]);
+            },
+            op_ced_multi => {
+                const ns: usize = @intCast(msg[1]);
+                if (ns < 2 or ns > 16 or msg.len != 2 + ns) return error.BadPlan;
+                var slots: [16]u32 = undefined;
+                for (msg[2..], slots[0..ns]) |x, *y| y.* = @intCast(x);
+                var out: [16]pf.Replayed = undefined;
+                try f.replayMulti(slots[0..ns], &out);
+            },
+            op_ced_finish => {
+                // the leader's slot ends where this one does, and both run replay (the same TF_DSV41_PREFILL)
+                if (f.prefill_state.mode != .replay or msg.len < 2 or msg[1] != f.slot.pos) return error.BadPlan;
+                try pf.finish(f);
+            },
+            op_ds_ingest => {
+                const d = f.drafter orelse return error.BadPlan;
+                try d.ingest(d.ptr, @intCast(msg[1]), @intCast(msg[2]), @intCast(msg[3]), @intCast(msg[4]));
+            },
+            op_ds_reset => {
+                const d = f.drafter orelse return error.BadPlan;
+                d.reset(d.ptr);
+            },
+            op_ds_propose => {
+                const d = f.drafter orelse return error.BadPlan;
+                f.prefetchEngram(@intCast(msg[2]), &.{@intCast(msg[1])});
+                try d.propose(d.ptr, @intCast(msg[1]), @intCast(msg[2]));
+            },
+            op_sample, op_sample_many => {
+                const x = f.sampler orelse return error.BadPlan;
+                try x.follow(x.ptr, msg);
+            },
+            op_grammar => {
+                const x = f.grammar orelse return error.BadPlan;
+                try x.follow(x.ptr, msg);
+            },
+            else => {
+                const x = f.ext orelse return error.BadPlan;
+                try x.run(x.ptr, msg);
+            },
+        }
+        return false;
     }
 
     fn glueMissing(name: []const u8) Error {
@@ -1296,8 +1326,10 @@ pub const Graphed = struct {
         // `split`: a window's head and tail graphs in one cache of twice the cap (a head is ~1/43 of a window)
         g.cache = graphs.Cache.init(f.gpa, g.engine.engine(), .{ .on = true, .max = if (rg.split) 2 * s.max else s.max, .hold = s.floor_hold });
         g.cache.agree = g.agreement.agree();
-        g.cache.room = roomFn;
-        room_floor = s.floor_gib;
+        g.cache.room = graphs.room;
+        g.cache.meter = graphs.meter;
+        g.cache.name = "decode windows";
+        graphs.rule = s.room;
         // every buffer a graph bakes in, at the largest window: the exchanges' send, Engram's gathered rows
         const D: usize = f.cfg.hidden;
         const W: usize = f.comm.world();
@@ -1345,11 +1377,6 @@ pub const Graphed = struct {
         return cs;
     }
 };
-
-var room_floor: f64 = 5.0;
-fn roomFn() bool {
-    return graphs.roomAbove(room_floor);
-}
 
 /// M2a's peer: world 2, rank 0 alone on one GPU, the peer's half of every all-gather zeros (dsv41_m1_capture.py's
 /// ZeroPeer, the Python reference's). Only the all-gather the forward uses is implemented.

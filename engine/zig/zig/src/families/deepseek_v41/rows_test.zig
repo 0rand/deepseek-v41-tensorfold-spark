@@ -16,6 +16,7 @@ const Config = @import("config.zig").Config;
 
 test {
     _ = @import("branches_test.zig"); // TF_DSV41_BRANCHES / MHC_DEFER on the same emitter
+    _ = @import("kx_early_test.zig"); // TF_DSV41_KV_SPLIT_EARLY on the same emitter
     _ = rowtab;
     _ = rowmode;
     _ = @import("aot_needs.zig");
@@ -256,6 +257,19 @@ test "row mode: split KV's dense exchange reads the stacked split table; a union
     try testing.expect(n.dense > 0);
     const big = try block.emit(a, &cfg, &w, o, &backbone, 24, 2040, true);
     try testing.expectError(error.UnionInRows, rowmode.transform(a, big, 24, .{ .slots = S, .rmax = 64, .pts = pts }));
+    // a row window past 16 rows (4 slots' verify windows, TF_DSV41_ROWS_CAP 64) exchanges dense
+    var ro = o;
+    ro.rows = true;
+    for ([_]u32{ 17, 24, 64 }) |R| {
+        const wide = try block.emit(a, &cfg, &w, ro, &backbone, R, 2040, true);
+        const wrows = try rowmode.transform(a, wide, R, .{ .slots = S, .rmax = 64, .pts = pts });
+        var dense: usize = 0;
+        for (wrows) |c| {
+            try testing.expect(!std.mem.eql(u8, c.name, "glue.kx_union"));
+            dense += @intFromBool(std.mem.eql(u8, c.name, "glue.kx_dense"));
+        }
+        try testing.expect(dense > 0);
+    }
     // the contiguous slot has no row mode
     try testing.expectError(error.NoPool, rowmode.transform(a, one, 8, .{ .slots = S, .rmax = rmax, .pts = 0 }));
 }
@@ -490,9 +504,9 @@ test "rowtab at 1M: four slots' windows at the limit's end, padded, within the l
     var t: [rowtab.ncol * rmax]i64 = undefined;
     var r32: [rmax]i32 = undefined;
     try rowtab.plan(&mix, &ids, R, rmax, S, &t, &r32);
-    const pos = t[@intFromEnum(rowtab.Col.pos) * rmax ..][0..R];
+    const pos = t[@backingInt(rowtab.Col.pos) * rmax ..][0..R];
     try testing.expectEqualSlices(i64, &.{ limit - 6, limit - 5, limit - 4, limit - 3, limit - 2, limit - 1, 900_000, 131_071, 131_072, 131_073, 131_074, 0, 1, 1, 1, 1 }, pos);
-    const ws = t[@intFromEnum(rowtab.Col.wslot) * rmax ..][0..R];
+    const ws = t[@backingInt(rowtab.Col.wslot) * rmax ..][0..R];
     try testing.expectEqualSlices(i64, &.{ 3, 3, 3, 3, 3, 3, 0, 2, 2, 2, 2, 1, 1, -1, -1, -1 }, ws);
     // the window's context bucket: the limit's last (its end is the limit)
     const s: graphs.Settings = .{};
@@ -550,4 +564,10 @@ test "TF_DSV41_ROUND_GRAPH=split on the served row window: head + tail = the win
         }
         try testing.expectEqual(@as(?usize, null), round_graph.splitAt(rows, 40));
     };
+}
+
+test {
+    _ = graphs; // graphs.zig's own tests (the room rule, the bucket ends)
+    _ = @import("forms_inplace.zig"); // TF_DSV41_FORMS_INPLACE's binding
+    _ = @import("ex_stacks.zig"); // TF_DSV41_EX_STACKS's pairs and binding
 }

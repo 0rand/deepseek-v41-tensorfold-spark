@@ -175,6 +175,8 @@ pub const Pool = struct {
     /// pages a slot's table holds
     pts: i64,
     split: bool = false,
+    /// TF_DSV41_KV_SPLIT_EARLY: an index layer's exchange right after its selection (side stream), beside the q group
+    early: bool = false,
     /// split's union cap (TF_DSV41_KV_SPLIT_UNION_MIB): the prefill receive buffer's bytes
     union_cap: i64 = 128 << 20,
     pub const page: i64 = 256;
@@ -695,7 +697,8 @@ pub const Emitter = struct {
         const n = e.n;
         const K: i64 = e.cfg.index_topk;
         const W: i64 = e.o.world;
-        const small = n <= 16;
+        // row windows exchange dense at any rows (kvsplit.py attend_rows: `win.rows or win.n <= dense_max`)
+        const small = n <= 16 or e.o.rows;
         // dense: every rank sends R x K rows; union: (W + 1) x M rows under the cap
         const sent: i64 = if (small) n * K else @divFloor(p.union_cap, (W + 1) * Pool.row_bytes);
         const recv = try e.buf("w.kx.recv", .{}, .u8, &.{ W * sent, Pool.row_bytes });
@@ -894,6 +897,10 @@ pub const Emitter = struct {
             });
         }
         if (indexer) try e.index(L, if (e.o.r1) qa else qn, iw, qnorm);
+        const early: ?Received = if (indexer and e.o.pool != null and e.o.pool.?.split and e.o.pool.?.early and (n <= 16 or e.o.rows))
+            try e.exchange(kv_src.?, e.cfg.compressRatio(kv_src.?), (try e.selection(L))[0])
+        else
+            null;
         e.onMain();
         // q group: wq_b
         const q = try e.buf("L.q", .{}, .bf16, &.{ n, H * hd });
@@ -916,7 +923,7 @@ pub const Emitter = struct {
             cnt = sel[1];
             if (e.o.pool != null and e.o.pool.?.split) {
                 // split: an index layer's selection brings its rows over the exchange; its reuse layers read them too
-                const got = if (indexer) try e.exchange(kv_src.?, src_ratio, sel[0]) else try e.received(kv_src.?, src_ratio);
+                const got = early orelse if (indexer) try e.exchange(kv_src.?, src_ratio, sel[0]) else try e.received(kv_src.?, src_ratio);
                 cv = got.cv;
                 cs = got.cs;
                 tok = got.tok;

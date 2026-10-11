@@ -3,6 +3,7 @@ const std = @import("std");
 const lanes = @import("lanes");
 const api = @import("engine_api.zig");
 const pc = @import("prompt_cache.zig");
+const pace_mod = @import("pace.zig");
 const Allocator = std.mem.Allocator;
 const Id = api.Id;
 const Request = api.Request;
@@ -47,6 +48,8 @@ pub const Rounds = struct {
         left: *const fn (ctx: *anyopaque, key: usize) void,
         /// After the round: the pieces' seconds and the decode round's (finals included).
         after: *const fn (ctx: *anyopaque, piece_s: f64, decode_s: f64) void,
+        /// A request cancelled mid-prompt: the row its finished prefix is kept at (a save-only piece), or null.
+        leaving: ?*const fn (ctx: *anyopaque, key: usize) ?u64 = null,
     };
 };
 
@@ -71,6 +74,8 @@ pub const LaneHost = struct {
     admitted: std.ArrayList(*Job) = .empty,
     cancels: std.ArrayList(Id) = .empty,
     closing: bool = false,
+    /// the rounds' pace against their baseline, read by /health (under the mutex)
+    pace: pace_mod.Pace = .{},
     /// `halt`'s reason: what is left finishes failed with it (null: a stop cancels what is left)
     halt_reason: ?[]const u8 = null,
     thread: ?std.Thread = null,
@@ -85,6 +90,7 @@ pub const LaneHost = struct {
     lone_job: ?*Job = null, // the job that driver holds now
     cache: ?*pc.Store = null, // kept prompt states (engine thread only); the backend restores and saves them
     memory: ?api.MemorySource = null, // the backend's memory counts; null: Engine.memory reports none
+    graphs: ?api.GraphsSource = null, // the backend's graph caches for /health; null: none
     explain: ?api.Explain = null, // the backend's words for a request it refuses; null: the error's name
     /// Runs first on the engine thread: a backend whose API state is per thread (a CUDA context) binds it there.
     on_thread: ?ThreadInit = null,
@@ -239,6 +245,27 @@ pub const LaneHost = struct {
             .preemptions = 0,
             .streams = n,
             .generation_tokens = h.live_generated,
+            .oldest_queued_s = if (h.queued.items.len > 0) seconds(now - oldestQueued(h)) else 0,
+            .pace = paceStatus(&h.pace, now),
+        };
+        if (h.graphs) |g| out.graph_caches = @intCast(g.read(g.ctx, &out.graphs));
+    }
+
+    fn oldestQueued(h: *const LaneHost) i96 {
+        var at = h.queued.items[0].submitted;
+        for (h.queued.items) |job| at = @min(at, job.submitted);
+        return at;
+    }
+
+    fn paceStatus(p: *const pace_mod.Pace, now: i96) api.PaceStatus {
+        return .{
+            .last_round_age_s = if (p.last_end) |e| seconds(now - e) else null,
+            .last_round_s = @as(f64, @floatFromInt(p.last_ns)) / 1e9,
+            .decode_s = if (p.decode.ready()) p.decode.quick else 0,
+            .decode_base_s = if (p.decode.ready()) p.decode.base else 0,
+            .prefill_rows_s = if (p.prefill.ready()) p.prefill.quick else 0,
+            .prefill_base_rows_s = if (p.prefill.ready()) p.prefill.base else 0,
+            .slow_s = p.slowFor(now),
         };
     }
 
@@ -328,6 +355,7 @@ pub const LaneHost = struct {
         dropped.deinit(h.gpa);
         for (ids) |id| {
             for (h.admitted.items, 0..) |job, i| if (job.id == id) {
+                if (job.started and !job.stream.finished) h.keepLeaving(job);
                 if (!job.stream.finished) h.core.discard(&job.stream);
                 h.lock();
                 _ = h.admitted.orderedRemove(i);
@@ -337,6 +365,14 @@ pub const LaneHost = struct {
             };
         }
         h.gpa.free(ids);
+    }
+
+    /// A request whose client left mid-prompt keeps its finished prefix as a session entry: the same prompt resumes.
+    fn keepLeaving(h: *LaneHost, job: *Job) void {
+        const rd = h.rounds orelse return;
+        const ask = rd.vtable.leaving orelse return;
+        const at = ask(rd.ctx, @intFromPtr(job)) orelse return;
+        h.core.piece(&job.stream, at, at, true) catch |e| std.log.warn("lane host: a leaving prompt's {d} rows were not kept ({t})", .{ at, e });
     }
 
     fn lock(h: *LaneHost) void {
@@ -514,12 +550,15 @@ pub const LaneHost = struct {
             did = true;
             h.runFinals();
         }
+        var step_ns: i96 = 0;
         if (h.core.activeCount() > 0) {
             did = true;
+            const s0 = std.Io.Clock.awake.now(h.io).toNanoseconds();
             h.core.step() catch |e| {
                 h.failAll(@errorName(e));
                 return true;
             };
+            step_ns = std.Io.Clock.awake.now(h.io).toNanoseconds() - s0;
         }
         if (!join and h.finals.items.len > 0) {
             did = true;
@@ -536,6 +575,15 @@ pub const LaneHost = struct {
             } else i += 1;
         }
         rd.vtable.after(rd.ctx, seconds(t1 - t0), seconds(t2 - t1));
+        if (did) {
+            var rows: u64 = 0;
+            for (h.pieces.items) |piece| if (piece.run) {
+                rows += piece.end - piece.start;
+            };
+            h.lock();
+            h.pace.round(t2, rows, seconds(t1 - t0), seconds(step_ns));
+            h.unlock();
+        }
         return did;
     }
 
@@ -744,10 +792,15 @@ pub const LaneHost = struct {
                 continue;
             }
             h.unlock();
+            const s0 = std.Io.Clock.awake.now(h.io).toNanoseconds();
             h.core.step() catch |e| {
                 h.failAll(@errorName(e));
                 continue;
             };
+            const s1 = std.Io.Clock.awake.now(h.io).toNanoseconds();
+            h.lock();
+            h.pace.round(s1, 0, 0, seconds(s1 - s0));
+            h.unlock();
             var i: usize = 0;
             while (i < h.admitted.items.len) {
                 const job = h.admitted.items[i];
@@ -936,4 +989,8 @@ test "a lane host serves the core's own tokens, in order, and cancels between ro
     try std.testing.expectEqual(@as(usize, 0), target.lanes.count());
 }
 
-test { _ = @import("lane_host_test.zig"); }
+test {
+    _ = @import("lane_host_test.zig");
+    _ = @import("lane_host_resume_test.zig");
+    _ = @import("pace.zig");
+}

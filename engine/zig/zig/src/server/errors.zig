@@ -13,7 +13,12 @@ pub const Kind = enum {
     other,
     /// An exception while the reply runs: 500 with ``{"message"}``, or a stream's server_error event.
     server,
+    /// The server stopped the request to restart (a drain's deadline): 503, server_error, code server_restarting.
+    restarting,
 };
+
+/// What a request refused or stopped by a drain is told.
+pub const restarting = "server restarting: retry shortly";
 
 pub const context_limit = "This server's maximum context length is"; // OpenAI's wording, which clients match to compact
 
@@ -45,7 +50,7 @@ pub const Cx = struct {
 
     pub fn status(cx: *const Cx) u16 {
         return switch (cx.kind) {
-            .capacity => 503,
+            .capacity, .restarting => 503,
             .server => 500,
             else => 400,
         };

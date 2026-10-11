@@ -855,8 +855,10 @@ const Graphs = struct {
         g.* = .{ .engine = .{ .d = r.d }, .agreement = try graphs.Agreement.init(r.d, f.comm, r.stream), .cache = undefined };
         g.cache = graphs.Cache.init(f.gpa, g.engine.engine(), .{ .on = true, .max = if (split) 2 * s.max else s.max, .hold = s.floor_hold });
         g.cache.agree = g.agreement.agree();
-        g.cache.room = roomFn;
-        room_floor = s.floor_gib;
+        g.cache.room = graphs.room;
+        g.cache.meter = graphs.meter;
+        g.cache.name = "row graphs";
+        graphs.rule = s.room;
     }
 
     fn deinit(g: *Graphs) void {
@@ -867,10 +869,6 @@ const Graphs = struct {
     }
 };
 
-var room_floor: f64 = 5.0;
-fn roomFn() bool {
-    return graphs.roomAbove(room_floor);
-}
 
 /// The lookback a warm of a window at `start` reads after: the slot's committed tail, plus the rows of its pending
 /// window (starting at the slot's position) that `start` implies are kept; null when `start` is not reachable.

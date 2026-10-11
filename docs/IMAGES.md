@@ -47,3 +47,40 @@ placeholder (4 / 4 HTTP text probes, and the speed suite's replies); hit == cold
 exact with images in the prompt; 4 image requests during a 299K prefill all answered with the worker at >= 5.1 GiB.
 Cost: the head's MemAvailable at boot -0.8 to -1.4 GiB. The duplicate-image bug (the same screenshot twice in one
 request killed both ranks) is fixed in this engine (see [Changes since G13](CHANGELOG.md)).
+
+## The Zig serving path
+
+The [Zig engine](ZIG-SERVE.md) serves images the same way: the tower and aligner on rank 0, image rows routed with
+`gate.bias_vl` on both ranks, no Engram contribution at image positions. Requests take the same image parts and the
+same limits (8 images, 20 MB and 64 M pixels an image, 1,024 positions an image); its preprocessed-image cache
+(`TF_DSV41_VISION_PREP_MB`) defaults to 256 MB. The [serving profile](../config/prod-zig.env.example) turns it on:
+
+```
+TF_DSV41_IMAGES=native
+TF_DSV41_BIAS_VL=/cache/dsv41-bias-vl
+```
+
+`TF_DSV41_BIAS_VL` names a folder in the `CACHE_DIR` mount (`/cache` in `scripts/run-zig.sh`). The Zig image carries
+no Python, so fetch `bias_vl.safetensors` with the Python serving image, once on each node into that node's
+`CACHE_DIR`:
+
+```bash
+docker run --rm -v "$CACHE_DIR:/cache" -e HF_HUB_OFFLINE=0 --entrypoint python <python-serving-image> \
+  -m tensorfold.families.deepseek_v41.cuda.bias_vl_fetch /cache/dsv41-bias-vl
+```
+
+If the variable names a folder without the tensors, `scripts/run-zig.sh` refuses to start (the engine would fail its
+boot). Unset it to serve images with the text bias; the boot log then says the image routing bias is missing.
+Turning images on adds the image segments' Triton variants to the AOT set: run `scripts/run-zig.sh N --check-aot`
+on each node after changing either variable (see [ZIG-SERVE](ZIG-SERVE.md#changing-serving-settings)).
+
+### Zig measurements
+
+Pending: the Zig vision gate on two DGX Sparks.
+
+| Check | Result |
+| --- | --- |
+| Vision tower vs DeepSeek's reference | pending |
+| Visual questions | pending (x / 20) |
+| Memory with images on (rank 0 MemAvailable at boot) | pending |
+| Text decode speed with images on vs off | pending |

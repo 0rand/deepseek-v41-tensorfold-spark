@@ -334,6 +334,14 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, step: *std.Build.S
     const longpf_run = b.addRunArtifact(b.addTest(.{ .root_module = longpf }));
     b.step("test-dsv41-longpf", "DeepSeek-V4.1 long prompts (stream top-k, split KV's row blocks) on the real prefill emitter, host only").dependOn(&longpf_run.step);
     step.dependOn(&longpf_run.step);
+    // DSV4.1 image prompts' buffer roles: the boot check and the plan's image options on the real prefill emitter
+    const vplan = b.createModule(.{ .root_source_file = b.path("zig/src/families/deepseek_v41/vision_plan_test.zig"), .target = host, .optimize = .debug, .link_libc = true });
+    vplan.addImport("cuda", cuda);
+    vplan.addImport("dsv41_kernels", dsv41Kernels(b, host, .debug, cuda, &.{}));
+    vplan.addImport("tp", @import("tp.zig").module(b, host, .debug, cuda));
+    const vplan_run = b.addRunArtifact(b.addTest(.{ .root_module = vplan }));
+    b.step("test-dsv41-vision-plan", "DeepSeek-V4.1 image prompts' buffer roles (the boot check, the plan's options), host only").dependOn(&vplan_run.step);
+    step.dependOn(&vplan_run.step);
     // DSV4.1 x3gm v2 on the prefill emitter (TF_DSV41_GM_V2): its reader and gm2_kernel's launches on the real emitter
     const gm2pf = b.createModule(.{ .root_source_file = b.path("zig/src/families/deepseek_v41/gm2pf_test.zig"), .target = host, .optimize = .debug, .link_libc = true });
     gm2pf.addImport("cuda", cuda);

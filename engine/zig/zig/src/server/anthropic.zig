@@ -253,7 +253,9 @@ const Reply = struct {
             const problem = p.get("error").?;
             const message = if (problem.get("message")) |m| (if (m == .string) m.string else "generation failed") else "generation failed";
             const kind = problem.get("type");
-            const status: u16 = if (kind != null and kind.? == .string and std.mem.eql(u8, kind.?.string, "invalid_request_error")) 400 else 500;
+            const code = problem.get("code");
+            const restarting = code != null and code.? == .string and std.mem.eql(u8, code.?.string, "server_restarting");
+            const status: u16 = if (restarting) 503 else if (kind != null and kind.? == .string and std.mem.eql(u8, kind.?.string, "invalid_request_error")) 400 else 500;
             const e = errorValue(r.a, message, status) catch return error.Closed;
             try r.send("error", e.object);
             r.finished = true;

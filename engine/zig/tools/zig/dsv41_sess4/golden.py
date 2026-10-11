@@ -57,6 +57,11 @@ def main() -> None:
     ap.add_argument("--py-src", required=True)
     ap.add_argument("--config", required=True)
     ap.add_argument("--out", required=True)
+    # split KV (a Python tree with kvsplit's pool, e.g. tensorfold-kvsplit): W ranks, this one's decisions and rows
+    ap.add_argument("--split", type=int, default=0)
+    ap.add_argument("--rank", type=int, default=0)
+    # the pool's pages (split's admission counts W x the scarcer residue: a little more pool keeps it admitting)
+    ap.add_argument("--pages", type=int, default=28)
     a = ap.parse_args()
     sys.path.insert(0, a.py_src)
     _stub_triton()
@@ -84,7 +89,7 @@ def main() -> None:
 
     # the scenario's sizes: a pool of 28 pages, 4 slots of 16 pages (4,096 positions), the RAM tier holding four
     # snapshots' bounded state (their pages then crowd the pool: admissions spill), the NVMe tier taking entries of 1,024 tokens and more (prod's TF_DSV41_SESSION_DISK_MIN)
-    page, pages, slots_n, capacity = PO.PAGE, 28, 4, 4096
+    page, pages, slots_n, capacity = PO.PAGE, a.pages, 4, 4096
     disk_min = 1024
     valid = [0] * slots_n          # drafter.valid: rows before it are not the slot's (drafter.reset / restore)
     stash_from = [0] * slots_n     # the CED stash's first position (replay.empty at a gap: here the slot's start)
@@ -115,12 +120,12 @@ def main() -> None:
         return Bounded(pos, arrays, {"ced": "replay", "window": W, "ring": W, "ds_rows": int(len(ds))})
 
     tmp = tempfile.mkdtemp(prefix="sess4-golden-")
-    pool = PO.Pool(topo, pages * page, page)
+    pool = PO.Pool(topo, pages * page, page, split=a.split, rank=a.rank) if a.split > 1 else PO.Pool(topo, pages * page, page)
     for _ in range(slots_n):
         pool.new_slot(capacity)
     # the RAM budget: four prompt snapshots of 128+ tokens' bounded state, plus a little (prod: 256 MiB)
     ram = int(4.5 * bounded(0, 1024).nbytes())
-    disk = SD.DiskTier(tmp, 0, SE.compat_extra(SE.Tag(), topo), budget_gib=64.0, min_tokens=disk_min, direct=False)
+    disk = SD.DiskTier(tmp, a.rank, SE.compat_extra(SE.Tag(), topo), budget_gib=64.0, min_tokens=disk_min, direct=False)
     store = SE.Store(pool, ram_bytes=ram, disk=disk)
     hist: list[list[int]] = [[] for _ in range(slots_n)]
     names: dict[str, str] = {}
@@ -131,7 +136,8 @@ def main() -> None:
     def state() -> dict:
         ram_e = sorted(name_of(e.key) for e in store.entries.values() if e.in_ram)
         disk_e = sorted(name_of(k) for k in disk.keys())
-        return {"ram": ram_e, "disk": disk_e, "available": pool.available(), "free": pool.alloc.n_free}
+        free = pool.alloc.free_total if a.split > 1 else pool.alloc.n_free  # a split pool's every residue
+        return {"ram": ram_e, "disk": disk_e, "available": pool.available(), "free": free}
 
     steps: list[dict] = []
 
@@ -241,7 +247,7 @@ def main() -> None:
     finish(1)
     finish(3)
 
-    out = {"python": "8474f31", "tag": TAG, "page": page, "pages": pages, "slots": slots_n, "capacity": capacity,
+    out = {"python": "8474f31" if a.split < 2 else f"kvsplit split {a.split} rank {a.rank}", "tag": TAG, "page": page, "pages": pages, "slots": slots_n, "capacity": capacity,
            "slack": pool.slack, "ram_bytes": ram, "disk_min": disk_min,
            "measure": {"layers": len(layers), "decoder_start": dec, "window": W, "carries": len(carries),
                        "head_dim": hd, "hidden": D, "hc": hc, "ds_blocks": ds_blocks, "keep": RP.KEEP,

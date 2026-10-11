@@ -94,7 +94,7 @@ each cell was measured, what is exact and what is approximate, and strict mode: 
 ## Quick start: Zig
 
 See [the Zig quick start](docs/ZIG-SERVE.md#quick-start), including the bundled source, build context,
-per-rank assets, and `scripts/run-zig.sh`.
+per-rank assets, and `scripts/run-zig.sh`. Image input on the Zig path: [IMAGES](docs/IMAGES.md#the-zig-serving-path).
 
 ## Quick start: published Python recipe
 

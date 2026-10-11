@@ -26,6 +26,7 @@ pub const aot = @import("aot.zig");
 pub const kernels = @import("kernels.zig");
 pub const segments = @import("segments.zig");
 pub const arena = @import("arena.zig");
+pub const pack = @import("pack.zig");
 
 test {
     _ = @import("memory.zig");
@@ -35,4 +36,5 @@ test {
     _ = segments;
     _ = graph_cache;
     _ = arena;
+    _ = pack;
 }

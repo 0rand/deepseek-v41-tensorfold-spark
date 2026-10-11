@@ -5,12 +5,13 @@ const abi = @import("abi.zig");
 const Driver = @import("driver.zig").Driver;
 const Error = @import("driver.zig").Error;
 
-/// Bytes this process holds in DeviceBuffers and HostBuffers, and the device peak since the last reset.
-pub const Usage = struct { device: u64, host: u64, peak: u64 };
+/// Bytes held in DeviceBuffers and HostBuffers, the device peak since the last reset, and the driver allocations.
+pub const Usage = struct { device: u64, host: u64, peak: u64, allocs: u64 = 0 };
 
 var device_bytes: std.atomic.Value(u64) = .init(0);
 var host_bytes: std.atomic.Value(u64) = .init(0);
 var peak_bytes: std.atomic.Value(u64) = .init(0);
+var driver_allocs: std.atomic.Value(u64) = .init(0);
 var counts_mutex: std.atomic.Mutex = .unlocked;
 
 /// The counts now; `reset_peak` starts a new peak at the current device bytes. Safe from any thread.
@@ -27,7 +28,8 @@ fn usageWithHook(reset_peak: bool, hook: anytype) Usage {
     const now = device_bytes.load(.monotonic);
     hook.afterRead();
     if (reset_peak) peak_bytes.store(now, .monotonic);
-    return .{ .device = now, .host = host_bytes.load(.monotonic), .peak = @max(now, peak_bytes.load(.monotonic)) };
+    const allocs = driver_allocs.load(.monotonic);
+    return .{ .device = now, .host = host_bytes.load(.monotonic), .peak = @max(now, peak_bytes.load(.monotonic)), .allocs = allocs };
 }
 
 fn held(counter: *std.atomic.Value(u64), n: usize) void {
@@ -79,7 +81,10 @@ pub const DeviceBuffer = struct {
         var p: abi.DevicePtr = 0;
         if (len > 0) {
             if (alloc_hook) |h| p = h.alloc(h.ctx, len) orelse 0;
-            if (p == 0) try d.check(d.api.cuMemAlloc_v2(&p, len), "cuMemAlloc");
+            if (p == 0) {
+                try d.check(d.api.cuMemAlloc_v2(&p, len), "cuMemAlloc");
+                _ = driver_allocs.fetchAdd(1, .monotonic);
+            }
         }
         held(&device_bytes, len);
         return .{ .d = d, .ptr = p, .len = len };
@@ -96,7 +101,10 @@ pub const DeviceBuffer = struct {
     pub fn free(self: *DeviceBuffer) void {
         if (self.ptr != 0) {
             const mine = if (alloc_hook) |h| h.free(h.ctx, self.ptr) else false;
-            if (!mine) _ = self.d.api.cuMemFree_v2(self.ptr);
+            if (!mine) {
+                _ = self.d.api.cuMemFree_v2(self.ptr);
+                _ = driver_allocs.fetchSub(1, .monotonic);
+            }
         }
         freed(&device_bytes, self.len);
         self.* = undefined;

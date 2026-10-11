@@ -71,8 +71,14 @@ was not repeated for this publication; the exported host build and host tests ar
    touch build/zig/fatbins/.keep
    docker build -f docker/zig/Dockerfile --build-arg ZIG_COMMIT="$(git rev-parse HEAD)" \
      -t tensorfold-dsv41-zig:local build/zig
+   scripts/check-zig-image.sh tensorfold-dsv41-zig:local
    docker save tensorfold-dsv41-zig:local -o build/zig-image.tar
    ```
+
+   The runtime stage installs cuBLAS / cuBLASLt 13.6.0.2 (`libcublas-13-3`, held), the release the vision tower's
+   exactness was measured on, and its last step checks every library the engine opens at run time (NCCL, verbs and
+   its mlx5 provider, cuBLAS by sha256): a missing or different library fails the build. `check-zig-image.sh` runs
+   the same kind of check against an image you loaded or pulled.
 
    The image label records the recipe commit you built (set `ZIG_COMMIT` in the config to the same value); the engine source revision is in `engine/zig/SOURCE-EXPORT.md`. Transfer the tar to rank 1 and run
    `docker load -i build/zig-image.tar` there. Compare the label and root filesystem layers on both nodes with
@@ -119,9 +125,7 @@ was not repeated for this publication; the exported host build and host tests ar
    timeouts do not end long prefills.
 
 4. Wait for the model to load and inspect the boot log: four slots, CED replay, row graphs, successful device-draft
-   self-check and RoCE probe. First preparation can take several minutes. On that first start a rank that cannot
-   fit the 4K prefill workspace while it writes its prepared images logs `first start (prepared images written this
-   boot)` and serves with 2,048-row prefill segments (the same bits); restart once to use 4K. Then query rank 0:
+   self-check and RoCE probe. First preparation can take several minutes. Then query rank 0:
 
    ```bash
    curl -fsS localhost:8000/v1/models
@@ -217,7 +221,12 @@ upstream TensorFold settings.
 | `TF_DSV41_SLOTS` | 1 | `4` | Concurrent live slots |
 | `TF_DSV41_SLOT_DRAFTS` | 0 | `1` | Per-slot drafts with batched verification |
 | `TF_DSV41_ROWS_CAP` | 16 | `64` | Maximum rows per decode forward; requires matching AOT |
-| `TF_DSV41_POOL_TOKENS` | unset: no paged pool | `1400000` | Shared paged KV capacity, not capacity per slot |
+| `TF_DSV41_POOL_TOKENS` | unset: no paged pool | `3000000` | Shared paged KV capacity, not capacity per slot ([split KV and the pool](#split-kv-and-the-pool)) |
+| `TF_DSV41_KV_SPLIT` | 0 | `1` | Compressed KV rows sharded over the ranks instead of replicated; needs TP >= 2 and `POOL_TOKENS` |
+| `TF_DSV41_KV_SPLIT_COMPACT` | 0 | `1` | Split KV's owner-packed exchange where every rank's transport takes device lengths and the shard fits, else dense; `force` packs on any transport |
+| `TF_DSV41_KV_SPLIT_UNION_MIB` | 128 | `128 (unset)` | Byte budget of each block of a prefill's union of selected rows under split KV (bounds its exchange and staging) |
+| `TF_DSV41_FORMS_INPLACE` | 0 | `1` | Dense weight forms written over their trellis instead of beside it |
+| `TF_DSV41_BOOT_TRACE` | 0 | `0 (unset)` | Logs each boot step's memory; for a first boot of a new profile |
 | `TF_DSV41_SAMPLING` | 0 | `1` | Keyed sampling for nonzero temperature |
 | `TF_DSV41_EXPERT_TOPP` | unset: no pruning | `0.85` | Decode routed-expert top-p pruning |
 | `TF_DSV41_INDEX_BUDGET_MIB` | 256 | `64` | Index selection scratch budget |
@@ -293,7 +302,8 @@ upstream TensorFold settings.
 | `TF_DSV41_THINKING` | 1 | `1` | Default thinking mode; requests can override |
 | `TF_DSV41_DEFAULT_EFFORT` | high | `high` | Default effort (high = 75) |
 | `TF_DSV41_SCHEMA_PROMPT` | 1 | `1` | Include response-format schema in the prompt |
-| `TF_DSV41_IMAGES` | placeholder | `placeholder` | Replace image parts with an omission notice; this profile does not serve native vision |
+| `TF_DSV41_IMAGES` | placeholder | `native` | Image input: DeepSeek's vision tower on rank 0 ([IMAGES](IMAGES.md#the-zig-serving-path)); `placeholder` turns each image into a notice, `reject` answers 400 |
+| `TF_DSV41_BIAS_VL` | unset: image rows route with the text bias | `/cache/dsv41-bias-vl` | Folder holding the release's `gate.bias_vl` tensors (`bias_vl.safetensors`), loaded on both ranks; boot fails if it names a folder without them |
 | `TF_DSV41_GRAMMAR` | 0 | `1` | Grammar-constrained structured output |
 | `TF_DSV41_TOOL_GRAMMAR` | 0 | `0` | Automatic tool-schema constraint; remains off |
 
@@ -324,16 +334,30 @@ across both ranks; if either cannot leave `TF_DSV41_PF_WS_FLOOR_GIB` free, both 
 The boot budget can also refuse a profile that cannot fit.
 
 `TF_DSV41_PF_WS_FLOOR_GIB` defaults to the hard floor (4 GiB); the profile uses 3.5 GiB so the more constrained rank
-does not fall back persistently. That trades workspace margin for speed. On a first start, while a rank writes its
-prepared images (about 95 GiB), its predicted worst MemAvailable is lower than on later starts. If the workspace does
-not fit then, that rank logs `first start (prepared images written this boot)` and the process serves with 2,048-row
-segments instead of refusing to start; the next start, which reads the prepared images, uses 4K. An existing install
-whose prepared images are complete is not affected. Under `PF_4K=1`, `aot-needs` also lists the 2,048-row segment
-programs this fallback (and the per-piece one) runs; a fill made from a 4K env with an older `aot-needs` lacks them
-and should be completed as in [Changing serving settings](#changing-serving-settings). For a conservative 2K profile set
+does not fall back persistently. That trades workspace margin for speed. Under `PF_4K=1`, `aot-needs` also lists the
+2,048-row segment programs this fallback runs; a fill made from a 4K env with an older `aot-needs` lacks them and
+should be completed as in [Changing serving settings](#changing-serving-settings). For a conservative 2K profile set
 `PF_4K=0`, drop `PF_4K_MEMORY_OK` and `PF_WS_FLOOR_GIB`, and use 2048 for `PREFILL_CHUNK` / `PREFILL_ROWS`. Do not
 enable two-batch prefill overlap (PF_TBO) alongside 4K without a separate memory gate: the tested combination
 exhausted memory.
+
+### Split KV and the pool
+
+Without split KV every rank holds every compressed KV row, so the pool is bounded by one node's free memory. With
+`TF_DSV41_KV_SPLIT=1` each rank holds its share of the rows and the ranks exchange the selected rows each round, about
+1,060 bytes a token on each rank. That is what lets the profile's `TF_DSV41_POOL_TOKENS=3000000` boot where the
+replicated layout fits about 1.4M: one slot can fill its whole `TF_DSV41_CONTEXT` (1M), two slots 1M each, four live
+slots about 750K each. The pool is shared, so these are totals across live slots, not per-slot reservations.
+`TF_DSV41_FORMS_INPLACE=1` frees the dense forms' separate copy for the pool, and `TF_DSV41_KV_SPLIT_COMPACT=1` sends
+each rank's packed rows instead of the dense table where the transport allows it.
+
+The boot check prices the pool against each rank's measured memory at the end of boot and refuses a pool that would
+leave the worst predicted dip (`TF_DSV41_SERVE_DIP_GIB`, default 3.0 GiB) under the hard floor, so an oversized
+`POOL_TOKENS` fails at boot, not under load. When live slots need the pool, admission parks idle sessions from RAM to
+the NVMe tier (`TF_DSV41_SESSION_DISK`); a parked chat's next prompt resumes it from disk, and a restore that fails on
+any rank is a cache miss: the prompt is prefilled from 0 and serving continues. Split KV costs some decode speed for the
+exchange (see [ZIG-RESULTS](ZIG-RESULTS.md#split-kv-and-the-30m-pool)). For a speed-first profile without long contexts,
+drop `KV_SPLIT` and `KV_SPLIT_COMPACT` and set `POOL_TOKENS=1400000`.
 
 `PIECE_RUNS`, `REPLAY_RUNS` and `JOIN_DRAFTS` batch several slots' prompt work into one run. They need
 `PREFILL_PIECES=1`, replay mode and the multi-segment AOT programs `aot-needs` lists under them.
