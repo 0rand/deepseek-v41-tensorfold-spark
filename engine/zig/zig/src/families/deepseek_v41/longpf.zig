@@ -36,8 +36,37 @@ pub fn plan(rows: i64, keys: i64, k: i64) i64 {
     return @max(1, @min(rows, @divFloor(budget, per)));
 }
 
+/// TF_DSV41_STREAM_LAZY=1: the stream top-k's scratch held only while prompts that name it prefill (256 MiB at 1M).
+pub const lazy_role = "L.ix.stream";
+
+pub fn lazyEnv() bool {
+    const v = std.c.getenv("TF_DSV41_STREAM_LAZY") orelse return false;
+    return std.mem.eql(u8, std.mem.trim(u8, std.mem.span(v), " "), "1");
+}
+
+/// The on-demand scratch: the plan's size for it, and its buffer while a prompt holds it.
+pub const Lazy = struct { bytes: u64, buf: ?cuda.DeviceBuffer = null, allocs: u64 = 0 };
+
+/// Whether a program names `role` (the stream select's scratch, or any other).
+pub fn names(cs: []const calls.Call, role: []const u8) bool {
+    for (cs) |c| for (c.args) |x| if (namesArg(x.arg, role)) return true;
+    return false;
+}
+
+fn namesArg(x: calls.Arg, role: []const u8) bool {
+    return switch (x) {
+        .list => |items| for (items) |y| {
+            if (namesArg(y, role)) break true;
+        } else false,
+        .t, .opaque_table => |t| t.role == .buf and std.mem.eql(u8, t.role.buf, role),
+        else => false,
+    };
+}
+
 /// The runtime's buffers (forward_prefill.State.long).
 pub const State = struct {
+    /// TF_DSV41_STREAM_LAZY: the stream scratch on demand (null: the plan holds it)
+    lazy: ?Lazy = null,
     /// uint32 0, 2, 4, ...: the merge's gather rows (a split's first K slots are every other K-slot row)
     even: ?cuda.DeviceBuffer = null,
     even_host: std.ArrayList(u32) = .empty,
@@ -45,6 +74,7 @@ pub const State = struct {
     pos: ?cuda.DeviceBuffer = null,
 
     pub fn deinit(s: *State, gpa: std.mem.Allocator) void {
+        if (s.lazy) |*z| if (z.buf) |*b| b.free();
         if (s.even) |*b| b.free();
         if (s.pos) |*b| b.free();
         s.even_host.deinit(gpa);
@@ -147,6 +177,7 @@ fn dtSize(dt: calls.Dt) i64 {
 /// `k`: the forward's ?*kv_state.Kv (its `blocks` and `fetchBlock`).
 /// TF_DSV41_PROFILE (profile.zig): each call timed on the GPU, the segment into the profile's prefill totals.
 pub fn window(s: *State, gpa: std.mem.Allocator, r: *run.Runner, k: anytype, start: u64, cs: []const calls.Call) !void {
+    if (s.lazy) |*z| if (z.buf == null and names(cs, lazy_role)) try acquire(z, r);
     const p = r.prof;
     if (p) |x| x.beginPrefill();
     for (cs) |*c| {
@@ -160,6 +191,30 @@ pub fn window(s: *State, gpa: std.mem.Allocator, r: *run.Runner, k: anytype, sta
         if (p) |x| try x.after(r.stream);
     }
     if (p) |x| try x.end(r.stream);
+}
+
+/// The scratch for a prompt that streams, zeroed as the plan's arena is (every rank in the same order).
+fn acquire(z: *Lazy, r: *run.Runner) !void {
+    const b = try cuda.DeviceBuffer.alloc(r.d, @max(z.bytes, 256));
+    errdefer {
+        var x = b;
+        x.free();
+    }
+    try b.fill8(0, r.stream.handle);
+    try r.external(lazy_role, b.ptr);
+    z.buf = b;
+    z.allocs += 1;
+    if (z.allocs <= 4 or z.allocs % 64 == 0) std.log.scoped(.dsv41).info("stream top-k scratch: {d} MiB allocated (prompt {d}), held while its prompts prefill (TF_DSV41_STREAM_LAZY)", .{ z.bytes >> 20, z.allocs });
+}
+
+/// Its prompts prefilled: the scratch freed once the stream is past its last use.
+pub fn release(s: *State, r: *run.Runner) !void {
+    const z = &(s.lazy orelse return);
+    var b = z.buf orelse return;
+    try r.stream.synchronize();
+    r.forget(lazy_role);
+    b.free();
+    z.buf = null;
 }
 
 fn attendBlocks(s: *State, gpa: std.mem.Allocator, r: *run.Runner, k: anytype, start: u64, c: *const calls.Call) !void {

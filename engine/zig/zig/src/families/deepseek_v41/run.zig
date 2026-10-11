@@ -91,6 +91,11 @@ pub const Runner = struct {
         g.value_ptr.* = addr;
     }
 
+    /// An external role's address gone (an on-demand role released): a later use fails as error.Unbound.
+    pub fn forget(r: *Runner, role: []const u8) void {
+        if (r.addrs.fetchRemove(role)) |kv| r.gpa.free(kv.key);
+    }
+
     /// Allocates every role of `plan`: persistent roles one buffer each (but the external ones), the rest one zeroed arena.
     pub fn bind(r: *Runner, plan: *const buffers.Plan) !void {
         var arena_bytes: u64 = 0;

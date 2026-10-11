@@ -14,7 +14,7 @@ const cuda = @import("cuda");
 
 const log = std.log.scoped(.dsv41);
 
-pub const Mode = enum { off, vmm, plain };
+pub const Mode = enum { off, vmm, plain, pack };
 
 /// TF_CUDA_SCHED (unset: the driver's `auto`): how the host waits for the GPU (cuda.Context.Schedule). On GB10 the
 /// CPU and GPU share one power budget; a host spinning in cuEventSynchronize between rounds may cost the GPU clock
@@ -40,7 +40,9 @@ pub fn mode(get: *const fn ([]const u8) ?[]const u8) !Mode {
     if (raw.len == 0 or std.mem.eql(u8, raw, "0")) return .off;
     if (std.mem.eql(u8, raw, "1") or std.mem.eql(u8, raw, "vmm")) return .vmm;
     if (std.mem.eql(u8, raw, "plain")) return .plain;
-    log.warn("TF_DSV41_ARENA={s}: expected 0, 1 / vmm or plain", .{raw});
+    // boot's permanent buffers packed (cuda/pack.zig); the rest as without an arena
+    if (std.mem.eql(u8, raw, "pack")) return .pack;
+    log.warn("TF_DSV41_ARENA={s}: expected 0, 1 / vmm, plain or pack", .{raw});
     return error.BadKnob;
 }
 
@@ -50,6 +52,18 @@ pub const Installed = struct {
     plain: cuda.arena.Plain,
     arena: cuda.arena.Arena = undefined,
     backend: Mode,
+    /// TF_DSV41_ARENA=pack: open from install to the end of boot (`endBoot`)
+    pack: ?cuda.pack.Pack = null,
+
+    /// Boot's buffers are in: later ones (workspaces, images, sessions) are allocated and freed as before.
+    pub fn endBoot(x: *Installed, rank: u32) void {
+        const p = &(x.pack orelse return);
+        p.end();
+        const gib = @as(f64, @floatFromInt(p.stats.bytes)) / (1 << 30);
+        const slack = @as(f64, @floatFromInt(p.slack())) / (1 << 20);
+        // a buffer freed during boot stays mapped to the end (`freed`): a count that should stay small
+        log.info("device arena: rank {d}: {d} boot buffers packed, {d:.2} GiB in {d} mapping(s), {d:.1} MiB slack, {d} freed during boot", .{ rank, p.stats.buffers, gib, p.segments.items.len, slack, p.stats.freed });
+    }
 };
 
 fn env(name: []const u8) ?[]const u8 {
@@ -63,6 +77,18 @@ pub fn install(gpa: std.mem.Allocator, ctx: *const cuda.Context, rank: u32) !?*I
     const d = ctx.d;
     const x = try gpa.create(Installed);
     x.* = .{ .plain = .{ .d = d }, .backend = .plain };
+    if (m == .pack) {
+        var total: usize = 0;
+        try d.check(d.api.cuDeviceTotalMem_v2(&total, ctx.device), "cuDeviceTotalMem");
+        // a mapping of its own, so every growth follows the last: no other user maps in between
+        x.vmm = try cuda.arena.Vmm.open(d, ctx.device, 2 * total);
+        x.backend = .pack;
+        x.pack = cuda.pack.Pack.init(gpa, x.vmm.backend());
+        x.pack.?.install();
+        x.pack.?.begin();
+        log.info("device arena: rank {d}: pack, {d} KiB granularity, boot's buffers back to back", .{ rank, x.vmm.granularity >> 10 });
+        return x;
+    }
     var be = x.plain.backend();
     if (m == .vmm) {
         var total: usize = 0;
@@ -115,6 +141,8 @@ test "TF_DSV41_ARENA reader" {
     try t.expectEqual(Mode.vmm, try mode(&F.get));
     F.v = "plain";
     try t.expectEqual(Mode.plain, try mode(&F.get));
+    F.v = "pack";
+    try t.expectEqual(Mode.pack, try mode(&F.get));
     F.v = "yes";
     try t.expectError(error.BadKnob, mode(&F.get));
 }

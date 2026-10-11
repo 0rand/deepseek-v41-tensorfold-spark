@@ -846,6 +846,7 @@ pub fn finishMulti(f: *Forward, slots: []const u32, out: []Replayed) !void {
     }
     f.last_rows = 0;
     try k4Release(f); // TF_DSV41_PF_4K: these prompts are prefilled
+    try longpf.release(&st.long, f.runner); // TF_DSV41_STREAM_LAZY: their stream scratch too
 }
 
 /// The glue's view of the whole run (Forward.multi): the first segment's slot, every row's ids, the run's rows pending.
@@ -917,8 +918,9 @@ pub fn finish(f: *Forward) !void {
     try longpf.window(&st.long, f.gpa, f.runner, f.kv, t.r0, cs);
     if (f.runner.prof) |pr| pr.prefillRows(@intCast(t.m), true);
     f.last_rows = 0;
-    // TF_DSV41_PF_4K: the prompt is prefilled, its workspace goes back
+    // TF_DSV41_PF_4K: the prompt is prefilled, its workspace goes back (TF_DSV41_STREAM_LAZY: and its stream scratch)
     try k4Release(f);
+    try longpf.release(&st.long, f.runner);
     // the drafter's context rows: the tail's taps (replay.finish's, which slots.finish_prompt hands to `replayed`)
     st.taps_at = t.r0;
     st.taps_rows = t.m;
