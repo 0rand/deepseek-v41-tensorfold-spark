@@ -45,6 +45,8 @@ const rowmode = @import("rowmode.zig");
 const triton_call = @import("triton_call.zig");
 const Config = @import("config.zig").Config;
 const ced = @import("ced.zig");
+const aot_cover = @import("aot_cover.zig");
+const cuda = @import("cuda");
 
 pub const Param = struct { name: []const u8, constexpr: bool, nospec: bool, noalign: bool };
 pub const Fn = struct { function: []const u8, params: []Param };
@@ -59,6 +61,8 @@ pub const Needs = struct {
     sigs: *const Sigs,
     keys: std.StringArrayHashMapUnmanaged(u64) = .empty,
     programs: u64 = 0,
+    /// AOTDIR given: each new variant checked against its aot.json
+    cover: ?*aot_cover.Cover = null,
 
     pub fn deinit(n: *Needs) void {
         for (n.keys.keys()) |k| n.gpa.free(k);
@@ -77,6 +81,7 @@ pub const Needs = struct {
             if (!got.found_existing) {
                 got.key_ptr.* = try n.gpa.dupe(u8, key);
                 got.value_ptr.* = 0;
+                if (n.cover) |cv| try cv.check(c, key);
             }
             got.value_ptr.* += 1;
             try ids.append(arena.allocator(), got.index);
@@ -535,8 +540,8 @@ fn prompts(gpa: std.mem.Allocator, a: std.mem.Allocator, n: *Needs, cfg: *const 
     }
 }
 
-/// `tf-dsv41-m1 aot-needs SIGS OUT`.
-pub fn main(gpa: std.mem.Allocator, io: std.Io, sigs_path: []const u8, out_path: []const u8, log: *std.Io.Writer) !void {
+/// `tf-dsv41-m1 aot-needs SIGS OUT [AOTDIR]`; error.AotIncomplete when AOTDIR lacks a variant (OUT is written first).
+pub fn main(gpa: std.mem.Allocator, io: std.Io, sigs_path: []const u8, out_path: []const u8, aot_dir: ?[]const u8, log: *std.Io.Writer) !void {
     const cwd = std.Io.Dir.cwd();
     const text = try cwd.readFileAlloc(io, sigs_path, gpa, .limited(1 << 26));
     defer gpa.free(text);
@@ -557,6 +562,11 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, sigs_path: []const u8, out_path:
     try log.print("aot-needs: limit {d}, {d} slot(s), rows cap {d}, prefill rows {d}, index budget {d} MiB, R1 {}, drafts {}, slot drafts {} (group {d}), world {d}\n", .{ sv.o.limit, sv.slots, sv.cap, sv.o.prefill_rows, sv.o.index_budget >> 20, sv.o.r1, sv.drafts, sv.slot_drafts, sv.group, sv.o.world });
     var n: Needs = .{ .gpa = gpa, .sigs = &parsed.value.kernels };
     defer n.deinit();
+    const have = if (aot_dir) |d| try cuda.aot.parseSpecs(gpa, try cwd.readFileAlloc(io, try std.fs.path.join(a, &.{ d, "aot.json" }), a, .limited(1 << 26))) else null;
+    defer if (have) |h| h.deinit();
+    var cover: ?aot_cover.Cover = if (have) |h| .{ .gpa = gpa, .specs = h.value.kernels } else null;
+    defer if (cover) |*cv| cv.deinit();
+    if (cover) |*cv| n.cover = cv;
     try enumerate(gpa, &n, &cfg, &w, sv, log);
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
@@ -568,6 +578,10 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, sigs_path: []const u8, out_path:
     try ow.writeAll("\n]}\n");
     try cwd.writeFile(io, .{ .sub_path = out_path, .data = out.written() });
     try log.print("aot-needs: {d} programs, {d} variants -> {s}\n", .{ n.programs, n.keys.count(), out_path });
+    if (cover) |*cv| if (!try cv.report(aot_dir.?, n.keys.count(), log, 20)) {
+        try log.flush();
+        return error.AotIncomplete;
+    };
     try log.flush();
 }
 
@@ -614,4 +628,5 @@ test "aot-needs: a launch reduces to Triton's specialization (constexprs, == 1, 
     // a call naming a parameter no kernel of that name has is refused
     const bad: calls.Call = .{ .triton = true, .name = "_k", .args = &.{.{ .name = "Z", .arg = .{ .i = 3 } }} };
     try testing.expectError(error.NoKernel, n.reduce(a, &bad));
+    _ = aot_cover;
 }

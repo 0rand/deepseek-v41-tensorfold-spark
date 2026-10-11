@@ -38,6 +38,7 @@ It generates a `knob-names.txt` from the names actually read by Zig. Asset gener
 `dsv41_m4/fill-prod.env` (or the 4K fill). Python reference source, Torch, Triton 3.7.1 and ptxas 13.3.73 are
 needed for that fill. Copy assets per rank and validate the fill manifest; a `MissingTritonVariant` is a missing
 prerequisite, not a reason to keep running. These generator tools are included in `engine/zig/tools/zig`.
+The AOT set depends on the serving settings: see [Changing serving settings](#changing-serving-settings).
 
 ## Quick start
 
@@ -82,19 +83,23 @@ was not repeated for this publication; the exported host build and host tests ar
    with them (build args `CUDA_DEVEL` / `CUDA_RUNTIME`). Use `ZIG_URL` for the exact Zig compiler tarball if the
    default download URL is unavailable. The first start builds prepared files; do not reuse Python's cache.
 
-3. Check the commands, then run rank 1 on its node followed promptly by rank 0 on its node:
+3. Check the commands and the AOT set, then run rank 1 on its node followed promptly by rank 0 on its node:
 
    ```bash
    scripts/run-zig.sh 1 --dry-run    # on rank 1
    scripts/run-zig.sh 0 --dry-run    # on rank 0
+   scripts/run-zig.sh 1 --check-aot  # on rank 1: aot/ holds every variant this env launches
+   scripts/run-zig.sh 0 --check-aot  # on rank 0
    scripts/run-zig.sh 1             # rank 1: keep running in this terminal
    scripts/run-zig.sh 0             # rank 0: another terminal on its node
    ```
 
-   The launcher passes the serving settings to both processes, sets TP world/rank/device explicitly, and uses
-   Docker `--init` because the follower exits when orphaned. It validates local directories and basic assets
-   (including `rope.bin`'s rows against `TF_DSV41_CONTEXT`); it does not replace the engine's memory checks, fill
-   validation, or a production watchdog. Keep the same env
+   `--check-aot` runs `tf-dsv41-m1 aot-needs` in the image with this env against the rank's `aot/` (host work only;
+   it enumerates every program, about 11 minutes on an x86 desktop CPU) and needs the fill's `sigs.json` in
+   `ASSETS_DIR`. The launcher passes the serving settings to both processes, sets TP world/rank/device explicitly,
+   and uses Docker `--init` because the follower exits when orphaned. It validates local directories and basic
+   assets (including `rope.bin`'s rows against `TF_DSV41_CONTEXT`); it does not replace the engine's memory checks,
+   fill validation, or a production watchdog. Keep the same env
    across restarts. A failure on either rank should end both via fail-fast (exit 70).
 
    To stop, signal rank 0 only and let it drain: on SIGTERM it answers new requests with 503 (`/health` reports
@@ -166,9 +171,27 @@ For the asset environment, build the builder stage with `docker build --target b
 -t tensorfold-dsv41-zig:builder build/zig` from the recipe root. Install the matching Torch/Triton toolchain in that
 environment. The Docker build's builder stage contains the Zig binaries under `/out/bin`; add them to `PATH` or copy them
 into `zig-out/bin` in the asset-generation environment. Mount the public reference, model and asset directories
-there. Repeat/check the manifest for each rank. Engram host tables do not replace packed
+there. Keep `sigs.json` in the assets directory: `scripts/run-zig.sh N --check-aot` reads it. Repeat/check the
+manifest for each rank. Engram host tables do not replace packed
 model Engram shards. The existing public reference supports the recommended `R1=1` fill; the optional R1-off
 binding against newer Python pruning variants is outside this recipe's qualification.
+
+### Changing serving settings
+
+The AOT set is enumerated from the serving env: prefill rows (`PF_4K`, `PREFILL_CHUNK` / `PREFILL_ROWS`), slots,
+`ROWS_CAP`, context, drafting and the knobs `aot-needs` lists. After changing any of them, check the set again and
+compile only the missing variants into the existing one, on every rank:
+
+```bash
+scripts/run-zig.sh 0 --check-aot   # exit 1 lists the missing variants
+# in the asset environment, with the new env sourced as above:
+zig-out/bin/tf-dsv41-m1 aot-needs "$ASSETS/sigs.json" "$ASSETS/needs.json"
+python tools/zig/triton_fill.py compile --py "$PY_SOURCE" --needs "$ASSETS/needs.json" \
+  --options tools/zig/dsv41_triton_options.json --arch 121 --have "$ASSETS/aot" --out "$ASSETS/aot"
+```
+
+Variants already in `aot/` are kept and not compiled again. Without this a start stops with `MissingTritonVariant`
+and the function and constexprs of the launch it could not find. `rope.bin` also depends on `TF_DSV41_CONTEXT`.
 
 ## Serving settings
 
@@ -307,7 +330,7 @@ not fit then, that rank logs `first start (prepared images written this boot)` a
 segments instead of refusing to start; the next start, which reads the prepared images, uses 4K. An existing install
 whose prepared images are complete is not affected. Under `PF_4K=1`, `aot-needs` also lists the 2,048-row segment
 programs this fallback (and the per-piece one) runs; a fill made from a 4K env with an older `aot-needs` lacks them
-and should be completed: run `aot-needs` with this env and `triton_fill.py compile --have` on the set. For a conservative 2K profile set
+and should be completed as in [Changing serving settings](#changing-serving-settings). For a conservative 2K profile set
 `PF_4K=0`, drop `PF_4K_MEMORY_OK` and `PF_WS_FLOOR_GIB`, and use 2048 for `PREFILL_CHUNK` / `PREFILL_ROWS`. Do not
 enable two-batch prefill overlap (PF_TBO) alongside 4K without a separate memory gate: the tested combination
 exhausted memory.

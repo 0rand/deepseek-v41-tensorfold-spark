@@ -129,6 +129,8 @@ pub const Set = struct {
         for (consts) |c| {
             if (c.int) |x| std.log.err("  constexpr {s} = {d}", .{ c.name, x }) else if (c.f32) |x| std.log.err("  constexpr {s} = {d}", .{ c.name, x });
         }
+        // the usual cause: the set was filled for other settings (prefill rows, slots, rows cap, context, knobs)
+        std.log.err("the AOT set was filled for other serving settings: with this env, run `tf-dsv41-m1 aot-needs SIGS NEEDS AOTDIR`, then `tools/zig/triton_fill.py compile --needs NEEDS --have AOTDIR --out AOTDIR` on every rank", .{});
         return error.MissingTritonVariant;
     }
 

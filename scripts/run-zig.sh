@@ -2,7 +2,7 @@
 # Run one local rank. Invoke separately on each node with the same serving env.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
-rank=${1:?usage: run-zig.sh 0|1 [--dry-run]}
+rank=${1:?usage: run-zig.sh 0|1 [--dry-run|--check-aot]}
 [[ "$rank" == 0 || "$rank" == 1 ]] || { echo 'rank must be 0 or 1' >&2; exit 2; }
 config=${CONFIG:-config/prod-zig.env}
 [[ -f "$config" ]] || { echo "missing $config; copy config/prod-zig.env.example first" >&2; exit 2; }
@@ -12,15 +12,29 @@ set +a
 for key in IMAGE TF_TP_MASTER NCCL_SOCKET_IFNAME NCCL_IB_HCA MODEL_DIR ENGRAM_DIR ASSETS_DIR PREPARED_DIR STATE_DIR CACHE_DIR; do
     [[ -n "${!key:-}" && "${!key}" != *'<'* ]] || { echo "set $key in $config" >&2; exit 2; }
 done
+# Pass values by environment name, preserving spaces in values.
+envs=()
+while IFS='=' read -r key value; do
+    case "$key" in TF_DSV41_*|GLM53_TF_*|NCCL_*) envs+=(-e "$key");; esac
+done < <(env)
+# --check-aot: every Triton variant this env launches, checked against this rank's aot/ (host only, no GPU work).
+# Run it before the first start and after any serving-setting change; it needs the fill's sigs.json in ASSETS_DIR.
+if [[ "${2:-}" == --check-aot ]]; then
+    [[ -f "$ASSETS_DIR/sigs.json" && -f "$ASSETS_DIR/aot/aot.json" ]] || {
+        echo "--check-aot needs $ASSETS_DIR/sigs.json (triton_fill.py sigs) and $ASSETS_DIR/aot/aot.json" >&2; exit 2; }
+    mkdir -p "$STATE_DIR"
+    docker run --rm --init -v "$ASSETS_DIR:/assets:ro" -v "$STATE_DIR:/state" "${envs[@]}" -e TF_TP_WORLD=2 "$IMAGE" \
+        tf-dsv41-m1 aot-needs /assets/sigs.json "/state/aot-needs-r$rank.json" /assets/aot || {
+        echo "rank $rank: aot/ does not cover this env (missing variants above; every needed one in $STATE_DIR/aot-needs-r$rank.json)" >&2
+        echo "compile them: triton_fill.py compile --needs <that file> --have <aot> --out <aot> (docs/ZIG-SERVE.md)" >&2
+        exit 1; }
+    exit
+fi
 args=(docker run --rm --init --name "tensorfold-zig-r$rank" --gpus all --ipc=host --network host
       --device /dev/infiniband --ulimit memlock=-1 --cap-add IPC_LOCK
       -v "$MODEL_DIR:/model:ro" -v "$ENGRAM_DIR:/engram:ro" -v "$ASSETS_DIR:/assets:ro"
       -v "$PREPARED_DIR:/prepared" -v "$STATE_DIR:/state" -v "$STATE_DIR/sessions:/sessions"
-      -v "$CACHE_DIR:/cache")
-# Pass values by environment name, preserving spaces in values.
-while IFS='=' read -r key value; do
-    case "$key" in TF_DSV41_*|GLM53_TF_*|NCCL_*) args+=(-e "$key");; esac
-done < <(env)
+      -v "$CACHE_DIR:/cache" "${envs[@]}")
 args+=(-e TF_TP_WORLD=2 -e "TF_TP_RANK=$rank" -e TF_TP_DEVICE=0
        -e "TF_TP_MASTER=$TF_TP_MASTER" -e "TF_TP_PORT=${TF_TP_PORT:-29571}"
        -e "TF_COMM_BACKEND=${TF_COMM_BACKEND:-roce}"
