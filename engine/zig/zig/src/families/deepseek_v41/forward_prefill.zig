@@ -69,6 +69,8 @@ pub const State = struct {
     /// workspace above the hard floor (wsAgreed, one collective a call); false: this call runs 2,048-row segments, the
     /// same bits (segmentation-invariant), never a failure. True until a call decides (the planner reads it at boot)
     ws_ok: bool = true,
+    /// kv_state.bootCheck's `.held` (a first start short of the workspace): this rank votes no in every wsAgreed
+    ws_hold: bool = false,
     ws_fallbacks: u64 = 0,
     agreement: ?graphs.Agreement = null,
     /// the next prompt piece's ids (Forward.prefillAhead, op 60: the round planner's next piece of this prompt, as
@@ -345,10 +347,10 @@ fn wsAgreed(f: *Forward) !bool {
     const avail = graphs.memAvailableGiB();
     const left = if (avail) |v| v - @as(f64, @floatFromInt(bytes)) / (1 << 30) else hard;
     if (st.agreement == null) st.agreement = try graphs.Agreement.init(f.runner.d, f.comm, f.runner.stream);
-    const ok = try st.agreement.?.agree().all(st.agreement.?.agree().ctx, left >= hard);
+    const ok = try st.agreement.?.agree().all(st.agreement.?.agree().ctx, left >= hard and !st.ws_hold);
     if (!ok) {
         st.ws_fallbacks += 1;
-        if (st.ws_fallbacks <= 4 or st.ws_fallbacks % 64 == 0)
+        if (!st.ws_hold and (st.ws_fallbacks <= 4 or st.ws_fallbacks % 64 == 0))
             log.warn("prefill workspace: {d} MiB does not fit on every rank (rank {d}: {d:.2} GiB MemAvailable leaves {d:.2}, floor {d:.1} GiB, TF_DSV41_PF_WS_FLOOR_GIB): this prompt piece runs 2,048-row segments (fallback {d})", .{ bytes >> 20, f.comm.rank(), avail orelse -1, left, hard, st.ws_fallbacks });
     }
     return ok;

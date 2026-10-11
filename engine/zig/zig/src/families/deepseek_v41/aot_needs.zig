@@ -45,6 +45,8 @@ const rowmode = @import("rowmode.zig");
 const triton_call = @import("triton_call.zig");
 const Config = @import("config.zig").Config;
 const ced = @import("ced.zig");
+const aot_cover = @import("aot_cover.zig");
+const cuda = @import("cuda");
 
 pub const Param = struct { name: []const u8, constexpr: bool, nospec: bool, noalign: bool };
 pub const Fn = struct { function: []const u8, params: []Param };
@@ -59,6 +61,8 @@ pub const Needs = struct {
     sigs: *const Sigs,
     keys: std.StringArrayHashMapUnmanaged(u64) = .empty,
     programs: u64 = 0,
+    /// AOTDIR given: each new variant checked against its aot.json
+    cover: ?*aot_cover.Cover = null,
 
     pub fn deinit(n: *Needs) void {
         for (n.keys.keys()) |k| n.gpa.free(k);
@@ -77,6 +81,7 @@ pub const Needs = struct {
             if (!got.found_existing) {
                 got.key_ptr.* = try n.gpa.dupe(u8, key);
                 got.value_ptr.* = 0;
+                if (n.cover) |cv| try cv.check(c, key);
             }
             got.value_ptr.* += 1;
             try ids.append(arena.allocator(), got.index);
@@ -408,6 +413,49 @@ pub fn enumerate(gpa: std.mem.Allocator, n: *Needs, cfg: *const Config, w: *cons
         try log.print("aot-needs: row mode, {d} programs, {d} variants\n", .{ n.programs, n.keys.count() });
         try log.flush();
     }
+    try prompts(gpa, a, n, cfg, w, sv, layers, log);
+    // TF_DSV41_PF_4K: the forward's own 2,048-row segments too (the per-piece fallback and a first start run them)
+    if (sv.o.pf4k) {
+        var two = sv;
+        two.o.pf4k = false;
+        two.o.prefill_rows = (block.Options{}).prefill_rows;
+        try prompts(gpa, a, n, cfg, w, two, layers, log);
+    }
+    // DSpark
+    if (sv.drafts) {
+        var pa = std.heap.ArenaAllocator.init(gpa);
+        defer pa.deinit();
+        const pb = pa.allocator();
+        _ = try n.program(try dspark_emit.emitPass(pb, cfg, w, sv.o, cfg.dspark_block));
+        // ingests: a window's rows, and a prompt's prefilled tail in one call (target.handTaps: up to the window)
+        var rows: i64 = 1;
+        while (rows <= @max(max_rows, cfg.window)) : (rows += 1) {
+            _ = try n.program(try dspark_emit.emitIngest(pb, cfg, w, sv.o, rows, 0));
+            _ = try n.program(try dspark_emit.emitIngest(pb, cfg, w, sv.o, rows, 1));
+        }
+        if (sv.slot_drafts) {
+            var k: i64 = 1;
+            while (k <= sv.group) : (k += 1) _ = try n.program(try dspark_emit.emitPassSlots(pb, cfg, w, sv.o, cfg.dspark_block, k, sv.slots));
+            // TF_DSV41_DRAFT_CHAIN's `_chain` (one variant whatever the slots: they are its grid), with and without the
+            // confidence head (Python passes cval for its tensors without it); WORLD x k candidates a row
+            const world: i64 = sv.o.world;
+            const c = world * @min(64, @divTrunc(128, world));
+            for ([_]bool{ true, false }) |conf| _ = try n.program(try dspark_emit.emitChain(pb, cfg, w, sv.o, cfg.dspark_block, sv.slots, c, conf));
+            try log.print("aot-needs: DSpark chain (TF_DSV41_DRAFT_CHAIN), N {d}, KP {d}, {d} candidates, with and without the confidence head\n", .{ cfg.dspark_block, dspark_emit.chain_kp, c });
+        } else if (try @import("dspark_dev.zig").chainFromEnv()) {
+            // the served config would boot without its chain (dspark_slots refuses it): a fill env that drifted
+            try log.print("aot-needs: TF_DSV41_DRAFT_CHAIN=1 without slot drafts (TF_DSV41_SLOTS > 1, TF_DSV41_SLOT_DRAFTS=1, row mode): no _chain variant listed\n", .{});
+            try log.flush();
+            return error.ChainWithoutSlotDrafts;
+        }
+        try log.print("aot-needs: DSpark, {d} programs, {d} variants\n", .{ n.programs, n.keys.count() });
+        try log.flush();
+    }
+}
+
+/// A prompt's programs under `sv`: prefill segments (each regime), multi-segment runs, CED replay's decoder pass.
+fn prompts(gpa: std.mem.Allocator, a: std.mem.Allocator, n: *Needs, cfg: *const Config, w: *const block.Widths, sv: Served, layers: []const u32, log: *std.Io.Writer) !void {
+    const limit = sv.o.limit;
     // prefill: the full segment's regimes, then every row count at each regime's first start
     const P = sv.o.prefill_rows;
     {
@@ -490,40 +538,10 @@ pub fn enumerate(gpa: std.mem.Allocator, n: *Needs, cfg: *const Config, w: *cons
             try log.flush();
         }
     }
-    // DSpark
-    if (sv.drafts) {
-        var pa = std.heap.ArenaAllocator.init(gpa);
-        defer pa.deinit();
-        const pb = pa.allocator();
-        _ = try n.program(try dspark_emit.emitPass(pb, cfg, w, sv.o, cfg.dspark_block));
-        // ingests: a window's rows, and a prompt's prefilled tail in one call (target.handTaps: up to the window)
-        var rows: i64 = 1;
-        while (rows <= @max(max_rows, cfg.window)) : (rows += 1) {
-            _ = try n.program(try dspark_emit.emitIngest(pb, cfg, w, sv.o, rows, 0));
-            _ = try n.program(try dspark_emit.emitIngest(pb, cfg, w, sv.o, rows, 1));
-        }
-        if (sv.slot_drafts) {
-            var k: i64 = 1;
-            while (k <= sv.group) : (k += 1) _ = try n.program(try dspark_emit.emitPassSlots(pb, cfg, w, sv.o, cfg.dspark_block, k, sv.slots));
-            // TF_DSV41_DRAFT_CHAIN's `_chain` (one variant whatever the slots: they are its grid), with and without the
-            // confidence head (Python passes cval for its tensors without it); WORLD x k candidates a row
-            const world: i64 = sv.o.world;
-            const c = world * @min(64, @divTrunc(128, world));
-            for ([_]bool{ true, false }) |conf| _ = try n.program(try dspark_emit.emitChain(pb, cfg, w, sv.o, cfg.dspark_block, sv.slots, c, conf));
-            try log.print("aot-needs: DSpark chain (TF_DSV41_DRAFT_CHAIN), N {d}, KP {d}, {d} candidates, with and without the confidence head\n", .{ cfg.dspark_block, dspark_emit.chain_kp, c });
-        } else if (try @import("dspark_dev.zig").chainFromEnv()) {
-            // the served config would boot without its chain (dspark_slots refuses it): a fill env that drifted
-            try log.print("aot-needs: TF_DSV41_DRAFT_CHAIN=1 without slot drafts (TF_DSV41_SLOTS > 1, TF_DSV41_SLOT_DRAFTS=1, row mode): no _chain variant listed\n", .{});
-            try log.flush();
-            return error.ChainWithoutSlotDrafts;
-        }
-        try log.print("aot-needs: DSpark, {d} programs, {d} variants\n", .{ n.programs, n.keys.count() });
-        try log.flush();
-    }
 }
 
-/// `tf-dsv41-m1 aot-needs SIGS OUT`.
-pub fn main(gpa: std.mem.Allocator, io: std.Io, sigs_path: []const u8, out_path: []const u8, log: *std.Io.Writer) !void {
+/// `tf-dsv41-m1 aot-needs SIGS OUT [AOTDIR]`; error.AotIncomplete when AOTDIR lacks a variant (OUT is written first).
+pub fn main(gpa: std.mem.Allocator, io: std.Io, sigs_path: []const u8, out_path: []const u8, aot_dir: ?[]const u8, log: *std.Io.Writer) !void {
     const cwd = std.Io.Dir.cwd();
     const text = try cwd.readFileAlloc(io, sigs_path, gpa, .limited(1 << 26));
     defer gpa.free(text);
@@ -544,6 +562,11 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, sigs_path: []const u8, out_path:
     try log.print("aot-needs: limit {d}, {d} slot(s), rows cap {d}, prefill rows {d}, index budget {d} MiB, R1 {}, drafts {}, slot drafts {} (group {d}), world {d}\n", .{ sv.o.limit, sv.slots, sv.cap, sv.o.prefill_rows, sv.o.index_budget >> 20, sv.o.r1, sv.drafts, sv.slot_drafts, sv.group, sv.o.world });
     var n: Needs = .{ .gpa = gpa, .sigs = &parsed.value.kernels };
     defer n.deinit();
+    const have = if (aot_dir) |d| try cuda.aot.parseSpecs(gpa, try cwd.readFileAlloc(io, try std.fs.path.join(a, &.{ d, "aot.json" }), a, .limited(1 << 26))) else null;
+    defer if (have) |h| h.deinit();
+    var cover: ?aot_cover.Cover = if (have) |h| .{ .gpa = gpa, .specs = h.value.kernels } else null;
+    defer if (cover) |*cv| cv.deinit();
+    if (cover) |*cv| n.cover = cv;
     try enumerate(gpa, &n, &cfg, &w, sv, log);
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
@@ -555,6 +578,10 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, sigs_path: []const u8, out_path:
     try ow.writeAll("\n]}\n");
     try cwd.writeFile(io, .{ .sub_path = out_path, .data = out.written() });
     try log.print("aot-needs: {d} programs, {d} variants -> {s}\n", .{ n.programs, n.keys.count(), out_path });
+    if (cover) |*cv| if (!try cv.report(aot_dir.?, n.keys.count(), log, 20)) {
+        try log.flush();
+        return error.AotIncomplete;
+    };
     try log.flush();
 }
 
@@ -601,4 +628,5 @@ test "aot-needs: a launch reduces to Triton's specialization (constexprs, == 1, 
     // a call naming a parameter no kernel of that name has is refused
     const bad: calls.Call = .{ .triton = true, .name = "_k", .args = &.{.{ .name = "Z", .arg = .{ .i = 3 } }} };
     try testing.expectError(error.NoKernel, n.reduce(a, &bad));
+    _ = aot_cover;
 }

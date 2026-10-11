@@ -66,18 +66,21 @@ pub fn optionsFromEnv(capacity: u64, world: u32) !?Options {
     return .{ .tokens = (tokens + unit - 1) / unit * unit, .split = split, .capacity = capacity, .union_cap = mib << 20 };
 }
 
+/// The workspace after the boot check: `.held` = a first start short of it runs 2,048-row segments this process.
+pub const Workspace = enum { fits, held };
+
 /// The measured boot check (memory.py serve_check, kv/budget.zig) before the pool is allocated: MemAvailable now - the pool
 /// (split counted) - the measured boot growth - the worst serving dip >= the hard floor (TF_DSV41_FLOOR_HARD_GIB). It runs
 /// where the GPU allocates from host memory (GB10; TF_DSV41_BOOT_MEASURED forces it); a refusal names the largest pool.
-pub fn bootCheck(ctx: *const cuda.Context, cfg: *const Config, o: Options, rank: u32, world: u32) !void {
+pub fn bootCheck(ctx: *const cuda.Context, cfg: *const Config, o: Options, rank: u32, world: u32, first_start: bool) !Workspace {
     const budget = kv.budget;
     const mi = budget.meminfo() catch |e| {
         std.log.warn("kv: no /proc/meminfo ({t}): the measured boot check is skipped", .{e});
-        return;
+        return .fits;
     };
     const dev = try ctx.memInfo();
     const integrated = (ctx.attribute(.integrated) catch 0) != 0;
-    if (!budget.measuredApplies(budget.modeFromEnv(), integrated, dev.total, mi.total)) return;
+    if (!budget.measuredApplies(budget.modeFromEnv(), integrated, dev.total, mi.total)) return .fits;
     var knobs: budget.Knobs = .{};
     if (std.c.getenv("TF_DSV41_FLOOR_HARD_GIB")) |v| knobs.hard_gib = try std.fmt.parseFloat(f64, std.mem.span(v));
     // TF_DSV41_FLOOR_GIB (5): the floor target the load plans for (memory.py floor_settings: 0 < hard <= target)
@@ -109,6 +112,11 @@ pub fn bootCheck(ctx: *const cuda.Context, cfg: *const Config, o: Options, rank:
     if (o.workspace > 0) {
         const ws = @as(f64, @floatFromInt(o.workspace)) / budget.GiB;
         const left = r.worst - ws;
+        if (left < r.hard and first_start) {
+            // a first start measures less MemAvailable than later starts: no 4K this run
+            std.log.warn("kv: rank {d}: first start (prepared images written this boot): the prefill workspace ({d:.2} GiB) on top of the predicted worst MemAvailable {d:.2} GiB leaves {d:.2} GiB, under the {d:.1} GiB hard floor; this run uses 2,048-row prefill segments, restart to use 4K", .{ rank, ws, r.worst, left, r.hard });
+            return .held;
+        }
         if (left < r.hard) {
             std.log.err("kv: rank {d}: the prefill workspace ({d:.2} GiB, TF_DSV41_PF_4K / TF_DSV41_PF_TBO) on top of the predicted worst MemAvailable {d:.2} GiB leaves {d:.2} GiB, under the {d:.1} GiB hard floor (TF_DSV41_FLOOR_HARD_GIB): lower TF_DSV41_POOL_TOKENS by about {d:.0} tokens, or drop TF_DSV41_PF_TBO (4K alone holds half of 4K + TBO's)", .{ rank, ws, r.worst, left, r.hard, (r.hard - left) * budget.GiB / @max(1.0, r.bytes_a_token) });
             return error.PoolDoesNotFit;
@@ -117,6 +125,7 @@ pub fn bootCheck(ctx: *const cuda.Context, cfg: *const Config, o: Options, rank:
         if (left < target) std.log.warn("kv: memory: with the prefill workspace the floor {d:.2} GiB is under the {d} GiB target (TF_DSV41_FLOOR_GIB)", .{ left, target });
     }
     if (r.worst < target) std.log.warn("kv: memory: floor {d:.2} GiB is under the {d} GiB target (TF_DSV41_FLOOR_GIB)", .{ r.worst, target });
+    return .fits;
 }
 
 pub const Kv = struct {

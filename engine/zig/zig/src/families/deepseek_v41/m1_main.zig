@@ -33,8 +33,8 @@ const usage =
     \\       tf-dsv41-m1 m5-emit CAPTURE (host only: the pool / split programs' invariants for every captured window)
     \\       tf-dsv41-m1 engram-probe DIR RANK WORLD (the Engram read path on a node's shards: device latency at depth
     \\                   1 / 8 / 32 / 64, the serving pool's batch times, idle and with spinning cores; no GPU)
-    \\       tf-dsv41-m1 aot-needs SIGS OUT (host only: every Triton variant the served config (env) can launch, for
-    \\                   tools/zig/triton_fill.py compile; SIGS from its `sigs`)
+    \\       tf-dsv41-m1 aot-needs SIGS OUT [AOTDIR] (host only: every Triton variant the served config (env) can launch,
+    \\                   for tools/zig/triton_fill.py compile; SIGS from its `sigs`; AOTDIR: exit 1 if its aot.json lacks one)
     \\       tf-dsv41-m1 m5 paged|split|compact|park PACK REF OUT (M5: a rank of TP=2 on the paged pool vs the pool reference)
     \\       tf-dsv41-m1 m2a PACK REF OUT (M2a: our forward vs tools/zig/dsv41_m2a_digests.py's run, one GPU)
     \\       tf-dsv41-m1 m2b PACK REF OUT (M2b: a rank of TP=2 over NCCL vs tools/zig/dsv41_m2b_ref.py; TF_TP_RANK ...)
@@ -160,10 +160,10 @@ pub fn main(init: std.process.Init) !u8 {
         };
         return 0;
     }
-    if (args.len == 4 and std.mem.eql(u8, args[1], "aot-needs")) {
+    if ((args.len == 4 or args.len == 5) and std.mem.eql(u8, args[1], "aot-needs")) {
         var buf: [4096]u8 = undefined;
         var out = std.Io.File.stderr().writer(init.io, &buf);
-        @import("aot_needs.zig").main(init.gpa, init.io, args[2], args[3], &out.interface) catch |e| {
+        @import("aot_needs.zig").main(init.gpa, init.io, args[2], args[3], if (args.len == 5) args[4] else null, &out.interface) catch |e| {
             std.debug.print("FAIL tf-dsv41-m1 aot-needs: {t}\n", .{e});
             return 1;
         };

@@ -265,7 +265,9 @@ pub const Model = struct {
             ko.resident = @import("prod_knobs.zig").streamScratch(&m.cfg, m.f.opts.limit, m.f.opts.prefill_rows);
             // TF_DSV41_PF_4K / _PF_TBO: the prefill workspace a long prompt allocates, priced on top of the worst point
             if (o.own_prefill) ko.workspace = try @import("forward_prefill.zig").workspaceBytes(&m.f, @intCast(m.f.opts.prefill_rows));
-            try kvs.bootCheck(&m.ctx, &m.cfg, ko, m.tcfg.rank, world);
+            // a first start (this rank wrote prepared images) holds the 4K workspace off rather than refusing the pool
+            const first = if (cache) |c| c.stats.written > 0 else false;
+            if (try kvs.bootCheck(&m.ctx, &m.cfg, ko, m.tcfg.rank, world, first) == .held) m.f.prefill_state.ws_hold = true;
             m.f.kv = try kvs.Kv.init(gpa, &m.driver, &m.ctx, &m.cfg, ko, &m.runner, comm);
             m.f.opts.pool = m.f.kv.?.options();
         }
@@ -302,7 +304,9 @@ pub const Model = struct {
         // rope.bin must hold the limit's rows (f32 [rows, 64] a table): a shorter one would leave positions unrotated
         const want: usize = @intCast(m.f.opts.rope_rows * 64 * 4);
         if (half < want) {
-            std.log.scoped(.dsv41).err("rope.bin holds {d} positions, the limit needs {d} (dsv41_rope_tables.py --rows)", .{ half / 256, want / 256 });
+            const rows = m.f.opts.rope_rows;
+            std.log.scoped(.dsv41).err("{s}/rope.bin holds {d} positions; TF_DSV41_CONTEXT {d} needs {d} (the context + 2,048 prefill rows)", .{ assets, half / 256, m.f.opts.limit, rows });
+            std.log.scoped(.dsv41).err("regenerate it on every rank, with this env sourced: python tools/zig/dsv41_rope_tables.py --config <model dir>/config.json --rows {d} --out <assets dir>/rope.bin", .{rows});
             return error.RopeTooShort;
         }
         for ([_][]const u8{ "s.rope.main", "s.rope.comp" }, 0..) |role, i| if (m.runner.addressOf(role)) |p|
