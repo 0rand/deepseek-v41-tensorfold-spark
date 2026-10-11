@@ -490,4 +490,3 @@ test "a long run of turns saved and dropped leaves the page map free slots" {
         try std.testing.expect(free * 10 >= x.by_digest.capacity());
     }
 }
-

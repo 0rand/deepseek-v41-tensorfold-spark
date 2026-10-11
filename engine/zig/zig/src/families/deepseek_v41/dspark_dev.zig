@@ -465,7 +465,6 @@ pub const Chain = struct {
     }
 };
 
-
 /// The fingerprint of a pass: the runner's owned buffers, its scratch, the pass's own and `extra`.
 pub fn fingerprint(r: *const run.Runner, x: *const Dev, extra: []const u64) u64 {
     var words: [80]u64 = undefined;
