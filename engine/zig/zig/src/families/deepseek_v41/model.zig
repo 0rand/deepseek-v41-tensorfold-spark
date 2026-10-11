@@ -302,7 +302,9 @@ pub const Model = struct {
         // rope.bin must hold the limit's rows (f32 [rows, 64] a table): a shorter one would leave positions unrotated
         const want: usize = @intCast(m.f.opts.rope_rows * 64 * 4);
         if (half < want) {
-            std.log.scoped(.dsv41).err("rope.bin holds {d} positions, the limit needs {d} (dsv41_rope_tables.py --rows)", .{ half / 256, want / 256 });
+            const rows = m.f.opts.rope_rows;
+            std.log.scoped(.dsv41).err("{s}/rope.bin holds {d} positions; TF_DSV41_CONTEXT {d} needs {d} (the context + 2,048 prefill rows)", .{ assets, half / 256, m.f.opts.limit, rows });
+            std.log.scoped(.dsv41).err("regenerate it on every rank, with this env sourced: python tools/zig/dsv41_rope_tables.py --config <model dir>/config.json --rows {d} --out <assets dir>/rope.bin", .{rows});
             return error.RopeTooShort;
         }
         for ([_][]const u8{ "s.rope.main", "s.rope.comp" }, 0..) |role, i| if (m.runner.addressOf(role)) |p|

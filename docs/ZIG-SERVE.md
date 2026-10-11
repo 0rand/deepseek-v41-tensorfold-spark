@@ -20,7 +20,8 @@ Required on both nodes:
 - Identical q28-v2 model files; rank-specific packed Engram shards on local NVMe. [Engram packing](INSTALL.md)
   writes `engram-l{1,14}-r{rank}of2.bin`. The weights download alone is not sufficient.
 - Rank-specific `/assets/rope.bin`, `engram-host.bin`, and `aot/`: RoPE tables covering the configured context plus
-  prefill rows, native host lookup data, and Triton programs for all emitted shapes. At four slots, include DSpark,
+  2,048 prefill rows (1,050,624 rows at the 1M context), native host lookup data, and Triton programs for all
+  emitted shapes. At four slots, include DSpark,
   row-mode up to 64 rows, CED replay, the device chain variants, 4K prefill pieces and replay runs, and the
   `INDEX_BOUND` twins. `aot-needs` enumerates them from the serving env (see below).
 - `/cache/pfdense-table.json`: copy the published `config/pfdense-table.json` into `CACHE_DIR` on both nodes
@@ -91,8 +92,9 @@ was not repeated for this publication; the exported host build and host tests ar
    ```
 
    The launcher passes the serving settings to both processes, sets TP world/rank/device explicitly, and uses
-   Docker `--init` because the follower exits when orphaned. It validates local directories and basic assets;
-   it does not replace the engine's memory checks, fill validation, or a production watchdog. Keep the same env
+   Docker `--init` because the follower exits when orphaned. It validates local directories and basic assets
+   (including `rope.bin`'s rows against `TF_DSV41_CONTEXT`); it does not replace the engine's memory checks, fill
+   validation, or a production watchdog. Keep the same env
    across restarts. A failure on either rank should end both via fail-fast (exit 70).
 
    To stop, signal rank 0 only and let it drain: on SIGTERM it answers new requests with 503 (`/health` reports
@@ -138,7 +140,6 @@ done
 export PY_SOURCE="$PWD/build/python-source/src"
 export PACK=/srv/models/q28-v2
 export ASSETS=/srv/assets/rank-0
-export ROPE_ROWS=1052672  # configured 1M context plus 4K headroom
 mkdir -p "$ASSETS"
 # Run the following in the build image/environment, from engine/zig.
 cd engine/zig
@@ -152,8 +153,9 @@ export TF_TP_WORLD=2
 zig-out/bin/tf-dsv41-m1 aot-needs "$ASSETS/sigs.json" "$ASSETS/needs.json"
 python tools/zig/triton_fill.py compile --py "$PY_SOURCE" --needs "$ASSETS/needs.json" \
   --options tools/zig/dsv41_triton_options.json --arch 121 --out "$ASSETS/aot"
+# rows default to TF_DSV41_CONTEXT + 2048 from the sourced env (1,050,624 at the 1M context)
 PYTHONPATH="$PY_SOURCE" python tools/zig/dsv41_rope_tables.py \
-  --config "$PACK/config.json" --rows "$ROPE_ROWS" --out "$ASSETS/rope.bin"
+  --config "$PACK/config.json" --out "$ASSETS/rope.bin"
 python tools/zig/dsv41_engram_host.py --py-src "$PY_SOURCE" --config "$PACK/config.json" \
   --tokenizer "$PACK/tokenizer.json" --out "$ASSETS/engram-host.bin"
 ```

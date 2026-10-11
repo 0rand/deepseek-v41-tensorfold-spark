@@ -39,6 +39,15 @@ done
 for asset in rope.bin engram-host.bin aot; do
     [[ -e "$ASSETS_DIR/$asset" ]] || { echo "missing asset $asset" >&2; exit 2; }
 done
+# rope.bin ("DSV41RP1", u32 rows, ...) covers the context plus the 2,048 prefill rows the engine reads past it
+rope_rows=$(od -An -t u4 -j 8 -N 4 "$ASSETS_DIR/rope.bin" | tr -d ' ')
+need_rows=$(( ${TF_DSV41_CONTEXT:-4096} + 2048 ))
+if (( rope_rows < need_rows )); then
+    echo "rope.bin holds $rope_rows rows; TF_DSV41_CONTEXT ${TF_DSV41_CONTEXT:-4096} needs $need_rows. Regenerate it:" >&2
+    echo "  PYTHONPATH=\$PY_SOURCE python engine/zig/tools/zig/dsv41_rope_tables.py --config $MODEL_DIR/config.json \\" >&2
+    echo "    --rows $need_rows --out $ASSETS_DIR/rope.bin   (docs/ZIG-SERVE.md, Generate runtime assets)" >&2
+    exit 2
+fi
 # the published pfdense tuning table, placed where the env points inside /cache when it is not there yet
 table=${TF_DSV41_PF_DENSE_TABLE:-}
 if [[ "$table" == /cache/* && ! -e "$CACHE_DIR/${table#/cache/}" ]]; then
