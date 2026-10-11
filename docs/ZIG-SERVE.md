@@ -23,7 +23,8 @@ Required on both nodes:
   prefill rows, native host lookup data, and Triton programs for all emitted shapes. At four slots, include DSpark,
   row-mode up to 64 rows, CED replay, the device chain variants, 4K prefill pieces and replay runs, and the
   `INDEX_BOUND` twins. `aot-needs` enumerates them from the serving env (see below).
-- `/cache/pfdense-table.json` (the published `config/pfdense-table.json`). Draft costs come from the engine's own
+- `/cache/pfdense-table.json`: copy the published `config/pfdense-table.json` into `CACHE_DIR` on both nodes
+  (`scripts/run-zig.sh` copies it there when it is missing). Draft costs come from the engine's own
   boot measurement (`CALIB=zig`): the first boot times its windows on both ranks and stores the table under
   `/state/calib-zig`; later boots read it.
 - Writable prepared and session directories on local NVMe. Plan roughly 100 GB weights, 95 GB Engram shards,
@@ -53,7 +54,9 @@ was not repeated for this publication; the exported host build and host tests ar
    ```
 
    Set the image, rank 0's link address, NIC/HCA settings and each node's own absolute directories. The engine
-   settings must match on both ranks. `config/prod-zig.env` is ignored by git. The template is the measured
+   settings must match on both ranks. Copy the dense-prefill tuning table into each node's `CACHE_DIR`
+   (`cp config/pfdense-table.json "$CACHE_DIR/"`; the launcher does it when the file is missing).
+   `config/prod-zig.env` is ignored by git. The template is the measured
    serving profile, with 4K prefill (it falls back to 2K per piece when memory is short); the pack URL remains
    provisional until publication completes.
 

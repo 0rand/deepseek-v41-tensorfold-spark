@@ -39,5 +39,12 @@ done
 for asset in rope.bin engram-host.bin aot; do
     [[ -e "$ASSETS_DIR/$asset" ]] || { echo "missing asset $asset" >&2; exit 2; }
 done
+# the published pfdense tuning table, placed where the env points inside /cache when it is not there yet
+table=${TF_DSV41_PF_DENSE_TABLE:-}
+if [[ "$table" == /cache/* && ! -e "$CACHE_DIR/${table#/cache/}" ]]; then
+    mkdir -p "$(dirname "$CACHE_DIR/${table#/cache/}")"
+    cp config/pfdense-table.json "$CACHE_DIR/${table#/cache/}"
+    echo "copied config/pfdense-table.json to $CACHE_DIR/${table#/cache/} (TF_DSV41_PF_DENSE_TABLE=$table)" >&2
+fi
 mkdir -p "$PREPARED_DIR" "$STATE_DIR/sessions"
 exec "${args[@]}"

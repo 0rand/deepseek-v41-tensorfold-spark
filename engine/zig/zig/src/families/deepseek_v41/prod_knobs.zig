@@ -115,7 +115,7 @@ pub fn pfDense(a: std.mem.Allocator, io: std.Io, get: Get) !?*const PfDense {
     };
     if (get("TF_DSV41_PF_DENSE_TABLE")) |path| {
         const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1 << 24)) catch |e| {
-            std.log.warn("TF_DSV41_PF_DENSE_TABLE={s}: {t}", .{ path, e });
+            std.log.warn("TF_DSV41_PF_DENSE_TABLE={s}: {t}: copy the recipe's config/pfdense-table.json to that path on every rank (scripts/run-zig.sh puts it in CACHE_DIR when missing), or unset the knob for the heuristic", .{ path, e });
             return e;
         };
         p.entries = PfDense.parseTable(a, bytes) catch |e| {
