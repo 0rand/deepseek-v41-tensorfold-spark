@@ -446,6 +446,8 @@ pub const Functions = struct {
     kv_dense: cuda.Function,
     /// kvsplit's compact pack (TF_DSV41_KV_SPLIT_COMPACT); null in a fatbin built before it
     kv_pack: ?cuda.Function = null,
+    /// kvsplit's dedup steps (TF_DSV41_KV_SPLIT_DEDUP: mark, flags, pack, tok); null in a fatbin built before them
+    kv_dedup: ?[4]cuda.Function = null,
     kv_gather: cuda.Function,
     glue: [10]cuda.Function, // glue.syms order
     /// glue.cu's DSpark candidates (TF_DSV41_DRAFT_GRAPHS); null in a fatbin built before it (the host's candidates)
@@ -511,6 +513,7 @@ pub const Functions = struct {
         f.kv_dense = try m_kv.function("_ZN13dsv41_kvsplit12dense_kernelENS_9DenseArgsE");
         f.kv_gather = try m_kv.function("_ZN13dsv41_kvsplit13gather_kernelEPKhjPKjjPh");
         f.kv_pack = m_kv.function("_ZN13dsv41_kvsplit11pack_kernelENS_8PackArgsE") catch null;
+        f.kv_dedup = kvsplit.dedupFns(m_kv) catch null;
         inline for (glue.syms, 0..) |name, i| f.glue[i] = try m_glue.function(name);
         f.ds_cands = m_glue.function(glue.ds_cands_sym) catch null;
         f.pick_pack = m_glue.function(glue.pick_pack_sym) catch null;
@@ -559,7 +562,30 @@ pub const kvsplit = struct {
         lens: u64,
     };
 
+    /// kv/split.zig's DedupArgs: PackArgs, then the map and the scratch.
+    pub const DedupArgs = extern struct {
+        p: PackArgs,
+        map: u64,
+        first: u64,
+        place: u64,
+        bcnt: u64,
+    };
+
+    const dedup_syms = [4][:0]const u8{
+        "_ZN13dsv41_kvsplit17dedup_mark_kernelENS_9DedupArgsE",
+        "_ZN13dsv41_kvsplit18dedup_flags_kernelENS_9DedupArgsE",
+        "_ZN13dsv41_kvsplit17dedup_pack_kernelENS_9DedupArgsE",
+        "_ZN13dsv41_kvsplit16dedup_tok_kernelENS_9DedupArgsE",
+    };
+
+    fn dedupFns(m: cuda.Module) ![4]cuda.Function {
+        var out: [4]cuda.Function = undefined;
+        for (dedup_syms, &out) |name, *f| f.* = try m.function(name);
+        return out;
+    }
+
     comptime {
+        std.debug.assert(@sizeOf(DedupArgs) == 120 and @offsetOf(DedupArgs, "map") == 88 and @offsetOf(DedupArgs, "bcnt") == 112);
         std.debug.assert(@sizeOf(DenseArgs) == 80 and @offsetOf(DenseArgs, "rslot") == 32 and @offsetOf(DenseArgs, "send") == 64);
         std.debug.assert(@sizeOf(PackArgs) == 88 and @offsetOf(PackArgs, "rank") == 44 and @offsetOf(PackArgs, "lens") == 80);
     }
@@ -848,6 +874,21 @@ pub const Ops = struct {
         var args: cuda.Args = .{};
         args.add(a);
         try o.go(f, .{ @intCast((n + 255) / 256), 1, 1 }, 256, 0, null, &args);
+    }
+
+    /// kvsplit dedup: the pack over each slot's unique rows (mark, flags, pack, tok: four launches of 256 threads).
+    pub fn kvDedup(o: Ops, d: kvsplit.DedupArgs) !void {
+        const fs = o.f.kv_dedup orelse return error.Unsupported;
+        const a = d.p;
+        if (a.row_bytes == 0 or a.row_bytes % 8 != 0 or a.k == 0 or a.world == 0 or a.world > 8 or a.psh > 30) return error.Shape;
+        const n = @as(u64, a.rows) * a.k;
+        if (n == 0) return;
+        const blocks: usize = @intCast((n + 255) / 256);
+        for (fs, [4]usize{ kvsplit.grid(n), blocks, blocks, kvsplit.grid(n) }) |f, g| {
+            var args: cuda.Args = .{};
+            args.add(d);
+            try o.go(f, .{ g, 1, 1 }, 256, 0, null, &args);
+        }
     }
 
     /// kvsplit gather: send[i] = base row phys[i] (uint32 [n]).

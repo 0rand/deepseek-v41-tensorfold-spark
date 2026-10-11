@@ -90,10 +90,10 @@ pub const Session = struct {
                 n_specs = roce_verbs.autoSpecs(&v, &specs, cfg.roce_hcas);
             } else |_| {}
         }
-        const opts: roce.Options = .{ .wire = if (cfg.roce_wire == .shm) .shm else .verbs, .hcas = specs[0..n_specs], .traffic_class = cfg.roce_tc, .cpu = cfg.roce_cpu, .max_bytes = cfg.mailbox_max_bytes, .timeout_ns = cfg.mailbox_timeout_ns, .fast = cfg.roce_fast, .blocks = cfg.roce_blocks };
+        const opts: roce.Options = .{ .wire = if (cfg.roce_wire == .shm) .shm else .verbs, .hcas = specs[0..n_specs], .traffic_class = cfg.roce_tc, .cpu = cfg.roce_cpu, .max_bytes = @max(cfg.mailbox_max_bytes, cfg.roce_var_bytes), .timeout_ns = cfg.mailbox_timeout_ns, .fast = cfg.roce_fast, .blocks = cfg.roce_blocks };
         const r = roce.Roce.init(d, b, image, opts) catch |e| return s.roceFallback(e);
         s.roce = r;
-        s.route = .{ .small = .{ .roce = r }, .nccl = &s.nccl, .max_bytes = cfg.mailbox_max_bytes };
+        s.route = .{ .small = .{ .roce = r }, .nccl = &s.nccl, .max_bytes = cfg.mailbox_max_bytes, .var_max_bytes = cfg.roce_var_bytes };
         const good = probe(s, d) catch false;
         var blobs: [bootstrap.max_ranks][]const u8 = undefined;
         var buf: [bootstrap.max_ranks]u8 = undefined;

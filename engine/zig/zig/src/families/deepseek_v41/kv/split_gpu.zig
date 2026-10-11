@@ -19,13 +19,28 @@ const DeviceKernels = struct {
     dense_fn: cuda.Function,
     gather_fn: cuda.Function,
     pack_fn: cuda.Function,
+    /// dedup_mark, _flags, _pack, _tok (null: a fatbin without them)
+    dedup_fns: ?[4]cuda.Function = null,
 
     fn grid(words: u64) u32 {
         return @intCast(@max(1, @min((words + 255) / 256, 4096)));
     }
 
     fn kernels(k: *DeviceKernels) split.Kernels {
-        return .{ .ptr = k, .vtable = &.{ .dense = dense, .gather = gather, .pack = pack } };
+        return .{ .ptr = k, .vtable = &.{ .dense = dense, .gather = gather, .pack = pack, .dedup = dedup } };
+    }
+
+    fn dedup(ptr: *anyopaque, a: split.DedupArgs, stream: tp.collective.Stream) anyerror!void {
+        const k: *DeviceKernels = @ptrCast(@alignCast(ptr));
+        const fs = k.dedup_fns orelse return error.Unsupported;
+        const n = @as(u64, a.p.rows) * a.p.k;
+        if (n == 0) return;
+        const b: u32 = @intCast((n + 255) / 256);
+        for (fs, [4]u32{ grid(n), b, b, grid(n) }) |f, g| {
+            var args: cuda.Args = .{};
+            args.add(a);
+            try cuda.launch.launch(f, .{ .grid = .{ .x = g }, .block = .{ .x = 256 } }, .{ .d = k.d, .handle = stream }, &args);
+        }
     }
 
     fn dense(ptr: *anyopaque, a: split.DenseArgs, stream: tp.collective.Stream) anyerror!void {
@@ -267,6 +282,123 @@ const Rank = struct {
         }
     }
 
+    /// Verify-like selections: a slot's rows share one base list, `fresh` in 16 entries replaced.
+    fn verifyLike(r: *const Rank, rnd: std.Random, fi: usize, R: u32, K: u32, fresh: u32, sel: []i32, rslot: []i32) void {
+        for (rslot[0..R], 0..) |*s, i| s.* = @intCast(i * 3 / R);
+        var base: [3][512]i32 = undefined;
+        for (&base, 0..) |*b, s| for (b[0..K]) |*t| {
+            t.* = @intCast(rnd.uintLessThan(u32, r.rowsOf(fi, s)));
+        };
+        for (sel[0 .. R * K], 0..) |*t, i| {
+            const s: usize = @intCast(rslot[i / K]);
+            t.* = if (rnd.uintLessThan(u32, 16) < fresh) @intCast(rnd.uintLessThan(u32, r.rowsOf(fi, s))) else base[s][i % K];
+        }
+    }
+
+    /// Dedup (graph replays, verify-like selections) against the pool rows, then dedup / dense / packed times a call.
+    fn dedupVsDense(r: *Rank, rnd: std.Random, io: std.Io, fi: u32, R: u32) !void {
+        const K = 512;
+        const n = R * K;
+        const g = r.gpa;
+        const v = r.dp.view(fi, 0);
+        const psh: u32 = @intCast(v.psh);
+        const map_rows = 3 * (@as(u64, @intCast(v.pts)) << @intCast(psh));
+        var scratch = try cuda.DeviceBuffer.alloc(r.d, 4 * (map_rows + 2 * n + (n + 255) / 256 * split.max_world));
+        defer scratch.free();
+        try scratch.fill32(std.math.maxInt(i32), null);
+        var xd = try split.Exchange.init(r.comm, r.x.kernels, .on);
+        xd.dedup = .{ .map = scratch.ptr, .map_rows = map_rows, .first = scratch.ptr + 4 * map_rows, .place = scratch.ptr + 4 * (map_rows + n), .bcnt = scratch.ptr + 4 * (map_rows + 2 * n), .entries = n, .slots = 3 };
+        const xo = try split.Exchange.init(r.comm, r.x.kernels, .on);
+        const sel = try g.alloc(i32, n);
+        defer g.free(sel);
+        const rslot = try g.alloc(i32, R);
+        defer g.free(rslot);
+        const tok = try g.alloc(i32, n);
+        defer g.free(tok);
+        const rh = try g.alloc(u8, 2 * n * 584);
+        defer g.free(rh);
+        var dsel = try cuda.DeviceBuffer.alloc(r.d, n * 4);
+        defer dsel.free();
+        var dslot = try cuda.DeviceBuffer.alloc(r.d, R * 4);
+        defer dslot.free();
+        var dtok = try cuda.DeviceBuffer.alloc(r.d, n * 4);
+        defer dtok.free();
+        var dlens = try cuda.DeviceBuffer.alloc(r.d, 2 * 4);
+        defer dlens.free();
+        var send = try cuda.DeviceBuffer.alloc(r.d, n * 584);
+        defer send.free();
+        var recv = try cuda.DeviceBuffer.alloc(r.d, 2 * n * 584);
+        defer recv.free();
+        const a: split.DenseArgs = .{ .sel = dsel.ptr, .rows = R, .k = K, .table = v.pt, .pts = @intCast(v.pts), .rslot = dslot.ptr, .psh = psh, .base = v.cv, .row_bytes = 584, .world = 2, .send = send.ptr, .tok = dtok.ptr };
+        const pa = split.PackArgs.of(a, r.comm.rank(), dlens.ptr);
+        var execs: [3]cuda.graph.Exec = undefined;
+        for (&execs, 0..) |*e, m| {
+            try cuda.graph.beginCapture(r.stream, .global);
+            switch (m) {
+                0 => try xd.window(pa, recv.ptr, r.stream.handle),
+                1 => try r.x.dense(a, recv.ptr, r.stream.handle),
+                else => try xo.window(pa, recv.ptr, r.stream.handle),
+            }
+            var gr = try cuda.graph.endCapture(r.stream);
+            defer gr.deinit();
+            e.* = try gr.instantiate();
+        }
+        defer for (&execs) |*e| e.deinit();
+        for (0..4) |round| {
+            r.verifyLike(rnd, fi, R, K, @intCast(round * 5), sel, rslot);
+            try dsel.upload(0, std.mem.sliceAsBytes(sel));
+            try dslot.upload(0, std.mem.sliceAsBytes(rslot));
+            try recv.fill8(0xEE, r.stream.handle);
+            if (round == 0) try xd.window(pa, recv.ptr, r.stream.handle) else try execs[0].launchOn(r.stream);
+            try r.stream.synchronize();
+            try dtok.download(0, std.mem.sliceAsBytes(tok));
+            try recv.download(0, rh);
+            var lens: [2]i32 = undefined;
+            try dlens.download(0, std.mem.asBytes(&lens));
+            var seen = std.AutoHashMap(u64, i32).init(g);
+            defer seen.deinit();
+            var unique: [2]u32 = .{ 0, 0 };
+            for (sel, tok, 0..) |t, o, i| {
+                r.checks += 1;
+                if (t < 0 or o < 0) {
+                    r.bad += @intFromBool((t < 0) != (o < 0));
+                    continue;
+                }
+                const gp = try seen.getOrPut((@as(u64, @intCast(rslot[i / K])) << 32) | @as(u64, @intCast(t)));
+                if (gp.found_existing) r.bad += @intFromBool(gp.value_ptr.* != o) else {
+                    gp.value_ptr.* = o;
+                    unique[split.ownerOf(@intCast(t), psh, 2)] += 1;
+                }
+                const before = r.bad;
+                const y = std.mem.bytesAsSlice(u64, rh[@as(usize, @intCast(o)) * 584 ..][0..584]);
+                for (y, 0..) |q, j| r.bad += @intFromBool(q != word(fi, @intCast(rslot[i / K]), @intCast(t), j));
+                if (r.bad != before and r.shown < 6) {
+                    r.shown += 1;
+                    std.debug.print("DEDUP MISMATCH fam {d} R {d} round {d} entry {d} t {d} token {d}\n", .{ fi, R, round, i, t, o });
+                }
+            }
+            for (0..2) |o| r.bad += @intFromBool(lens[o] != @as(i32, @intCast(unique[o] * 584)));
+            const map = try g.alloc(i32, map_rows);
+            defer g.free(map);
+            try scratch.download(0, std.mem.sliceAsBytes(map));
+            for (map) |m| r.bad += @intFromBool(m != std.math.maxInt(i32));
+            if (round == 1) std.debug.print("dedup fam {d} R {d}: {d} + {d} unique rows of {d} entries\n", .{ fi, R, unique[0], unique[1], n });
+        }
+        r.verifyLike(rnd, fi, R, K, 3, sel, rslot);
+        try dsel.upload(0, std.mem.sliceAsBytes(sel));
+        try dslot.upload(0, std.mem.sliceAsBytes(rslot));
+        var us: [3]f64 = undefined;
+        for (execs, &us) |e, *u| {
+            try e.launchOn(r.stream);
+            try r.stream.synchronize();
+            const t0 = std.Io.Clock.awake.now(io).toNanoseconds();
+            for (0..50) |_| try e.launchOn(r.stream);
+            try r.stream.synchronize();
+            u.* = @as(f64, @floatFromInt(std.Io.Clock.awake.now(io).toNanoseconds() - t0)) / 50e3;
+        }
+        std.debug.print("exchange fam {d} R {d} (3 in 16 fresh): dedup {d:.1} us, dense {d:.1} us, packed {d:.1} us a call (packed moves {s})\n", .{ fi, R, us[0], us[1], us[2], if (xo.packs(@as(u64, n) * 584)) "lengths" else "whole strides" });
+    }
+
     fn unions(r: *Rank, rnd: std.Random, fi: u32, rank: u32) !u32 {
         const K = 512;
         const S = 256; // a prefill segment's rows
@@ -328,6 +460,12 @@ pub fn main(init: std.process.Init) !u8 {
     var module = try cuda.Module.load(&driver, image);
     defer module.unload();
     var dk: DeviceKernels = .{ .d = &driver, .dense_fn = try module.function("_ZN13dsv41_kvsplit12dense_kernelENS_9DenseArgsE"), .gather_fn = try module.function("_ZN13dsv41_kvsplit13gather_kernelEPKhjPKjjPh"), .pack_fn = try module.function("_ZN13dsv41_kvsplit11pack_kernelENS_8PackArgsE") };
+    dk.dedup_fns = .{
+        try module.function("_ZN13dsv41_kvsplit17dedup_mark_kernelENS_9DedupArgsE"),
+        try module.function("_ZN13dsv41_kvsplit18dedup_flags_kernelENS_9DedupArgsE"),
+        try module.function("_ZN13dsv41_kvsplit17dedup_pack_kernelENS_9DedupArgsE"),
+        try module.function("_ZN13dsv41_kvsplit16dedup_tok_kernelENS_9DedupArgsE"),
+    };
     var stream = try cuda.Stream.init(&driver, true);
     defer stream.deinit();
     var pool = try sessions.Pool.init(gpa, .{ .families = &fams, .page = page }, 8192 * page, 2, cfg.rank);
@@ -361,6 +499,7 @@ pub fn main(init: std.process.Init) !u8 {
         try r.dense(rnd, fi, R, true);
     };
     for ([_]u32{ 0, 1 }) |fi| for ([_]u32{ 1, 6, 16, 64 }) |R| try r.packedVsDense(rnd, fi, R);
+    for ([_]u32{ 0, 1 }) |fi| for ([_]u32{ 1, 4, 8, 24, 32 }) |R| try r.dedupVsDense(rnd, init.io, fi, R);
     var blocks: u32 = 0;
     for ([_]u32{ 0, 1 }) |fi| blocks += try r.unions(rnd, fi, cfg.rank);
     // the time of one dense exchange (pack + all-gather), graph-replayed, R = 16, K = 512

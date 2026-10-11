@@ -71,8 +71,55 @@ pub const PackArgs = extern struct {
     }
 };
 
+/// TF_DSV41_KV_SPLIT_DEDUP's pack (kvsplit.cu dedup_*): a slot's row sent once, its entries read one place.
+pub const DedupArgs = extern struct {
+    p: PackArgs,
+    /// int32 [map rows]: key slot x (pts << psh) + logical row
+    map: u64,
+    /// int32 [R x K] each, and uint32 [blocks of 256 entries, max_world]
+    first: u64,
+    place: u64,
+    bcnt: u64,
+};
+
+/// The dedup knob's device scratch (Kv's), and what its map covers.
+pub const Dedup = struct {
+    map: u64,
+    map_rows: u64,
+    first: u64,
+    place: u64,
+    bcnt: u64,
+    /// entries the scratch takes (R x K)
+    entries: u64,
+    /// slots the map holds (row mode's rslot values below it)
+    slots: u32,
+
+    /// A row-mode window (one stream's exchanges) whose keys fit the map and entries the scratch: alike on every rank.
+    pub fn covers(d: Dedup, a: PackArgs) bool {
+        const n = @as(u64, a.rows) * a.k;
+        const keys = @as(u64, d.slots) * (@as(u64, a.pts) << @intCast(a.psh));
+        return a.rslot != 0 and n > 0 and n <= d.entries and keys <= d.map_rows;
+    }
+
+    pub fn args(d: Dedup, a: PackArgs) DedupArgs {
+        return .{ .p = a, .map = d.map, .first = d.first, .place = d.place, .bcnt = d.bcnt };
+    }
+};
+
+/// TF_DSV41_KV_SPLIT_DEDUP=1: packed exchanges send each slot's unique rows (default off).
+pub fn dedupOn() bool {
+    const v = std.mem.span(std.c.getenv("TF_DSV41_KV_SPLIT_DEDUP") orelse return false);
+    return std.mem.eql(u8, std.mem.trim(u8, v, " \t"), "1");
+}
+
+/// TF_DSV41_KV_SPLIT_EARLY=1: an index layer's exchange issued right after its selection (block.zig; default off).
+pub fn earlyOn() bool {
+    const v = std.mem.span(std.c.getenv("TF_DSV41_KV_SPLIT_EARLY") orelse return false);
+    return std.mem.eql(u8, std.mem.trim(u8, v, " \t"), "1");
+}
+
 comptime {
-    std.debug.assert(@sizeOf(DenseArgs) == 80 and @sizeOf(PackArgs) == 88);
+    std.debug.assert(@sizeOf(DenseArgs) == 80 and @sizeOf(PackArgs) == 88 and @sizeOf(DedupArgs) == 120);
     std.debug.assert(@offsetOf(PackArgs, "rank") == 44 and @offsetOf(PackArgs, "base") == @offsetOf(DenseArgs, "base") and @offsetOf(PackArgs, "lens") == 80);
 }
 
@@ -88,13 +135,70 @@ pub const Kernels = struct {
         pack: ?*const fn (ptr: *anyopaque, a: PackArgs, stream: Stream) anyerror!void = null,
         /// send[i] = base row phys[i] (uint32 [n])
         gather: *const fn (ptr: *anyopaque, base: u64, row_bytes: u32, phys: u64, n: u32, send: u64, stream: Stream) anyerror!void,
+        /// The deduplicated pack (kvsplit.cu dedup_*: four launches); null: a Kernels without it (packs without dedup).
+        dedup: ?*const fn (ptr: *anyopaque, a: DedupArgs, stream: Stream) anyerror!void = null,
     };
 };
 
 /// The kernels on host memory (addresses are host pointers): the reference the device kernels must equal, and the host ranks' path.
 pub const HostKernels = struct {
     pub fn kernels(h: *HostKernels) Kernels {
-        return .{ .ptr = h, .vtable = &.{ .dense = dense, .gather = gather, .pack = pack } };
+        return .{ .ptr = h, .vtable = &.{ .dense = dense, .gather = gather, .pack = pack, .dedup = dedup } };
+    }
+
+    /// dedup_*'s steps in order on host memory: the first entry of each key, places among each owner's first entries.
+    fn dedup(_: *anyopaque, d: DedupArgs, _: Stream) anyerror!void {
+        const a = d.p;
+        if (a.world < 1 or a.world > max_world or a.rank >= a.world) return error.BadWorld;
+        const n = @as(usize, a.rows) * a.k;
+        const sel: [*]const i32 = @ptrFromInt(a.sel);
+        const tab: [*]const i32 = @ptrFromInt(a.table);
+        const rslot: ?[*]const i32 = if (a.rslot == 0) null else @ptrFromInt(a.rslot);
+        const map: [*]i32 = @ptrFromInt(d.map);
+        const first: [*]i32 = @ptrFromInt(d.first);
+        const place: [*]i32 = @ptrFromInt(d.place);
+        const base: [*]const u8 = @ptrFromInt(a.base);
+        const send: [*]u8 = @ptrFromInt(a.send);
+        const tok: [*]i32 = @ptrFromInt(a.tok);
+        const lens: [*]i32 = @ptrFromInt(a.lens);
+        const mask = (@as(u32, 1) << @intCast(a.psh)) - 1;
+        const span = @as(usize, a.pts) << @intCast(a.psh);
+        const key = struct {
+            fn of(rs: ?[*]const i32, k: u32, sp: usize, i: usize, t: i32) usize {
+                return (if (rs) |r| @as(usize, @intCast(r[i / k])) * sp else 0) + @as(usize, @intCast(t));
+            }
+        }.of;
+        for (0..n) |i| if (sel[i] >= 0) {
+            const at = &map[key(rslot, a.k, span, i, sel[i])];
+            at.* = @min(at.*, @as(i32, @intCast(i)));
+        };
+        var count: [max_world]u32 = @splat(0);
+        for (0..n) |i| {
+            first[i] = if (sel[i] < 0) -1 else map[key(rslot, a.k, span, i, sel[i])];
+            if (first[i] != @as(i32, @intCast(i))) continue;
+            const t: u32 = @intCast(sel[i]);
+            const o = ownerOf(t, a.psh, a.world);
+            place[i] = @intCast(count[o]);
+            if (o == a.rank) {
+                const s: usize = if (rslot) |rs| @intCast(rs[i / a.k]) else 0;
+                const local: u32 = @intCast(tab[s * a.pts + (t >> @intCast(a.psh))]);
+                const phys = (@as(usize, local) << @intCast(a.psh)) | (t & mask);
+                @memcpy(send[count[o] * a.row_bytes ..][0..a.row_bytes], base[phys * a.row_bytes ..][0..a.row_bytes]);
+            }
+            count[o] += 1;
+        }
+        for (0..n) |i| {
+            if (first[i] < 0) {
+                tok[i] = -1;
+                continue;
+            }
+            const t: u32 = @intCast(sel[i]);
+            tok[i] = @intCast(ownerOf(t, a.psh, a.world) * n + @as(usize, @intCast(place[@intCast(first[i])])));
+        }
+        for (0..n) |i| if (first[i] == @as(i32, @intCast(i))) {
+            map[key(rslot, a.k, span, i, sel[i])] = std.math.maxInt(i32);
+        };
+        for (0..a.world) |o| lens[o] = @intCast(count[o] * a.row_bytes);
     }
 
     /// One pass in list order: an owner's running count is each entry's place (pack_kernel's prefix sums).
@@ -280,6 +384,8 @@ pub const Exchange = struct {
     compact: Compact = .off,
     /// Every rank's transport takes device lengths (`Collective.varAgreed`, asked once at `init` when compact is on).
     var_ok: bool = false,
+    /// TF_DSV41_KV_SPLIT_DEDUP's scratch (null: off)
+    dedup: ?Dedup = null,
 
     /// An exchange under `mode` (`compactMode()` for the knob). Every rank calls it alike, outside any graph: `on` asks the
     /// communicator's once-per-communicator agreement.
@@ -294,7 +400,13 @@ pub const Exchange = struct {
 
     /// The window's exchange as the knob says: densePacked where `packs`, else dense (a.lens unused then).
     pub fn window(x: Exchange, a: PackArgs, recv: DevicePtr, stream: Stream) !void {
-        if (x.packs(@as(u64, a.rows) * a.k * a.row_bytes)) return x.densePacked(a, recv, stream);
+        if (x.packs(@as(u64, a.rows) * a.k * a.row_bytes)) {
+            if (x.dedup) |d| if (x.kernels.vtable.dedup) |f| if (d.covers(a)) {
+                try f(x.kernels.ptr, d.args(a), stream);
+                return x.comm.allGatherV(a.send, recv, @as(usize, a.rows) * a.k * a.row_bytes, a.lens, .u8, stream);
+            };
+            return x.densePacked(a, recv, stream);
+        }
         return x.dense(a.dense(), recv, stream);
     }
 

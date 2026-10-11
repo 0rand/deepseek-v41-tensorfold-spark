@@ -33,6 +33,8 @@ pub const Config = struct {
     device: u32 = 0,
     backend: Backend = .nccl,
     mailbox_max_bytes: usize = 256 * 1024,
+    /// TF_TP_ROCE_VAR_KB: `allGatherV` strides up to this go RoCE (0: the max above); other ops keep their route.
+    roce_var_bytes: usize = 0,
     /// A mailbox wait for the peer gives up after this long and poisons the transport (fail-stop).
     mailbox_timeout_ns: u64 = 120 * std.time.ns_per_s,
     failfast: bool = true,
@@ -80,6 +82,7 @@ pub const Config = struct {
             return error.BadSetting;
         };
         c.mailbox_max_bytes = 1024 * try int(usize, get, alias(get, "TF_TP_MAILBOX_MAX_KB", "GLM53_TF_ROCE_MAX_KB"), 256, 4, 16 * 1024);
+        c.roce_var_bytes = 1024 * try int(usize, get, "TF_TP_ROCE_VAR_KB", 0, 0, 32 * 1024);
         c.mailbox_timeout_ns = try seconds(get, "TF_TP_MAILBOX_TIMEOUT_S", 120, 0.001, 86400);
         if (get("TF_DSV41_FAILFAST")) |v| c.failfast = !(std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "off"));
         c.grace_ns = try seconds(get, "TF_DSV41_FAILFAST_GRACE_S", 1.0, 0, 60);
@@ -138,6 +141,7 @@ pub const Config = struct {
         h.update(std.mem.asBytes(&c.world));
         h.update(std.mem.asBytes(&c.backend));
         h.update(std.mem.asBytes(&c.mailbox_max_bytes));
+        h.update(std.mem.asBytes(&c.roce_var_bytes));
         h.update(std.mem.asBytes(&c.failfast));
         h.update(std.mem.asBytes(&c.roce_wire));
         h.update(std.mem.asBytes(&c.roce_fallback));
@@ -224,6 +228,14 @@ test "bad settings are refused and the digest ignores the rank" {
     try std.testing.expectEqualSlices(u8, &a.digest(), &b.digest());
     b.mailbox_max_bytes = 1024;
     try std.testing.expect(!std.mem.eql(u8, &a.digest(), &b.digest()));
+    try std.testing.expectEqual(@as(usize, 0), a.roce_var_bytes);
+    var v = a;
+    v.roce_var_bytes = 10 << 20;
+    try std.testing.expect(!std.mem.eql(u8, &a.digest(), &v.digest()));
+    Fake.pairs = &.{ .{ "TF_COMM_BACKEND", "roce" }, .{ "TF_TP_ROCE_VAR_KB", "10240" } };
+    try std.testing.expectEqual(@as(usize, 10 << 20), (try Config.parse(&Fake.get)).roce_var_bytes);
+    Fake.pairs = &.{.{ "TF_TP_ROCE_VAR_KB", "65536" }};
+    try std.testing.expectError(error.BadSetting, Config.parse(&Fake.get));
 }
 
 test "prod.env's names: GLM53_TF_* where ours are unset, the plan link's spin and pin" {

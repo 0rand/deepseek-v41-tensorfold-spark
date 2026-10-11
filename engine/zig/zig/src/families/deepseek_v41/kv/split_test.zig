@@ -221,10 +221,58 @@ fn packedRank(comm: tp.Collective, me: u32, ctx: *const PCtx) anyerror!void {
         }
         for (0..W) |o| try testing.expectEqual(@as(i32, @intCast(count[o] * rb)), plens[o]);
         if (kind == .one_owner) for (0..W) |o| if (o != one) try testing.expectEqual(@as(i32, 0), plens[o]);
+        try dedupCheck(x, pa, sel, &rslot, .{ .fi = fi, .K = K, .psh = fpsh, .rows = pts * per, .W = W });
     };
 }
 
-test "packed == dense == replicated: 1 / 6 / 16 rows x K 512, ratio 2 and 1, one-owner and padded selections, W 2 and 3" {
+const DCase = struct { fi: usize, K: u32, psh: u32, rows: u64, W: u32 };
+
+/// TF_DSV41_KV_SPLIT_DEDUP: rows by token == replicated, unique keys sent once, one token a key, the map reset.
+fn dedupCheck(x0: split.Exchange, pa0: split.PackArgs, sel: []const i32, rslot: []const i32, c: DCase) !void {
+    const gpa = testing.allocator;
+    const n = sel.len;
+    const map_rows = 3 * c.rows;
+    const mem = try gpa.alloc(i32, map_rows + 2 * n + (n + 255) / 256 * split.max_world);
+    defer gpa.free(mem);
+    @memset(mem[0..map_rows], std.math.maxInt(i32));
+    const at = @intFromPtr(mem.ptr);
+    var x = x0;
+    x.dedup = .{ .map = at, .map_rows = map_rows, .first = at + 4 * map_rows, .place = at + 4 * (map_rows + n), .bcnt = at + 4 * (map_rows + 2 * n), .entries = n, .slots = 3 };
+    const send = try gpa.alloc(u8, n * rb);
+    defer gpa.free(send);
+    const recv = try gpa.alloc(u8, c.W * n * rb);
+    defer gpa.free(recv);
+    @memset(recv, 0xEE);
+    const tok = try gpa.alloc(i32, n);
+    defer gpa.free(tok);
+    var lens: [split.max_world]i32 = @splat(-7);
+    var pa = pa0;
+    pa.send = @intFromPtr(send.ptr);
+    pa.tok = @intFromPtr(tok.ptr);
+    pa.lens = @intFromPtr(&lens);
+    try x.window(pa, @intFromPtr(recv.ptr), null);
+    var seen = std.AutoHashMap(u64, i32).init(gpa);
+    defer seen.deinit();
+    var unique: [split.max_world]u32 = @splat(0);
+    for (sel, tok, 0..) |t, o, i| {
+        if (t < 0) {
+            try testing.expectEqual(@as(i32, -1), o);
+            continue;
+        }
+        const s: usize = @intCast(rslot[i / c.K]);
+        const g = try seen.getOrPut(@as(u64, s) * c.rows + @as(u64, @intCast(t)));
+        if (g.found_existing) try testing.expectEqual(g.value_ptr.*, o) else {
+            g.value_ptr.* = o;
+            unique[split.ownerOf(@intCast(t), c.psh, c.W)] += 1;
+        }
+        const row = recv[@as(usize, @intCast(o)) * rb ..][0..rb];
+        for (row, 0..) |b, j| try testing.expectEqual(pvalue(c.fi, s, @intCast(t), j), b);
+    }
+    for (0..c.W) |o| try testing.expectEqual(@as(i32, @intCast(unique[o] * rb)), lens[o]);
+    for (mem[0..map_rows]) |m| try testing.expectEqual(@as(i32, std.math.maxInt(i32)), m);
+}
+
+test "packed == dedup == dense == replicated: 1 / 6 / 16 rows x K 512, ratio 2 and 1, one-owner and padded, W 2 and 3" {
     for ([_]u64{ 1, 2 }) |seed| {
         try tp.host.run(2, &PCtx{ .seed = seed }, packedRank);
         try tp.host.run(3, &PCtx{ .seed = seed }, packedRank);

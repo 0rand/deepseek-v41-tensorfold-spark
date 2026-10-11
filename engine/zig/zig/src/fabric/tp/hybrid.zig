@@ -56,6 +56,8 @@ pub const Hybrid = struct {
     nccl: *Nccl,
     /// Largest shard a rank sends through the small path.
     max_bytes: usize,
+    /// Largest stride a rank's variable-length gather takes on RoCE (TF_TP_ROCE_VAR_KB; below max_bytes: max_bytes).
+    var_max_bytes: usize = 0,
     /// Every rank's `varFits(16)`, agreed at `Session.open` (the bootstrap's all-gather): `varAgreed`'s answer.
     var_agreed: bool = false,
 
@@ -125,7 +127,7 @@ pub const Hybrid = struct {
     pub fn varFits(ptr: *anyopaque, n: usize) bool {
         const h = self_(ptr);
         return switch (h.small) {
-            .roce => |p| n > 0 and h.routed(n) and p.d != null,
+            .roce => |p| n > 0 and n <= @max(h.max_bytes, h.var_max_bytes) and p.fits(n) and p.d != null,
             .mailbox => false,
         };
     }

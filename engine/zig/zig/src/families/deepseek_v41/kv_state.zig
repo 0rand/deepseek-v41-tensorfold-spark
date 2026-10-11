@@ -142,6 +142,8 @@ pub const Kv = struct {
     x: kv.split.Exchange = undefined,
     ops: Ops = undefined,
     lens: ?cuda.DeviceBuffer = null,
+    /// TF_DSV41_KV_SPLIT_DEDUP's map and scratch (kv/split.zig Dedup)
+    dedup: ?cuda.DeviceBuffer = null,
     stats: Stats = .{},
     /// the last union when it took several row blocks (empty: one block, already exchanged): each block's rows
     /// sit in `phys` at its offset, its tokens in the call's token rows; longpf.zig exchanges them block by block
@@ -172,8 +174,26 @@ pub const Kv = struct {
             k.lens = try cuda.DeviceBuffer.alloc(d, 4 * @as(usize, world));
             // the compact mode's transport agreement happens here, once, outside any graph
             k.x = try kv.split.Exchange.init(comm, k.ops.kernels(), try kv.split.compactMode());
+            if (kv.split.dedupOn()) try k.initDedup(d, cfg.index_topk);
         }
         return k;
+    }
+
+    /// The dedup scratch: a key map over every slot's rows (ratio 1), INT_MAX; entries for 64 rows (wider: no dedup).
+    fn initDedup(k: *Kv, d: *const cuda.Driver, topk: u32) !void {
+        if (k.runner.kernels.ops.kv_dedup == null) {
+            std.log.err("[tensorfold] TF_DSV41_KV_SPLIT_DEDUP=1: the kvsplit fatbin has no dedup kernels (rebuild it)", .{});
+            return error.MissingKernel;
+        }
+        const slot_rows = @as(u64, k.slot.max_pages) * block.Pool.page;
+        const map_rows = slot_rows * k.slots.len;
+        const entries = 64 * @as(u64, topk);
+        const bcnt = (entries + 255) / 256 * kv.split.max_world;
+        const buf = try cuda.DeviceBuffer.alloc(d, @intCast(4 * (map_rows + 2 * entries + bcnt)));
+        k.dedup = buf;
+        try buf.fill32(std.math.maxInt(i32), null);
+        k.x.dedup = .{ .map = buf.ptr, .map_rows = map_rows, .first = buf.ptr + 4 * map_rows, .place = buf.ptr + 4 * (map_rows + entries), .bcnt = buf.ptr + 4 * (map_rows + 2 * entries), .entries = entries, .slots = @intCast(k.slots.len) };
+        if (k.rank == 0) std.log.info("[tensorfold] split KV dedup: {d} MiB (map {d} rows, {d} entries)", .{ buf.len >> 20, map_rows, entries });
     }
 
     pub fn deinit(k: *Kv) void {
@@ -182,6 +202,7 @@ pub const Kv = struct {
         k.block_phys.deinit(k.gpa);
         if (k.phys) |*b| b.free();
         if (k.lens) |*b| b.free();
+        if (k.dedup) |*b| b.free();
         if (k.pin_sel) |*b| b.free();
         if (k.pin_up) |*b| b.free();
         k.dev.deinit();
@@ -203,6 +224,7 @@ pub const Kv = struct {
             .ik_pages = k.pool.familyTensorPages(fams[1]),
             .pts = k.slot.max_pages,
             .split = k.layout.opts.split,
+            .early = k.layout.opts.split and kv.split.earlyOn(),
             .union_cap = @intCast(k.opts.union_cap),
         };
     }
@@ -379,7 +401,7 @@ const Ops = struct {
     r: *run.Runner,
 
     fn kernels(o: *Ops) kv.split.Kernels {
-        return .{ .ptr = o, .vtable = &.{ .dense = dense, .gather = gather, .pack = pack } };
+        return .{ .ptr = o, .vtable = &.{ .dense = dense, .gather = gather, .pack = pack, .dedup = dedup } };
     }
 
     fn self(ptr: *anyopaque) *Ops {
@@ -399,5 +421,17 @@ const Ops = struct {
     fn pack(ptr: *anyopaque, a: kv.split.PackArgs, _: tp.collective.Stream) anyerror!void {
         const r = self(ptr).r;
         try r.kernels.others(r.stream).kvPack(.{ .sel = a.sel, .rows = a.rows, .k = a.k, .table = a.table, .pts = a.pts, .rslot = a.rslot, .psh = a.psh, .rank = a.rank, .base = a.base, .row_bytes = a.row_bytes, .world = a.world, .send = a.send, .tok = a.tok, .lens = a.lens });
+    }
+
+    fn dedup(ptr: *anyopaque, a: kv.split.DedupArgs, _: tp.collective.Stream) anyerror!void {
+        const r = self(ptr).r;
+        const p = a.p;
+        try r.kernels.others(r.stream).kvDedup(.{
+            .p = .{ .sel = p.sel, .rows = p.rows, .k = p.k, .table = p.table, .pts = p.pts, .rslot = p.rslot, .psh = p.psh, .rank = p.rank, .base = p.base, .row_bytes = p.row_bytes, .world = p.world, .send = p.send, .tok = p.tok, .lens = p.lens },
+            .map = a.map,
+            .first = a.first,
+            .place = a.place,
+            .bcnt = a.bcnt,
+        });
     }
 };

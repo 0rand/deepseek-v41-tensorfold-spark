@@ -167,4 +167,120 @@ __global__ void __launch_bounds__(256) gather_kernel(const uint8_t* __restrict__
     }
 }
 
+// dedup (TF_DSV41_KV_SPLIT_DEDUP): pack each slot's unique rows once; an entry's token is its key's first entry's place
+struct DedupArgs {
+    PackArgs p;
+    int* map;                // int32 [map_rows], key slot x (pts << psh) + row: INT_MAX between calls
+    int* first;              // int32 [R K]: each entry's first entry of its key (-1: none)
+    int* place;              // int32 [R K]: code (owner, or world: not counted), then a first entry's place
+    uint32_t* bcnt;          // uint32 [blocks, kMaxWorld]: each block's counted entries by owner
+};
+static_assert(sizeof(DedupArgs) == 120, "kv/split.zig DedupArgs");
+
+__device__ __forceinline__ long long dedup_key(const PackArgs& a, long long i, int sv) {
+    return (a.rslot ? (long long)a.rslot[i / a.k] * ((long long)a.pts << a.psh) : 0ll) + sv;
+}
+
+// mark: map[key] = the key's first entry (atomicMin), then flags, pack (places by ballots) and tok (puts map back)
+__global__ void __launch_bounds__(256) dedup_mark_kernel(const DedupArgs d) {
+    const long long n = (long long)d.p.rows * d.p.k;
+    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (long long)gridDim.x * blockDim.x) {
+        const int sv = d.p.sel[i];
+        if (sv >= 0) atomicMin(&d.map[dedup_key(d.p, i, sv)], (int)i);
+    }
+}
+
+__global__ void __launch_bounds__(kPackThreads) dedup_flags_kernel(const DedupArgs d) {
+    __shared__ uint32_t s_cnt[kMaxWorld];
+    const uint32_t tid = threadIdx.x, W = d.p.world;
+    const long long n = (long long)d.p.rows * d.p.k;
+    const long long i = (long long)blockIdx.x * kPackThreads + tid;
+    if (tid < kMaxWorld) s_cnt[tid] = 0u;
+    __syncthreads();
+    uint32_t code = W;
+    if (i < n) {
+        const int sv = d.p.sel[i];
+        int f = -1;
+        if (sv >= 0) {
+            f = d.map[dedup_key(d.p, i, sv)];
+            if ((long long)f == i) code = owner_of(sv, d.p.psh, W);
+        }
+        d.first[i] = f;
+        d.place[i] = (int)code;
+    }
+    if (code < W) atomicAdd(&s_cnt[code], 1u);
+    __syncthreads();
+    if (tid < kMaxWorld) d.bcnt[(long long)blockIdx.x * kMaxWorld + tid] = s_cnt[tid];
+}
+
+__global__ void __launch_bounds__(kPackThreads) dedup_pack_kernel(const DedupArgs d) {
+    __shared__ uint32_t s_before[kMaxWorld];
+    __shared__ uint32_t s_warp[kMaxWorld][kPackThreads / 32];
+    __shared__ unsigned long long s_row[kPackThreads];
+    const PackArgs& a = d.p;
+    const uint32_t tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5, W = a.world;
+    const long long n = (long long)a.rows * a.k;
+    const long long i = (long long)blockIdx.x * kPackThreads + tid;
+    if (tid < kMaxWorld) {
+        uint32_t v = 0u;
+        for (uint32_t b = 0; b < blockIdx.x; b++) v += d.bcnt[(long long)b * kMaxWorld + tid];
+        s_before[tid] = v;
+    }
+    const uint32_t o = i < n ? (uint32_t)d.place[i] : W;
+    const uint32_t lt = (1u << lane) - 1u;
+    uint32_t below = 0u;
+#pragma unroll
+    for (int q = 0; q < kMaxWorld; q++) {
+        if ((uint32_t)q < W) {
+            const uint32_t m = __ballot_sync(0xffffffffu, o == (uint32_t)q);
+            if (o == (uint32_t)q) below = __popc(m & lt);
+            if (lane == 0u) s_warp[q][warp] = __popc(m);
+        }
+    }
+    __syncthreads();
+    if (o < W) {
+        uint32_t at = below;
+        for (uint32_t w = 0; w < warp; w++) at += s_warp[o][w];
+        d.place[i] = (int)(s_before[o] + at);
+        if (o == a.rank) {
+            const uint32_t t = (uint32_t)a.sel[i];
+            const long long s = a.rslot ? (long long)a.rslot[i / a.k] : 0;
+            const uint32_t local = (uint32_t)a.table[s * a.pts + (t >> a.psh)];
+            s_row[at] = ((unsigned long long)local << a.psh) | (t & ((1u << a.psh) - 1u));
+        }
+    }
+    uint32_t mine = 0u;
+#pragma unroll
+    for (int w = 0; w < kPackThreads / 32; w++) mine += s_warp[a.rank][w];
+    __syncthreads();
+    const uint32_t wpr = a.row_bytes >> 3;
+    const unsigned long long first = s_before[a.rank];
+    for (uint32_t w = tid; w < mine * wpr; w += kPackThreads) {
+        const uint32_t j = w / wpr;
+        const uint32_t q = w - j * wpr;
+        const uint64_t* src = reinterpret_cast<const uint64_t*>(a.base + s_row[j] * a.row_bytes);
+        reinterpret_cast<uint64_t*>(a.send + (first + j) * a.row_bytes)[q] = src[q];
+    }
+    if (blockIdx.x == gridDim.x - 1 && tid < W) {
+        uint32_t total = s_before[tid];
+#pragma unroll
+        for (int w = 0; w < kPackThreads / 32; w++) total += s_warp[tid][w];
+        a.lens[tid] = (int)(total * a.row_bytes);
+    }
+}
+
+__global__ void __launch_bounds__(256) dedup_tok_kernel(const DedupArgs d) {
+    const long long n = (long long)d.p.rows * d.p.k;
+    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (long long)gridDim.x * blockDim.x) {
+        const int f = d.first[i];
+        if (f < 0) {
+            d.p.tok[i] = -1;
+            continue;
+        }
+        const int sv = d.p.sel[i];
+        d.p.tok[i] = (int)((long long)owner_of(sv, d.p.psh, d.p.world) * n + d.place[f]);
+        if ((long long)f == i) d.map[dedup_key(d.p, i, sv)] = 0x7fffffff;
+    }
+}
+
 }  // namespace dsv41_kvsplit
