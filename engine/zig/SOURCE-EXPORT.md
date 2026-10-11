@@ -3,9 +3,37 @@
 This is a sanitized source snapshot based on TensorFold 1.0.2, upstream revision
 `f8fe17d24629aedabf90bbf78279dd776e6d62e7`, from
 [ashhart/TensorFold](https://github.com/ashhart/TensorFold). The DeepSeek-V4.1 source snapshot revision is
-`74ace4be5cc46f2f7444011433c6fad53ea679a6`, the engine source of the current serving kit. The previous snapshot was
-`8e96f99cc27743bb80f4827ea78b30481e3b4bcc`; before it `55c96c65bf97b8c30455f171e01aec8c59544aeb` and
-`0d723a8275f5b7879a083e8042a7048242ee624c`.
+`9131e10ad17dde51e94a996da8255227727cd224`, the engine source of the current serving kit. The previous snapshots were
+`74ace4be5cc46f2f7444011433c6fad53ea679a6`, `8e96f99cc27743bb80f4827ea78b30481e3b4bcc`,
+`55c96c65bf97b8c30455f171e01aec8c59544aeb` and `0d723a8275f5b7879a083e8042a7048242ee624c`.
+
+## Changes since 74ace4be
+
+Every new engine path below is default-off unless noted.
+
+- **TP RoCE:** every RDMA post is bounds-checked against its slot and memory region before the verb; no RDMA write
+  goes past 1 MiB, and boot refuses a setting that would ask for one (on); `TF_TP_ROCE_CHUNKED_KB` gathers strides
+  past 1 MiB in ops of at most 1 MiB, with an ABI marker the transport fatbin must carry; a failed transport halts its
+  queue pairs, drains them and keeps its region registered until exit (on); `TF_TP_ROCE_VAR_KB` routes
+  variable-length gathers past the small-op cap over RoCE.
+- **Split KV:** `TF_DSV41_KV_SPLIT_DEDUP` sends a slot's row once, `TF_DSV41_KV_SPLIT_EARLY` issues the exchange beside
+  the q group, `TF_DSV41_KV_SPLIT_HISTORY` exchanges a prefill union without a plan or a host sync; split KV runs with
+  four session slots against its own store and pool.
+- **Memory:** `TF_DSV41_ARENA=pack` packs boot's permanent buffers back to back and falls back to plain allocations
+  (saying why) where virtual memory management fails; `TF_DSV41_STREAM_LAZY` holds the stream top-k's scratch only
+  while prompts stream; `TF_DSV41_POST_BOOT_GIB` prices post-boot one-time cost apart from the serving dip;
+  `TF_DSV41_BOOT_TRACE` also logs the kernel memory each boot step grew; `TF_DSV41_EX_STACKS` reads the experts'
+  suh / svh stacks where the weights hold them.
+- **Images:** served models switch images on before the buffer plan is sized, and boot refuses a plan that lacks an
+  image segment's roles (before, the first image request failed with `Unbound`); a window holding an image position
+  fails loudly, since a window's embedding fills no image rows; the aligner's first linear reads the unfold's
+  transposed view, as torch's addmm does, which makes the vision tower bit-exact with the Python reference.
+- **AOT:** a missing Triton variant fails its request instead of both ranks (the window is checked before any launch;
+  on, `TF_DSV41_AOT_GUARD=0` turns it off); `TF_DSV41_AOT_TRACE` writes every lookup; `aot-needs` prices the pool as
+  the served engine does.
+- **Serving:** the boot log names the depth policy in effect.
+- **Tools and tests:** a tower-only vision gate and a 30-image shape sweep; a transport fail-fast check on real HCAs;
+  host tests for the RoCE bounds and cap, the image plan check, the AOT guard and the post-boot reserve.
 
 ## Changes since 8e96f99c
 
