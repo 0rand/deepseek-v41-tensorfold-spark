@@ -406,6 +406,13 @@ pub fn planOptions(f: *const fwd.Forward) block.Options {
     return vision_plan.planOptions(f.opts, f.images, f.image_bias);
 }
 
+/// planOptions without image rows: multi-segment runs and PF_TBO pairs refuse them (image segments run alone).
+pub fn runOptions(f: *const fwd.Forward) block.Options {
+    var o = planOptions(f);
+    o.image_rows = 0;
+    return o;
+}
+
 /// Glue image_split (x [n, D] -> image rows, text rows) / image_merge (the two partials -> [n, D]): rows by the
 /// segment's ids, one copy a run (vision.moe's index_select and its scatter).
 pub fn splitRows(f: *fwd.Forward, r: *run.Runner, c: *const calls.Call, merge: bool) !void {
