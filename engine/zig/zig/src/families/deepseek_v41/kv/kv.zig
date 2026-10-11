@@ -19,6 +19,7 @@ test {
     _ = device;
     _ = @import("split_test.zig");
     _ = @import("union_plan_test.zig");
+    _ = @import("split_roce_test.zig");
     _ = sess;
     _ = @import("sess4_test.zig");
     _ = @import("resend_test.zig");

@@ -3,15 +3,70 @@ const std = @import("std");
 const verbs = @import("verbs");
 const abi = verbs.abi;
 const Verbs = verbs.Verbs;
+const sock = @import("sock.zig");
 
 pub const max_hcas = 2;
 /// Work requests a queue pair holds; at most a quarter outstanding (two requests a stripe), as in roce.cpp.
 const send_depth = 256;
 const flag_stride = 128;
 const link_ethernet = 2;
-const record_magic: u32 = 0x5446_5244 + 1; // roce.cpp's "TFRD", bumped: this record's layout is the Zig engine's
+const record_magic: u32 = 0x5446_5244 + 2; // roce.cpp's "TFRD", bumped: this record's layout is the Zig engine's
 
-pub const Error = error{ NoHca, VerbsFailed, PostFailed, Completion, BadRecord };
+pub const Error = error{ NoHca, VerbsFailed, PostFailed, Completion, BadRecord, OutOfRegion, WriteTooLarge };
+
+/// The largest RDMA write a post may make, whatever the slot (a ~9.6 MB post once faulted the HCA); never raised.
+pub const max_write: u32 = 1 << 20;
+
+/// Bytes posted and not yet completed, every HCA together: a post waits for completions past it; never raised.
+pub const max_inflight: u64 = 2 * @as(u64, max_write);
+/// The flag post's bytes: a u32 on the stack under lkey 0, legal only while the QP sends it inline.
+pub const flag_bytes: u32 = @sizeOf(u32);
+/// The longest `quiesce` waits for the HCAs to flush what was posted.
+pub const quiesce_ns: u64 = 5 * std.time.ns_per_s;
+
+/// Before ibv_reg_mr: no fork shares or copies the region (DONTFORK), its pages stay 4 KiB (NOHUGEPAGE); else no start.
+pub fn prepareRegion(region: []align(std.heap.page_size_min) u8) Error!void {
+    for ([_]u32{ std.posix.MADV.DONTFORK, std.posix.MADV.NOHUGEPAGE }) |advice| std.posix.madvise(region.ptr, region.len, advice) catch |e| {
+        std.log.warn("tp roce: madvise({d}) on the {d} B region failed: {t}; refusing to start", .{ advice, region.len, e });
+        return error.VerbsFailed;
+    };
+}
+
+/// Whether a QP's actual inline capacity takes the flag post.
+pub fn inlineFits(cap: abi.QpCap) bool {
+    return cap.max_inline_data >= flag_bytes;
+}
+
+/// A post that waits on completions this long fails the proxy (a peer or HCA that stopped answering).
+const inflight_wait_ns: u64 = 10 * std.time.ns_per_s;
+const ring_len = send_depth / 4;
+
+/// Both ranks' region layout (roce.zig's): byte offsets and the registered length every post must stay inside.
+pub const Layout = struct { send: u64, recv: u64, flags: u64, slot: u64, len: u64 };
+
+/// One HCA's share of a post: its data stripe in this rank's send slot and the peer's receive slot, and its flag word.
+pub const Stripe = struct { local: u64, remote: u64, len: u32, flag: u64 };
+
+/// Slot `slot`'s first `padded` bytes striped over `n_hca` HCAs; error.OutOfRegion before any verb past a slot or MR.
+pub fn stripes(l: Layout, n_hca: u32, slot: u32, padded: u32, out: *[max_hcas]Stripe) Error!void {
+    if (n_hca == 0 or n_hca > max_hcas or slot > 1) return error.OutOfRegion;
+    if (padded > max_write) return error.WriteTooLarge;
+    if (padded == 0 or padded % 16 != 0 or padded > l.slot) return error.OutOfRegion;
+    const packs = padded / 16;
+    var offset: u64 = 0;
+    for (out[0..n_hca], 0..) |*o, i| {
+        var stripe = packs / n_hca;
+        if (i < packs % n_hca) stripe += 1;
+        o.* = .{ .local = l.send + slot * l.slot + offset, .remote = l.recv + slot * l.slot + offset, .len = stripe * 16, .flag = l.flags + (@as(u64, slot) * max_hcas + i) * flag_stride };
+        if (!within(o.local, o.len, l.send + slot * l.slot, l.slot) or !within(o.remote, o.len, l.recv + slot * l.slot, l.slot)) return error.OutOfRegion;
+        if (!within(o.flag, 4, l.flags, l.send - l.flags) or !within(o.local, o.len, 0, l.len) or !within(o.remote, o.len, 0, l.len)) return error.OutOfRegion;
+        offset += o.len;
+    }
+}
+
+fn within(at: u64, len: u64, lo: u64, size: u64) bool {
+    return at >= lo and at + len <= lo + size;
+}
 
 /// One HCA as configured: its device name and RoCE v2 GID index (null: detected).
 pub const HcaSpec = struct { name: [64]u8 = @splat(0), name_len: u8 = 0, gid: ?u8 = null };
@@ -21,6 +76,9 @@ pub const Record = extern struct {
     magic: u32 = record_magic,
     n_hca: u32 = 0,
     region: u64 = 0,
+    /// The region's slot and registered length: a peer whose layout differs is refused at connect.
+    slot_bytes: u64 = 0,
+    region_len: u64 = 0,
     rkey: [max_hcas]u32 = @splat(0),
     lid: [max_hcas]u32 = @splat(0),
     mtu: [max_hcas]u32 = @splat(0),
@@ -39,6 +97,13 @@ const Hca = struct {
     mtu: u32,
     lid: u16,
     outstanding: u32 = 0,
+    /// Each outstanding post's stripe bytes, oldest at `head` (completions arrive in order).
+    ring: [ring_len]u32 = undefined,
+    head: u32 = 0,
+    inflight: u64 = 0,
+    /// Posts made and their completions reaped (the proxy writes them, others read): equal = nothing in flight.
+    posts: std.atomic.Value(u64) = .init(0),
+    done: std.atomic.Value(u64) = .init(0),
 };
 
 /// Parses `name[:gid],name[:gid]` (TF_TP_ROCE_HCA).
@@ -124,7 +189,12 @@ pub const VerbsWire = struct {
     slot_bytes: usize,
     region: []u8,
     posted: u64 = 0,
+    /// The most stripe bytes in flight at once (posted, not completed), for tests and reports.
+    peak: std.atomic.Value(u64) = .init(0),
     completed: u64 = 0,
+    /// Completions `quiesce` reaped, and those of them flushed (not sent: the QP was in error).
+    reaped: u64 = 0,
+    flushed: u64 = 0,
 
     /// Opens the HCAs, registers `region` on each and creates the queue pairs (INIT); `record` then goes to the peer.
     pub fn open(specs: []const HcaSpec, region: []u8, layout: struct { send: usize, recv: usize, flags: usize, slot: usize }, traffic_class: u8) !VerbsWire {
@@ -164,6 +234,10 @@ pub const VerbsWire = struct {
         var init: abi.QpInitAttr = .{ .send_cq = cq, .recv_cq = cq, .cap = .{ .max_send_wr = send_depth, .max_recv_wr = 1, .max_send_sge = 1, .max_recv_sge = 1, .max_inline_data = 16 }, .qp_type = abi.qpt_rc };
         const qp = api.ibv_create_qp(pd, &init) orelse return error.VerbsFailed;
         errdefer _ = api.ibv_destroy_qp(qp);
+        if (!inlineFits(init.cap)) {
+            std.log.warn("tp roce: {s}'s QP sends {d} B inline, the flag post needs {d}; refusing to start", .{ name, init.cap.max_inline_data, flag_bytes });
+            return error.VerbsFailed;
+        }
         var a: abi.QpAttr = .{ .qp_state = abi.qps_init, .port_num = 1, .qp_access_flags = abi.access_remote_write };
         if (api.ibv_modify_qp(qp, &a, abi.mask.state | abi.mask.pkey_index | abi.mask.port | abi.mask.access_flags) != 0) return error.VerbsFailed;
         w.hcas[w.n_hca] = .{ .ctx = ctx, .pd = pd, .mr = mr, .cq = cq, .qp = qp, .gid_index = gi, .gid = gid.raw, .mtu = @intCast(port.active_mtu), .lid = port.lid };
@@ -184,8 +258,73 @@ pub const VerbsWire = struct {
         w.v.close();
     }
 
+    /// The region and each HCA's keys, this side's and the peer's (a protection error is checked against them).
+    pub fn describe(w: *const VerbsWire, buf: []u8) []const u8 {
+        var out: std.Io.Writer = .fixed(buf);
+        out.print("region 0x{x} len {d}", .{ @intFromPtr(w.region.ptr), w.region.len }) catch return out.buffered();
+        for (w.hcas[0..w.n_hca], 0..) |h, i| {
+            out.print("; HCA {d} lkey 0x{x} rkey 0x{x}, peer region 0x{x} rkey 0x{x}", .{ i, h.mr.lkey, h.mr.rkey, w.peer_region, w.peer_rkey[i] }) catch break;
+        }
+        return out.buffered();
+    }
+
+    /// The QPs to error: the HCAs stop sending and refuse the peer's writes, and what was posted completes as flushed.
+    pub fn halt(w: *VerbsWire) bool {
+        var ok = true;
+        for (w.hcas[0..w.n_hca]) |h| {
+            var a: abi.QpAttr = .{ .qp_state = abi.qps_err };
+            if (w.v.api.ibv_modify_qp(h.qp, &a, abi.mask.state) != 0) ok = false;
+        }
+        return ok;
+    }
+
+    /// `halt`, then every posted request's completion reaped, flushed or not: no request of the region left at an HCA.
+    pub fn quiesce(w: *VerbsWire, timeout_ns: u64) bool {
+        if (!w.halt()) return false;
+        const t0 = sock.nowNs();
+        for (w.hcas[0..w.n_hca]) |*h| while (h.outstanding > 0) {
+            var wc: [32]abi.Wc = undefined;
+            const n = h.ctx.ops.poll_cq(h.cq, 32, &wc);
+            if (n < 0) return false;
+            for (wc[0..@intCast(n)]) |c| w.flushed += @intFromBool(c.status != abi.wc_success);
+            w.reaped += @intCast(n);
+            if (n > 0) w.popped(h, @intCast(n)) else if (sock.nowNs() - t0 > timeout_ns) return false;
+        };
+        return true;
+    }
+
+    /// Every HCA's posts completed: no request of the region at an HCA (readable beside the proxy).
+    pub fn idle(w: *const VerbsWire) bool {
+        for (w.hcas[0..w.n_hca]) |*h| if (h.posts.load(.acquire) != h.done.load(.acquire)) return false;
+        return true;
+    }
+
+    /// Each QP's state as its device reports it (ibv_query_qp), then what `quiesce` reaped and what is still posted.
+    pub fn report(w: *const VerbsWire, buf: []u8) []const u8 {
+        const names = [_][]const u8{ "RESET", "INIT", "RTR", "RTS", "SQD", "SQE", "ERR" };
+        var out: std.Io.Writer = .fixed(buf);
+        for (w.hcas[0..w.n_hca], 0..) |*h, i| {
+            var a: abi.QpAttr = .{};
+            var init: abi.QpInitAttr = undefined;
+            const q = w.v.query_qp orelse {
+                out.print("HCA {d} QP state unknown (no ibv_query_qp); ", .{i}) catch break;
+                continue;
+            };
+            if (q(h.qp, &a, abi.mask.state, &init) != 0) {
+                out.print("HCA {d} QP query failed; ", .{i}) catch break;
+            } else if (a.qp_state >= 0 and a.qp_state < names.len) {
+                out.print("HCA {d} QP {s}; ", .{ i, names[@intCast(a.qp_state)] }) catch break;
+            } else out.print("HCA {d} QP state {d}; ", .{ i, a.qp_state }) catch break;
+            out.print("posted {d}, completed {d}; ", .{ h.posts.load(.acquire), h.done.load(.acquire) }) catch break;
+        }
+        var held: u64 = 0;
+        for (w.hcas[0..w.n_hca]) |h| held += h.outstanding;
+        out.print("reaped {d} (flushed {d}), still posted {d}", .{ w.reaped, w.flushed, held }) catch {};
+        return out.buffered();
+    }
+
     pub fn record(w: *const VerbsWire) Record {
-        var r: Record = .{ .n_hca = w.n_hca, .region = @intFromPtr(w.region.ptr) };
+        var r: Record = .{ .n_hca = w.n_hca, .region = @intFromPtr(w.region.ptr), .slot_bytes = w.slot_bytes, .region_len = w.region.len };
         for (w.hcas[0..w.n_hca], 0..) |h, i| {
             r.rkey[i] = h.mr.rkey;
             r.lid[i] = h.lid;
@@ -200,7 +339,7 @@ pub const VerbsWire = struct {
     /// else the same position.
     pub fn pairing(mine: Record, peer: Record) ![max_hcas]u32 {
         if (peer.magic != record_magic) return error.BadRecord;
-        if (peer.n_hca != mine.n_hca) return error.BadRecord;
+        if (peer.n_hca != mine.n_hca or peer.slot_bytes != mine.slot_bytes or peer.region_len != mine.region_len) return error.BadRecord;
         var out: [max_hcas]u32 = undefined;
         for (0..mine.n_hca) |i| {
             out[i] = @intCast(i);
@@ -234,25 +373,31 @@ pub const VerbsWire = struct {
     /// Slot `slot`'s first `padded` bytes (a multiple of 16) to the peer's receive slot, striped over the HCAs, each
     /// stripe followed by `seq` at that HCA's flag on the same queue pair (so the flag cannot land first).
     pub fn post(w: *VerbsWire, slot: u32, seq: u32, padded: u32) !void {
-        const packs = padded / 16;
-        var offset: u64 = 0;
+        var plan: [max_hcas]Stripe = undefined;
+        try stripes(w.regionLayout(), w.n_hca, slot, padded, &plan);
+        while (w.inflight() + padded > max_inflight) try w.reapWait();
         var seq_copy = seq;
-        for (w.hcas[0..w.n_hca], 0..) |*h, i| {
-            while (h.outstanding >= send_depth / 4) try w.reapHca(h);
-            var stripe = packs / w.n_hca;
-            if (i < packs % w.n_hca) stripe += 1;
-            const bytes: u32 = stripe * 16;
+        for (w.hcas[0..w.n_hca], plan[0..w.n_hca], 0..) |*h, s, i| {
+            while (h.outstanding >= ring_len) try w.reapHca(h);
             var flag_sge: abi.Sge = .{ .addr = @intFromPtr(&seq_copy), .length = 4, .lkey = 0 };
-            var flag_wr: abi.SendWr = .{ .wr_id = seq, .sg_list = @ptrCast(&flag_sge), .num_sge = 1, .opcode = abi.wr_rdma_write, .send_flags = abi.send_signaled | abi.send_inline, .remote_addr = w.peer_region + w.flag_off + (@as(u64, slot) * max_hcas + i) * flag_stride, .rkey = w.peer_rkey[i] };
-            var data_sge: abi.Sge = .{ .addr = @intFromPtr(w.region.ptr) + w.send_off + slot * w.slot_bytes + offset, .length = bytes, .lkey = h.mr.lkey };
-            var data_wr: abi.SendWr = .{ .wr_id = seq, .next = &flag_wr, .sg_list = @ptrCast(&data_sge), .num_sge = 1, .opcode = abi.wr_rdma_write, .send_flags = 0, .remote_addr = w.peer_region + w.recv_off + slot * w.slot_bytes + offset, .rkey = w.peer_rkey[i] };
+            var flag_wr: abi.SendWr = .{ .wr_id = seq, .sg_list = @ptrCast(&flag_sge), .num_sge = 1, .opcode = abi.wr_rdma_write, .send_flags = abi.send_signaled | abi.send_inline, .remote_addr = w.peer_region + s.flag, .rkey = w.peer_rkey[i] };
+            var data_sge: abi.Sge = .{ .addr = @intFromPtr(w.region.ptr) + s.local, .length = s.len, .lkey = h.mr.lkey };
+            var data_wr: abi.SendWr = .{ .wr_id = seq, .next = &flag_wr, .sg_list = @ptrCast(&data_sge), .num_sge = 1, .opcode = abi.wr_rdma_write, .send_flags = 0, .remote_addr = w.peer_region + s.remote, .rkey = w.peer_rkey[i] };
             var bad: ?*abi.SendWr = null;
-            const first: *abi.SendWr = if (bytes > 0) &data_wr else &flag_wr;
+            const first: *abi.SendWr = if (s.len > 0) &data_wr else &flag_wr;
             if (h.ctx.ops.post_send(h.qp, first, &bad) != 0) return error.PostFailed;
+            h.ring[(h.head + h.outstanding) % ring_len] = s.len;
             h.outstanding += 1;
-            offset += bytes;
+            h.inflight += s.len;
+            _ = h.posts.fetchAdd(1, .release);
         }
+        if (w.inflight() > w.peak.load(.monotonic)) w.peak.store(w.inflight(), .monotonic);
         w.posted += 1;
+    }
+
+    /// This rank's layout; the MR covers `region` exactly and the peer's record matched it at connect.
+    pub fn regionLayout(w: *const VerbsWire) Layout {
+        return .{ .send = w.send_off, .recv = w.recv_off, .flags = w.flag_off, .slot = w.slot_bytes, .len = w.region.len };
     }
 
     fn reapHca(w: *VerbsWire, h: *Hca) !void {
@@ -263,8 +408,35 @@ pub const VerbsWire = struct {
             std.log.err("tp roce: RDMA write of seq {d} failed: {s} (vendor 0x{x})", .{ c.wr_id, w.v.statusText(c.status), c.vendor_err });
             return error.Completion;
         };
-        h.outstanding -= @intCast(n);
-        w.completed += @intCast(n);
+        w.popped(h, @intCast(n));
+    }
+
+    fn popped(w: *VerbsWire, h: *Hca, n: u32) void {
+        for (0..n) |_| {
+            h.inflight -= h.ring[h.head];
+            h.head = (h.head + 1) % ring_len;
+        }
+        h.outstanding -= n;
+        w.completed += n;
+        _ = h.done.fetchAdd(n, .release);
+    }
+
+    /// Bytes posted and not yet completed over every HCA.
+    pub fn inflight(w: *const VerbsWire) u64 {
+        var sum: u64 = 0;
+        for (w.hcas[0..w.n_hca]) |h| sum += h.inflight;
+        return sum;
+    }
+
+    /// Reaps until some post completes (error.Completion when none does within `inflight_wait_ns`).
+    fn reapWait(w: *VerbsWire) !void {
+        const before = w.completed;
+        const t0 = sock.nowNs();
+        while (w.completed == before) {
+            try w.reap();
+            if (w.completed == before and sock.nowNs() - t0 > inflight_wait_ns) return error.Completion;
+            std.atomic.spinLoopHint();
+        }
     }
 
     /// Reap every HCA's completions (after each op, and in the proxy's idle loop).
