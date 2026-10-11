@@ -221,12 +221,16 @@ fn vmFlags(at: usize, buf: []u8) ![]const u8 {
         if (got <= 0) break;
         n += @intCast(got);
     }
-    var head: [32]u8 = undefined;
-    const want = try std.fmt.bufPrint(&head, "{x}-", .{at});
+    // the mapping holding `at`: once its flags match a neighbour's, the kernel may merge the two, so it can start below
     var lines = std.mem.splitScalar(u8, buf[0..n], '\n');
     var inside = false;
     while (lines.next()) |l| {
-        if (std.mem.startsWith(u8, l, want)) inside = true;
+        const sp = std.mem.indexOfScalar(u8, l, ' ') orelse l.len;
+        if (std.mem.indexOfScalar(u8, l[0..sp], '-')) |dash| {
+            const lo = std.fmt.parseInt(usize, l[0..dash], 16) catch continue;
+            const hi = std.fmt.parseInt(usize, l[dash + 1 .. sp], 16) catch continue;
+            inside = lo <= at and at < hi;
+        }
         if (inside and std.mem.startsWith(u8, l, "VmFlags:")) return l;
     }
     return error.NotFound;
