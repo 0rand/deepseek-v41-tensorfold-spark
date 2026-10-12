@@ -9,7 +9,8 @@ The recommended pack is **q28-v2 EXL3 2.8 bpw**:
 (publication pending; repository name provisional). Serve across two NVIDIA DGX Sparks, TP=2 over the 200 Gb/s CX7
 link, behind an OpenAI-compatible API.
 
-The new [CUDA Zig serving path](docs/ZIG-SERVE.md) is based on TensorFold 1.0.2 plus the DeepSeek CUDA port.
+The [CUDA Zig serving path](docs/ZIG-SERVE.md) exports engine `9131e10a`, based on TensorFold 1.0.2 plus the DeepSeek CUDA port,
+with split KV, a shared 3.0M-token pool and native images. The latest measured gates and earlier benchmarks are separated below.
 Its source is included in [`engine/zig`](engine/zig), with the Apache-2.0 upstream license and provenance.
 The serving profile (4K prefill, the engine's own boot calibration) and generated AOT asset preparation are documented there. The existing Python
 recipe remains TensorFold 0.6.0 plus the two published patches, with exact DSpark speculative decoding, CED replay,
@@ -19,32 +20,67 @@ predate the q28-v2 ragged-expert loader; keep their original 2.9 bpw pack until 
 > **Work in progress.** Measured on one pair of Sparks, against one baseline. Read
 > [what is not solved](docs/KNOWN-ISSUES.md) before relying on it.
 
-## Current q28-v2 results: Zig vs Python
+## Latest merged kit: split KV and native images
 
-Two DGX Spark nodes, TP=2 over RoCE, q28-v2. Zig with the [serving profile](config/prod-zig.env.example) against a
-fresh same-night run of the Python serving path; **best of 3** warm repetitions for both engines (medians, first
-repetitions and cold runs in [the full results](docs/ZIG-RESULTS.md)). Decode tok/s; ×4 is the four-stream aggregate.
+Two DGX Sparks (GB10, 128 GB each), TP=2 over CX7/RoCE, q28-v2 EXL3 2.8 bpw. Engine `9131e10a`,
+2026-10-11 09:22–09:28 UTC; same-window baseline: prior Zig kit `17add462`. **One warm repetition**, code workload;
+×4 is the all-four-live decode aggregate. This text gate ran **before images were enabled**.
+Sources: [merged #24](https://github.com/jayleaton/deepseek-v41-tensorfold-spark/pull/24) and
+[the selected receipts](docs/README-STATS.md). These are not comparisons with Python or vLLM.
 
-| Cell | Python | Zig | Δ |
+| Text gate | Prior kit `17add462` | Kit `9131e10a` | Reported Δ |
 | --- | ---: | ---: | ---: |
-| code T0 ×1 | 88.0 | 90.3 | +2.6 % |
-| code T0 ×4 | 144.1 | 156.4 | +8.6 % |
-| code T0.7 ×1 | 91.3 | 92.2 | +1.0 % |
-| code T0.7 ×4 | 145.0 | 153.0 | +5.6 % |
-| prose T0 ×1 | 53.8 | 54.7 | +1.7 % |
-| prose T0 ×4 | 98.2 | 104.7 | +6.6 % |
-| prose T0.7 ×1 | 49.6 | 50.6 | +2.1 % |
-| prose T0.7 ×4 | 97.9 | 103.3 | +5.6 % |
-| 32K prompt (tok/s, 3 cold prefills) | 2,440 | 2,686 | +10.1 % |
-| 131K prompt (tok/s, 3 cold prefills) | 2,264 | 2,496 | +10.3 % |
-| 32K decode | 63.5 | 63.6 | +0.2 % |
-| 131K decode | 67.0 | 69.3 | +3.3 % |
-| mix: code ×4 aggregate beside a 131K stream | 145.1 | 155.9 | +7.5 % |
-| mixed windows: aggregate | 143.4 | 155.1 | +8.2 % |
+| code T0 ×1 (tok/s) | 87.11 | 86.96 | −0.2 % |
+| code T0 ×4 (tok/s) | 146.91 | 148.03 | +0.8 % |
 
-Zig is ahead in every cell: +5.6 to +8.6 % on four-stream code, +1.0 to +2.6 % on one-stream code, +10 % on long
-prompts, +3.3 % on 131K decode. Replies are identical (16/16 short replies, and the long reply hashes). One pair of
-nodes, one night: treat differences of a few percent as indicative.
+On the same hardware and engine, 2026-10-11: the text gate matched 16/16 replies and the long-context hashes.
+The subsequent native-image gate passed 75/75 outputs (25 requests, three repetitions), VQA 20/20, and a
+120-minute soak had 24/24 clean five-minute checks, with text and image probes passing at start and end.
+One text prompt has a known T0 near-tie (`shorter` / `short`); the 75 image outputs were exact.
+
+| Capacity / profile | Value | Evidence scope |
+| --- | ---: | --- |
+| Shared split-KV pool observed at boot | 3,000,320 token positions | `9131e10a`, 2026-10-11; both ranks report the same logical capacity, not twice the pool |
+| Requested pool in the profile | 3,000,000 tokens | [Serving profile](config/prod-zig.env.example); boot capacity includes allocation granularity |
+| Configured context per slot / slots | 1,048,576 tokens / 4 | Configuration, not a receipt for four full-context requests |
+| Long requests completed (serial prefill) | 996,011 tokens ×2; about 740K tokens ×4 | Earlier merged engine `74ace4be`, 2026-10-10, same two Sparks; images off |
+| NVMe resume in that long-context gate | 1.3 s; 996,000 of 996,011 prompt tokens cached | `74ace4be`, 2026-10-10; restored reply identical |
+
+[Merged #26](https://github.com/jayleaton/deepseek-v41-tensorfold-spark/pull/26) fixes host-side image run planning;
+it supplies no new Spark speed measurement. No newer complete prefill, draft-acceptance-rate or startup-latency
+measurement is claimed for `9131e10a`.
+
+## Earlier q28-v2 benchmark: exported Zig engine and Python reference
+
+Two DGX Sparks (GB10, 128 GB each), TP=2 over CX7/RoCE, q28-v2 EXL3 2.8 bpw, replicated 1.4M pool,
+placeholder images, 4K prefill and Zig boot calibration. The latest complete gated rerun of the engine exported in
+[merged #18](https://github.com/jayleaton/deepseek-v41-tensorfold-spark/pull/18) is `8e96f99c`,
+2026-10-10 07:44–08:01 UTC. Zig figures are **best / median of three** warm repetitions; prompt rows use three cold
+prefills. Python `8474f31` figures retain the earlier night's reference measurement. This is not a fresh paired
+comparison with the current split-KV kit. [Receipt provenance and the old→new table](docs/README-STATS.md).
+
+| Cell | Python best (earlier run) | Zig `8e96f99c` best / median |
+| --- | ---: | ---: |
+| code T0 ×1 | 88.0 | 90.68 / 90.39 |
+| code T0 ×4 | 144.1 | 155.55 / 154.73 |
+| code T0.7 ×1 | 91.3 | 92.48 / 92.16 |
+| code T0.7 ×4 | 145.0 | 152.74 / 152.27 |
+| prose T0 ×1 | 53.8 | 54.87 / 54.66 |
+| prose T0 ×4 | 98.2 | 104.90 / 103.00 |
+| prose T0.7 ×1 | 49.6 | 50.67 / 50.57 |
+| prose T0.7 ×4 | 97.9 | 102.85 / 101.62 |
+| 32K prompt (tok/s) | 2,440.2 | 2,689.6 / 2,687.1 |
+| 131K prompt (tok/s) | 2,263.5 | 2,497.0 / 2,495.6 |
+| 32K / 131K time to first token (s, best) | 15.56 / 68.12 | 14.12 / 61.75 |
+| 32K decode | 63.47 | 64.75 / 63.41 |
+| 131K decode | 67.04 | 68.42 / 68.34 |
+| mix: code ×4 aggregate beside a 131K stream | 145.10 | 156.21 / 155.55 |
+| mixed windows: aggregate | 143.39 | 155.70 / 155.69 |
+
+The 32K / 131K workload labels encode to 37,974 / 154,183 prompt tokens. The rerun matched all 16 short replies and
+the long reply hashes, including salted passes. Its historical Python reference was not rerun with it, so the old
+percentage column and the claim that those percentages describe the current kit have been removed.
+[ZIG-RESULTS](docs/ZIG-RESULTS.md) retains the original earlier comparison and its cold/first-repetition detail.
 
 ## Historical 2.9 bpw results: Python vs vLLM
 
@@ -54,7 +90,8 @@ there are no new vLLM measurements for the Zig path here.
 Two DGX Sparks (GB10, 128 GB each, one QSFP cable, RoCE), weights
 [`dealignai/DeepSeek-V4.1-Flash-UNCENSORED-EXL3-2.9bpw`](https://huggingface.co/dealignai/DeepSeek-V4.1-Flash-UNCENSORED-EXL3-2.9bpw).
 Baseline: [MiaAI-Lab's 2x DGX Spark vLLM kit](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-EXL3-2x-DGX-Sparks) on
-the same pair and weights. Ours: [`config/prod.env.example`](config/prod.env.example) on engine `7bd2d67` (G19).
+the same pair and weights, measured 2026-10-01. Ours: [`config/prod.env.example`](config/prod.env.example) on
+engine `7bd2d67` (G19), 2026-10-05. No newer matched vLLM gate is available; these historical values are retained.
 
 ### Speed (tok/s)
 
@@ -71,9 +108,17 @@ the same pair and weights. Ours: [`config/prod.env.example`](config/prod.env.exa
 | Start to ready | **34-44 s** | 378 s | ~9x |
 
 Decode: mean of 2 boots of the shipped build. Prefill: 8K / 32K on the shipped `TF_DSV41_PREFILL_ADAPT_GIB=4.5`,
-64K / 128K on the soaked 4.0. Start to ready not re-measured since G11.
+64K / 128K on the soaked 4.0. Start to ready retains engine `38f6500` (G10/G11), 2026-10-03; it was not re-measured.
 
 ### Quality and robustness
+
+Historical Python gates on the same two GB10 Sparks, 128 GB each, TP=2 over CX7/RoCE, 2026-10-02 to 10-05.
+These are not fresh measurements on the Zig kit. Engine/date provenance: `767ad9f` (G13), 2026-10-03 for the original
+top-1, MMLU and tool-chain gates; `0bdd276` (G17), 2026-10-04 for the top-1 recheck; `6e03615` plus the native-image cap (G16), 2026-10-04 for
+MMLU and tool-chain rechecks; `e87e813` (G7), 2026-10-02 for needles and the preamble MMLU; `38f6500` (G10),
+2026-10-03 for structured output; `6e03615` (G15b), 2026-10-04 for images; and `7bd2d67` (G19), 2026-10-05 for soak
+and stress. Details and per-gate limits: [METHOD](docs/METHOD.md) and [campaign receipts](docs/campaign/README.md).
+Top-1 agreement is not a draft-acceptance fraction. The historical figures below have no newer comparable merged gate.
 
 | | **TensorFold** | kit |
 | --- | --- | --- |
