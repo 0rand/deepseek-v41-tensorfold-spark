@@ -42,7 +42,7 @@ What it needs beyond the general Zig setup ([ZIG-SERVE](ZIG-SERVE.md)):
 ## Recommended serving profile
 
 [`config/prod-zig-flash17.env.example`](../config/prod-zig-flash17.env.example) is the q28-v2 serving profile with
-only these changes. Engine Zig `9131e10a` (the exported [`engine/zig`](../engine/zig)), TP=2, four slots, 1M context,
+only these changes, served behind the thermal and memory guard. Engine Zig `9131e10a` (the exported [`engine/zig`](../engine/zig)), TP=2, four slots, 1M context,
 split + compact KV, expert top-p 0.85 / min 3, native images, 4K prefill, floors 5 / 4 GiB and the 3.0 GiB serving dip
 are all unchanged.
 
@@ -53,11 +53,21 @@ are all unchanged.
 | `PREPARED_DIR` / `STATE_DIR` | q28-v2's | **its own** | prepared files and calibration belong to one pack |
 | `TF_DSV41_BIAS_VL` | `/cache/dsv41-bias-vl` | **`/model`** | the 1017 learned image biases |
 | `TF_DSV41_POOL_TOKENS` | 3000000 | **2100000** | memory headroom ([below](#memory-the-21m-pool)) |
+| `TF_DSV41_PF_WS_FLOOR_GIB` | 3.5 | **4.75** | a planned 4K workspace stays above the 4 GiB floor |
+| `TF_CUDA_SCHED` | unset | **`blocking`** | the host sleeps instead of spinning while it waits for the GPU |
+| `TF_DSV41_PLAN_PIN` | `auto` | **`1`**, inside `CPUSET_CPUS` | plan thread on a chosen host CPU |
+| `CPUSET_CPUS` | unset | **host CPUs from your topology** | [host CPU affinity](OPERATIONS.md#zig-serving-thermal-and-memory-guard) |
+| `PORT` | 8000 | **8001** | the guard serves 8000 and forwards to the engine |
 
 We suggest a 2100-2200 MHz GPU clock cap (`nvidia-smi -lgc 300,2100`) to help with temperature control.
 
-Each path key is set per node, so the profile changes nine entries from q28-v2's: model, prepared, Engram and state
-folders on each of the two nodes, plus `TF_DSV41_BIAS_VL`; and the pool.
+The full profile, with the guard, was qualified over a 3-hour soak of long agentic sessions up to ~156K tokens with
+RAM resume, 322 requests, no errors. Setup, the guard and the watchdog are in
+[OPERATIONS](OPERATIONS.md#zig-serving-thermal-and-memory-guard); qualify your own machines before you rely on it
+([Qualifying your own setup](OPERATIONS.md#qualifying-your-own-setup)).
+
+Each path key is set per node, so beyond the settings above the profile changes model, prepared, Engram and state
+folders on each of the two nodes, plus `TF_DSV41_BIAS_VL`.
 
 With a 2.1M-token pool, one slot can still fill its 1M context and two slots 1M each; four live slots share about
 525K each. The pool is shared across live slots, not reserved per slot.

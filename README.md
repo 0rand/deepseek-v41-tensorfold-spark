@@ -73,6 +73,10 @@ scripts/run-zig.sh 1 --check-aot && scripts/run-zig.sh 1   # rank 1 node; then t
 - Pack the **1017 Engram shards** with `scripts/pack_engram.py` ([INSTALL step 3](docs/INSTALL.md), with
   `deepseek-ai/DeepSeek-V4.1-Flash-1017` as the source); the September shards do not match this pack.
 - We suggest a 2100-2200 MHz GPU clock cap (`nvidia-smi -lgc 300,2100`) to help with temperature control.
+- Serve it behind the thermal and memory guard, with the profile's 4.75 GiB workspace floor, blocking host waits and a
+  host CPU set chosen from your own topology: [OPERATIONS](docs/OPERATIONS.md#zig-serving-thermal-and-memory-guard).
+  The full profile was qualified over a 3-hour soak of long agentic sessions up to ~156K tokens with RAM resume,
+  322 requests, no errors; [qualify your own setup](docs/OPERATIONS.md#qualifying-your-own-setup) before relying on it.
 - Check the answer to `What is 17 * 23?` is 391 before serving traffic.
 
 ## Rollback to q28-v2
@@ -96,7 +100,7 @@ in [INSTALL](docs/INSTALL.md).
 | [PREVIOUS-RESULTS](docs/PREVIOUS-RESULTS.md) | q28-v2 kit results and the historical 2.9 bpw Python vs vLLM tables |
 | [INSTALL](docs/INSTALL.md) | requirements, weights, Engram shards, the Python recipe, watchdog |
 | [API](docs/API.md) / [IMAGES](docs/IMAGES.md) | endpoints, thinking and effort, image input |
-| [OPERATIONS](docs/OPERATIONS.md) | settings, memory gates, turning each lever off |
+| [OPERATIONS](docs/OPERATIONS.md) | settings, memory gates, the thermal and memory guard, the Zig watchdog |
 | [METHOD](docs/METHOD.md) / [RESULTS](docs/RESULTS.md) / [BENCHMARKS](docs/BENCHMARKS.md) | how it was measured, every table, how to rerun |
 | [CHANGELOG](docs/CHANGELOG.md) | bug fixes and new levers since G13 |
 | [KNOWN-ISSUES](docs/KNOWN-ISSUES.md) | what is not solved |

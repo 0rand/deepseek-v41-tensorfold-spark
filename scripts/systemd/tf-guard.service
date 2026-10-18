@@ -1,0 +1,17 @@
+# The thermal / memory guard front (scripts/guard/daemon.py) on the rank 0 node: listens on the public port, forwards
+# to the engine on its loopback port. Install as a user unit (docs/OPERATIONS.md); WorkingDirectory is this checkout.
+[Unit]
+Description=TensorFold Zig thermal and memory guard
+After=tf-guard-sampler.service
+Wants=tf-guard-sampler.service
+
+[Service]
+WorkingDirectory=%h/deepseek-v41-tensorfold-spark
+ExecStart=/usr/bin/env python3 scripts/guard/daemon.py --config %h/.config/tf-guard/guard.json
+Restart=on-failure
+RestartSec=5
+# exit 78: invalid config or durable state; do not loop on it
+RestartPreventExitStatus=78
+
+[Install]
+WantedBy=default.target

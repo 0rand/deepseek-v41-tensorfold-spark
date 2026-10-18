@@ -148,6 +148,112 @@ Host memory and stalls (G12; defaults in brackets):
 - Before benchmarks with `scripts/serve.sh run`, stop the server and the watchdog timer
   (`systemctl --user stop dsv41-tf-watchdog.timer`), or set `WATCH_LEASE` and touch the file.
 
+## Zig serving: thermal and memory guard
+
+The qualified flash17 profile ([`config/prod-zig-flash17.env.example`](../config/prod-zig-flash17.env.example)) is
+served behind a guard on the rank 0 node: the engine listens on `127.0.0.1:8001` (`PORT=8001`) and the guard front on
+`127.0.0.1:8000` (put your proxy in front of 8000). It was qualified over a 3-hour soak of long agentic sessions up to
+~156K tokens with RAM resume, 322 requests, no errors.
+
+What it does (`scripts/guard`, standard-library Python 3.11+, no packages):
+
+- **Policy.** A two-node sampler (`sampler.py`, every 2 s; rank 1 over `WORKER_SSH`) records `MemAvailable` and the
+  hottest thermal zone. A fresh sample at or above 94 °C or under 4 GiB on either node is a hard STOP: the guard
+  cancels in-flight requests, stops both owned containers and holds the watchdog timers. 92 °C pauses admission until
+  both nodes are at or below 88 °C; 90 °C held for 600 s, or a fourth pause within 1800 s, asks for one step down the
+  clock ladder; a step requested at the last cap is a terminal STOP. Stale or missing telemetry blocks admission.
+- **Clock ladder.** `clock_ladder_mhz` in the guard config lists the caps the guard may walk down, highest first
+  (`[2100, 2000]` in the example; the first entry must match the cap service at first start). A step runs only with
+  both nodes idle, at or below 88 °C, and both container identities rechecked before each node's change; it rewrites
+  the cap service's drop-in and restarts it. The guard never raises a cap.
+- **Admission cooldown.** Separate from the policy: new requests wait once either node reaches
+  `prefill_admission_pause_c` (78) until both are at or below `prefill_admission_resume_c` (70). An answer already
+  streaming is not paused.
+- **Memory-reservation queue.** Requests are admitted in FIFO order, one prefill at a time. A request is admitted only
+  when fresh samples from both nodes cover 4.25 GiB plus every retained reservation plus its own reserve
+  (`memory_transient_reserve_gib`, 0.5), and the next admission waits for samples taken after the previous request's
+  first generated token. A reservation is kept until the engine finishes the request. A client that disconnects is
+  cancelled at once, whether it is queued, waiting silently for its first token or streaming. When the guard cannot
+  prove the engine finished a request (a cut stream), it keeps that reservation and admits nothing new until the
+  engine reports idle (reconciliation). `/__thermal/status` shows the queue, each waiter's reason and the
+  reservations.
+- **Identity fences.** Generation is forwarded only while the serving env file's SHA-256 matches a snapshotted
+  profile and both containers still have that profile's image, mounts, inference environment and host CPU set.
+- **Durable STOP evidence.** Before it cancels anything, a STOP writes (fsync) the raw and validated per-node samples,
+  the exact conditions with rank and value, the in-flight count and each active request's body hash and prompt token
+  count to the state file and `events.jsonl`. After the containers stop, resumed-token counts from the engine log are
+  added only where they match one request unambiguously; anything else stays explicitly unknown. A STOP survives
+  restarts and reboots; the watchdog does not heal through it.
+
+Setup on the rank 0 node:
+
+1. **Clock cap service, on each node** (system units). Install
+   [`scripts/systemd/tf-gpu-clock-cap.service`](../scripts/systemd/tf-gpu-clock-cap.service) in
+   `/etc/systemd/system/` and write the drop-in `/etc/systemd/system/tf-gpu-clock-cap.service.d/cap.conf` with exactly
+   these four lines (the guard checks them byte for byte before a step):
+
+   ```ini
+   [Unit]
+   Description=GPU SM clock cap (300-2100 MHz)
+   [Service]
+   ExecStart=
+   ExecStart=/usr/bin/nvidia-smi -lgc 300,2100
+   ```
+
+   then `sudo systemctl daemon-reload && sudo systemctl enable --now tf-gpu-clock-cap.service`.
+   We suggest a 2100-2200 MHz GPU clock cap to help with temperature control. Whichever cap you pick is the first
+   ladder entry. The guard's user needs passwordless `sudo -n python3` on both nodes for a step down.
+2. **Host CPU affinity.** Read your topology on each node (`lscpu -e=CPU,CORE,MAXMHZ` and
+   `/sys/devices/system/cpu/cpu*/cpu_capacity`). Choose a set of host CPUs for the engine, the same on both nodes,
+   leaving the rest to the OS, docker and the network, and set `CPUSET_CPUS` (docker `--cpuset-cpus` syntax, such as
+   `<first>-<last>,<first>-<last>`) in `config/prod-zig.env` on both nodes. Set `TF_DSV41_PLAN_PIN` to one CPU inside
+   that set. The CPU numbers are specific to each machine; do not copy them from another host.
+3. **Start the pair** with the profile (`scripts/run-zig.sh 1`, then `scripts/run-zig.sh 0`) and check it idles
+   healthy on `http://127.0.0.1:8001/health`.
+4. **Guard config.** Copy [`config/guard.example.json`](../config/guard.example.json) to
+   `~/.config/tf-guard/guard.json`, set its paths, `worker_ssh` and `production_config` (this node's
+   `config/prod-zig.env`), then snapshot the running pair into it:
+   `python3 scripts/guard/profile.py --config ~/.config/tf-guard/guard.json --write`.
+5. **Services.** Install [`tf-guard-sampler.service`](../scripts/systemd/tf-guard-sampler.service) and
+   [`tf-guard.service`](../scripts/systemd/tf-guard.service) as user units and enable them. On the first start the
+   guard creates its durable state from the actual cap.
+
+Watchdog for the Zig pair: [`scripts/watch-zig.sh`](../scripts/watch-zig.sh), run every minute by
+[`tf-zig-watchdog.timer`](../scripts/systemd/tf-zig-watchdog.timer). It keeps the cadence and failure handling above
+(`WATCH_FAILS`, `WATCH_MIN_HEAL`, fail-fast exit 70) with two changes:
+
+- **Idle-only generation probes.** Every `WATCH_PROBE_EVERY` s (180) one tiny completion (`max_tokens` 1, header
+  `X-TF-Probe: watchdog`) checks that a `/health` 200 is not a wedged engine. The probe is skipped while every slot is
+  busy, and the guard answers it `429 watchdog_deferred` instead of queueing it behind user work, a waiting request or
+  an admission hold, so load and cooling are never counted as failures. `WATCH_PROBE_FAILS` (3) real failures in a row
+  heal on that tick.
+- **Bounded startup-503 retry.** The engine can report `stalled` for a request that started prefill under 3 s ago
+  (see [KNOWN-ISSUES](KNOWN-ISSUES.md)). Only that exact shape is rechecked, for at most 3 s; a real healthy 200
+  clears it, anything else heals as a stall.
+
+Set `GUARD_CONFIG` so ticks and heals obey the guard (no heal through a STOP, hold or stale telemetry), and
+`WATCH_HEAL=1` with `WATCH_RESTART_CMD` (your command that restarts both ranks) to let it restart the pair. Touch
+`WATCH_STATE_DIR/stopped` when you stop the pair on purpose, or use `WATCH_LEASE` while you benchmark.
+
+**After a STOP.** Read the evidence first (`curl -s 127.0.0.1:8000/__thermal/status`, the `HARD_STOP` / `FLOOR_STOP`
+and `STOP_REQUEST_CONTEXT` lines of `events.jsonl`). The same profile is not restarted automatically and cannot be
+reset. Change what the evidence points at (for a memory STOP, a smaller `TF_DSV41_POOL_TOKENS`), start that profile,
+snapshot it (`profile.py --write`), restart `tf-guard`, and run
+`python3 scripts/guard/control.py --config <guard.json> prepare-profile --sha <new-sha>` and then
+`authorize-profile --sha <new-sha>`. Both wait (bounded) for the nodes to cool and the pair to idle; authorization
+checks both identities and the engine's boot memory forecast, and the STOP stays in the archived history. A changed
+`clock_ladder_mhz` is refused against existing state; move the state file aside (keep it) to start a new ladder.
+An operator lease (touch `lease_path`) makes the guard stand aside and refuse generation while it is fresh.
+
+### Qualifying your own setup
+
+The profile was qualified on our two Sparks, in our room, at our cap, for long agentic sessions up to ~156K tokens
+with RAM resume. It is not a guarantee for other machines or loads. Before you
+rely on it: start below your highest cap, keep the guard on, and soak your own traffic shape (longest sessions, RAM
+resumes, the most clients you will offer) for several hours while you watch `events.jsonl` and `/__thermal/status`.
+Treat any pause, step-down or STOP as a reason to change the profile, not to raise a threshold. Requalify after a
+change of cap, pool, room temperature, session length or concurrency.
+
 ## Logs and state
 
 - `docker logs dsv41-tf-r0` / `scripts/serve.sh logs 1`; the `[boot]` lines time each start phase.

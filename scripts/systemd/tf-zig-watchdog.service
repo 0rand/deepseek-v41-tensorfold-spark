@@ -1,0 +1,19 @@
+# One watchdog tick for the Zig pair (scripts/watch-zig.sh --once), run by tf-zig-watchdog.timer. Healing:
+# WATCH_HEAL=1 with WATCH_RESTART_CMD (how you restart both ranks). GUARD_CONFIG makes it obey the guard's lifecycle.
+[Unit]
+Description=TensorFold Zig watchdog tick
+After=network-online.target docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/deepseek-v41-tensorfold-spark
+Environment=CONFIG=config/prod-zig.env
+# Environment=GUARD_CONFIG=%h/.config/tf-guard/guard.json
+# Environment=WATCH_HEAL=1
+# Environment=WATCH_RESTART_CMD=<your command that restarts both ranks>
+ExecStart=/usr/bin/env bash scripts/watch-zig.sh --once
+# an unhealthy tick is logged, not a unit failure that trips start limits
+SuccessExitStatus=1
+# the heal runs detached: keep it alive when the oneshot exits
+KillMode=process
+TimeoutStartSec=120

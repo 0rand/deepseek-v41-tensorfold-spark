@@ -1,0 +1,14 @@
+# GPU SM clock cap, applied at boot (system unit, on EACH node). The cap itself lives in the drop-in
+# /etc/systemd/system/tf-gpu-clock-cap.service.d/cap.conf (docs/OPERATIONS.md, guard setup), which the guard
+# rewrites one ladder step down when its policy asks for it. Pick the starting cap for your own room.
+[Unit]
+Description=GPU SM clock cap
+After=nvidia-persistenced.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/nvidia-smi -lgc 300,2100
+
+[Install]
+WantedBy=multi-user.target

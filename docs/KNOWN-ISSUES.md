@@ -24,6 +24,10 @@
   on a 1-row window in the graph. (`TF_DSV41_BRANCHES`, off in G13, is on since G14 on dedicated priority streams.)
 - **Strict mode on the current engine** (every precision trade off, `full` prefill with the cone) has not been
   measured; the strict numbers above are G13's.
+- **The engine's `/health` can report a false `stalled` at the start of work.** When a request starts prefill after
+  an idle period, the native stall check can read the old idle round clock and answer 503 `stalled` ("no round for N s
+  with work in flight") for a request under 3 s old. The fix belongs in the engine; until then
+  `scripts/watch-zig.sh` rechecks only that exact shape for at most 3 s before treating it as a stall.
 - **`/health`** reports `drafted_total` / `accepted_total` as 0 for this family (the counters are not wired).
 - **No trimmed draft-head vocabulary is shipped** (`TF_DSV41_DRAFT_HEAD=trim`, off by default and not adopted). The
   development ranking was counted from private chat transcripts and is excluded, so `trim` needs

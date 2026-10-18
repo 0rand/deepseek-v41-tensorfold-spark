@@ -1,0 +1,12 @@
+# Two-node memory / thermal-zone telemetry for the guard (scripts/guard/sampler.py): rank 0 locally, rank 1 over ssh.
+[Unit]
+Description=TensorFold Zig guard telemetry sampler
+
+[Service]
+WorkingDirectory=%h/deepseek-v41-tensorfold-spark
+ExecStart=/usr/bin/env python3 scripts/guard/sampler.py --config %h/.config/tf-guard/guard.json
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target

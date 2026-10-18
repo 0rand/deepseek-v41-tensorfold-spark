@@ -263,7 +263,7 @@ upstream TensorFold settings.
 | `TF_DSV41_LOOKUP_PLAN` | 0 | `1` | Cost-priced copy-draft lookup planning |
 | `TF_DSV41_PF_4K` | 0 | `1` | 4096-row prefill workspace; may fall back to 2K |
 | `TF_DSV41_PF_4K_MEMORY_OK` | unset | `1` | Required acknowledgment for 4K memory cost |
-| `TF_DSV41_PF_WS_FLOOR_GIB` | FLOOR_HARD_GIB (4) | `3.5` | Memory remaining after workspace allocation on every rank |
+| `TF_DSV41_PF_WS_FLOOR_GIB` | FLOOR_HARD_GIB (4) | `4.75` (q28-v2: `3.5`) | Memory remaining after workspace allocation on every rank |
 | `TF_DSV41_PIECE_RUNS` | 0 | `1` | Combine several slots' prompt pieces in one run; needs PREFILL_PIECES and replay |
 | `TF_DSV41_REPLAY_RUNS` | 0 | `1` | Several slots' CED decoder replays in one run |
 | `TF_DSV41_JOIN_DRAFTS` | 0 | `1` | Prompts finishing in one round draft their first tokens in one pass |
@@ -291,7 +291,8 @@ upstream TensorFold settings.
 | `TF_DSV41_PREPARED_WRITE` | 0 | `1` | Write missing prepared files |
 | `TF_DSV41_PLAN_TIMEOUT` | 300 | `1800` | Seconds allowed for TP rendezvous connection |
 | `TF_DSV41_PLAN_LINK` | blocking socket | `rdma` | Spin on the plan socket before blocking; 5000 μs when rdma |
-| `TF_DSV41_PLAN_PIN` | off | `auto` | Pin plan threads to the best available CPU |
+| `TF_DSV41_PLAN_PIN` | off | `1`, a CPU inside `CPUSET_CPUS` (q28-v2: `auto`) | Pin plan threads to that CPU (`auto`: the best available CPU) |
+| `TF_CUDA_SCHED` | driver `auto` | `blocking` (q28-v2: unset) | How the host waits for the GPU; `blocking` sleeps instead of spinning (same launches and bits) |
 | `TF_DSV41_DEPTH_JOINT` | 1 | `0` | Disable joint draft depth policy, matching the Python reference |
 | `TF_DSV41_SESSIONS` | 0 | `1` | Session reuse; SESSION_SLOTS additionally required at four slots |
 | `TF_DSV41_SESSION_RAM_MIB` | 256 | `256` | Bounded session state RAM tier |
@@ -338,8 +339,9 @@ the same env. The 4K workspace is transient and released after the CED finish. E
 across both ranks; if either cannot leave `TF_DSV41_PF_WS_FLOOR_GIB` free, both use 2K segments with the same bits.
 The boot budget can also refuse a profile that cannot fit.
 
-`TF_DSV41_PF_WS_FLOOR_GIB` defaults to the hard floor (4 GiB); the profile uses 3.5 GiB so the more constrained rank
-does not fall back persistently. That trades workspace margin for speed. Under `PF_4K=1`, `aot-needs` also lists the
+`TF_DSV41_PF_WS_FLOOR_GIB` defaults to the hard floor (4 GiB). The flash17 profile uses 4.75 GiB, which keeps a
+planned 4K workspace above the 4 GiB floor; q28-v2's profile keeps 3.5 GiB, which trades that margin for fewer 2K
+fallbacks. The guard ([OPERATIONS](OPERATIONS.md#zig-serving-thermal-and-memory-guard)) refuses a floor under 4. Under `PF_4K=1`, `aot-needs` also lists the
 2,048-row segment programs this fallback runs; a fill made from a 4K env with an older `aot-needs` lacks them and
 should be completed as in [Changing serving settings](#changing-serving-settings). For a conservative 2K profile set
 `PF_4K=0`, drop `PF_4K_MEMORY_OK` and `PF_WS_FLOOR_GIB`, and use 2048 for `PREFILL_CHUNK` / `PREFILL_ROWS`. Do not

@@ -1,0 +1,43 @@
+{
+ "enabled": true,
+ "mode": "production",
+ "policy": {
+  "step_c": 90,
+  "step_seconds": 600,
+  "pause_c": 92,
+  "resume_c": 88,
+  "pause_window_seconds": 1800,
+  "pause_limit": 3,
+  "hard_c": 94,
+  "memory_floor_gib": 4
+ },
+ "clock_ladder_mhz": [2100, 2000],
+ "clock_service": "tf-gpu-clock-cap.service",
+ "clock_dropin": "/etc/systemd/system/tf-gpu-clock-cap.service.d/cap.conf",
+ "upstream": "http://127.0.0.1:8001",
+ "listen_host": "127.0.0.1",
+ "listen_port": 8000,
+ "state_path": "/home/user/.local/state/tf-guard/state.json",
+ "samples_path": "/home/user/.local/state/tf-guard/samples.json",
+ "events_path": "/home/user/.local/state/tf-guard/events.jsonl",
+ "control_socket": "/home/user/.local/state/tf-guard/control.sock",
+ "lease_path": "/home/user/.local/state/tf-guard/maintenance.lease",
+ "lease_minutes": 20,
+ "production_config": "/home/user/deepseek-v41-tensorfold-spark/config/prod-zig.env",
+ "worker_ssh": "user@rank1.example",
+ "containers": {"0": "tensorfold-zig-r0", "1": "tensorfold-zig-r1"},
+ "watchdog_units": ["tf-zig-watchdog.timer"],
+ "limits": {
+  "max_inflight": 4,
+  "max_pending": 8,
+  "max_connections": 32,
+  "max_body_bytes": 16777216,
+  "body_buffers": 2,
+  "queue_seconds": 1200,
+  "upstream_seconds": 1800,
+  "memory_transient_reserve_gib": 0.5,
+  "prefill_admission_pause_c": 78,
+  "prefill_admission_resume_c": 70
+ },
+ "profiles": {}
+}

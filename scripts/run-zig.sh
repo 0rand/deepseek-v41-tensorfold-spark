@@ -15,7 +15,7 @@ done
 # Pass values by environment name, preserving spaces in values.
 envs=()
 while IFS='=' read -r key value; do
-    case "$key" in TF_DSV41_*|GLM53_TF_*|NCCL_*) envs+=(-e "$key");; esac
+    case "$key" in TF_DSV41_*|GLM53_TF_*|NCCL_*|TF_CUDA_SCHED) envs+=(-e "$key");; esac
 done < <(env)
 # --check-aot: every Triton variant this env launches, checked against this rank's aot/ (host only, no GPU work).
 # Run it before the first start and after any serving-setting change; it needs the fill's sigs.json in ASSETS_DIR.
@@ -35,6 +35,8 @@ args=(docker run --rm --init --name "tensorfold-zig-r$rank" --gpus all --ipc=hos
       -v "$MODEL_DIR:/model:ro" -v "$ENGRAM_DIR:/engram:ro" -v "$ASSETS_DIR:/assets:ro"
       -v "$PREPARED_DIR:/prepared" -v "$STATE_DIR:/state" -v "$STATE_DIR/sessions:/sessions"
       -v "$CACHE_DIR:/cache" "${envs[@]}")
+# CPUSET_CPUS: the host CPUs this rank's container may use (docs/OPERATIONS.md, guard setup); unset: all
+if [[ -n "${CPUSET_CPUS:-}" ]]; then args+=(--cpuset-cpus "$CPUSET_CPUS"); fi
 args+=(-e TF_TP_WORLD=2 -e "TF_TP_RANK=$rank" -e TF_TP_DEVICE=0
        -e "TF_TP_MASTER=$TF_TP_MASTER" -e "TF_TP_PORT=${TF_TP_PORT:-29571}"
        -e "TF_COMM_BACKEND=${TF_COMM_BACKEND:-roce}"
