@@ -5,6 +5,9 @@ flash17 is the **recommended pack** for this recipe, served by the Zig engine wi
 documented as the [rollback](#rollback-to-q28-v2) with its own profile,
 [`config/prod-zig.env.example`](../config/prod-zig.env.example).
 
+**Status:** flash17 is serving as the production default on our two Sparks with this profile, under the model ID
+`DeepSeek-V4.1-Flash-TF`.
+
 ## The pack
 
 | | |
@@ -120,7 +123,7 @@ pack keeps of September on science, math, chat and multilingual, ties on code, a
 of 1017 on code and tools. Teacher-forced short-context fidelity did not predict task results for q28-v2, so the
 task suite decides usefulness.
 
-## Task results (353 of 356 items)
+## Task results (356 items)
 
 Same frozen items and scorers as the matched baseline: greedy (T0, top_p 1, seed 0), thinking on, effort high,
 max_tokens 32,768, pass@1 (strict score == 1). Conservative paired 95 % intervals: Bonferroni Clopper-Pearson 97.5 %
@@ -134,25 +137,22 @@ the interval's width.
 | MMLU-Pro STEM (100 / 100) | 93 / 100 | 91 / 100 | 90 / 100 | +2.0 [-4.1, +7.9]; 6.0 | +3.0 [-5.3, +10.9]; 8.1 |
 | MATH-500 (40 / 40) | 36 / 40 | 36 / 40 | 36 / 40 | +0.0 [-10.4, +10.4]; 10.4 | +0.0 [-10.4, +10.4]; 10.4 |
 | SciCode first step (10 / 10) | 6 / 10 | 6 / 10 | 5 / 10 | +0.0 [-35.5, +35.5]; 35.5 | +10.0 [-35.4, +49.1]; 42.2 |
-| LiveCodeBench (17 / 20) | 14 / 17 | 11 / 17 | 11 / 17 | +17.6 [-19.8, +46.9]; 33.4 | +17.6 [-19.8, +46.9]; 33.4 |
+| LiveCodeBench (20 / 20) | 16 / 20 | 13 / 20 | 13 / 20 | +15.0 [-17.2, +41.1]; 29.2 | +15.0 [-17.2, +41.1]; 29.2 |
 | BFCL (40 / 40) | 39 / 40 | 39 / 40 | 39 / 40 | +0.0 [-10.4, +10.4]; 10.4 | +0.0 [-10.4, +10.4]; 10.4 |
 | Tool chains (6 / 6) | 6 / 6 | 6 / 6 | 4 / 6 | +0.0 [-51.8, +51.8]; 51.8 | +33.3 [-48.8, +81.6]; 65.2 |
 | MGSM (40 / 40) | 40 / 40 | 40 / 40 | 40 / 40 | +0.0 [-10.4, +10.4]; 10.4 | +0.0 [-10.4, +10.4]; 10.4 |
 
-**[FINAL LAUNCH: PENDING]** The last 3 LiveCodeBench items (20 / 20) and the updated LiveCodeBench row.
+**Every confidence interval includes zero.** No suite shows a statistically significant difference against either pack,
+and no statistical superiority is claimed. On these 356 items flash17 scores at least as high as Mia's 2.9 bpw pack on
+every suite (equal on six, higher on MBPP+, MMLU-Pro STEM and LiveCodeBench), and at least as high as q28-v2 on every
+suite.
 
-**Every confidence interval includes zero.** No suite shows a statistically significant difference against either
-pack, and no statistical superiority is claimed. On these items flash17 scores at least as high as Mia's 2.9 bpw pack
-on every suite (equal on six, higher on MBPP+, MMLU-Pro STEM and LiveCodeBench), and at least as high as q28-v2 on
-every suite.
-
-The Mia and q28-v2 columns are their results on the same completed items. Generations that hit the 32,768-token limit
+The Mia and q28-v2 columns are their results on the same items. Generations that hit the 32,768-token limit
 without an answer count as failures and were not retried.
 
 Limits:
 
-- **Selection.** Suites ran in a fixed order; 3 LiveCodeBench items are still to run. The intervals describe the
-  observed paired items only.
+- **Sample.** A fixed set of 356 items; the intervals describe these paired items only.
 - **Mixed runtime.** The flash17 rows ran across several boots of the same engine and pack, at pools of 3.0M, 2.2M and
   2.1M and clock caps from 2000 to 2250 MHz; generation settings were the same throughout.
 - **Different engines and bases.** The Mia and q28-v2 references ran on the Python engine `8474f31` with pools of
@@ -169,13 +169,29 @@ Limits:
 | BFCL subset / tool chains | 39 / 40, 6 / 6 | pool 3.0M, 2250 MHz |
 | OpenCode sessions (multi-file build, bug fix, read / edit / bash) | 3 / 3, protected tests unchanged | pool 3.0M, 2250 MHz |
 | OpenCode multi-file build | completed, visible and held-out tests passed; strict harness false (one sandbox permission denial, recovered) | pools 2.2M (2250 MHz) and 2.1M (2200 MHz) |
-| **Final launch, recommended profile** | **[FINAL LAUNCH: PENDING]** images and OpenCode | pool 2.1M, 2100 MHz |
+| **VQA + `image_url` probes, final launch** | **20 / 20 + 3 / 3**, answers reviewed | **recommended profile: pool 2.1M, 2100 MHz** |
+| **OpenCode build session, final launch** | **passed**: 7 valid tool calls, protected held-out checks passed, normal stop | **recommended profile: pool 2.1M, 2100 MHz** |
 
 ## Speed
 
-**Config: pool 3.0M, 2250 MHz caps** (not the recommended profile), Zig `9131e10a`, one boot each, same probe: greedy,
-thinking off, 384 output tokens on short cells and 128 on long ones. Short cells are the mean of three repetitions; long
-cells are one run. No statistical speed interval. The q28-v2 column is the same engine and pool.
+**At the recommended profile** (pool 2.1M, 2100 MHz cap), single stream, greedy, thinking off, 384 output tokens on
+the short cell (mean of three runs) and 128 on the long ones (one run each). The q28-v2 column is q28-v2's **earlier
+measurement**, on the same engine and probe but a different clock cap and its 3.0M pool: this is not a matched A/B.
+
+| Metric | q28-v2 (earlier) | flash17 |
+| --- | ---: | ---: |
+| Short decode (tok/s) | 85.75 | **87.9** (+2.5 %) |
+| 32K prompt: prompt tokens / TTFT (tok/s) | 2,630 | 2,349 |
+| Decode after the 32K prompt (tok/s) | 66.7 | 64.1 |
+| 131K prompt: prompt tokens / TTFT (tok/s) | 2,460 | 2,198 |
+| Decode after the 131K prompt (tok/s) | 64.5 | 64.9 |
+
+The 32K / 131K prompts are 37,979 / 154,188 tokens for flash17. TTFT includes HTTP and admission time, so the prompt
+rows are not isolated prefill speed. No speed interval is inferred from three runs.
+
+**Earlier flash17 measurement, pool 3.0M, 2250 MHz caps** (not the recommended profile), Zig `9131e10a`, one boot each,
+same probe: greedy, thinking off, 384 output tokens on short cells and 128 on long ones. Short cells are the mean of
+three repetitions; long cells are one run. No statistical speed interval. The q28-v2 column is the same engine and pool.
 
 | Metric | q28-v2 | flash17 | Change |
 | --- | ---: | ---: | ---: |
@@ -189,9 +205,6 @@ cells are one run. No statistical speed interval. The q28-v2 column is the same 
 The prompts encode to 37,985 and 154,194 tokens for flash17 (37,977 and 154,186 for q28-v2); prompt throughput is
 prompt tokens over time to first token (flash17: 14.409 s and 62.593 s), including HTTP overhead. The recommended
 profile uses a smaller pool and a lower clock cap, so these numbers do not describe it.
-
-**[FINAL LAUNCH: PENDING]** Speed at the recommended profile (pool 2.1M, 2100 MHz cap), with q28-v2 on the same
-nodes for comparison.
 
 ## Rollback to q28-v2
 
