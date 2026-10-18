@@ -11,7 +11,7 @@ the reasoning or inject a turn boundary. The literals are hidden before the chat
 own tokens are untouched; the `/v1/completions` route sends what it is given.
 
 Thinking follows DeepSeek-V4.1's encoding (`Reasoning Effort: N (range 1-100)`), on by default
-(`TF_DSV41_THINKING=0` turns it off). Both the top-level `reasoning_effort` and
+(`TF_DSV41_THINKING=0` turns the default off; requests can still turn it on). Both the top-level `reasoning_effort` and
 `chat_template_kwargs.reasoning_effort` are read (the kwargs win):
 
 | value | thinking | effort |
@@ -24,6 +24,15 @@ Thinking follows DeepSeek-V4.1's encoding (`Reasoning Effort: N (range 1-100)`),
 
 `chat_template_kwargs.enable_thinking` (or `thinking`) true / false sets the mode directly. Note: the kit's vLLM
 path renders `low` as 25; we keep DeepSeek's 50.
+
+Effort sets how long the model thinks, not how fast it decodes: a lower effort gives a shorter `reasoning_content`
+and an earlier answer at the same tok/s.
+
+**Thinking and `max_tokens`.** Thinking is on by default at effort `high` (75), and `max_tokens` (or
+`max_completion_tokens`) counts the `reasoning_content` and the `content` together. A short cap can therefore end the
+reply while the model is still thinking: `content` comes back empty with `finish_reason: "length"`, and the Zig server
+logs a warning. Raise `max_tokens`, or turn thinking off for the request with
+`"chat_template_kwargs": {"enable_thinking": false}`, or for the server with `TF_DSV41_THINKING=0`.
 
 ## Sampling
 

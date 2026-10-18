@@ -19,6 +19,15 @@ cp config/prod.env.example config/prod.env
 $EDITOR config/prod.env      # every <placeholder>: WORKER_SSH, HEAD_IP, the paths on each node; check the NIC names
 ```
 
+Copy the example whole and change only the placeholders. The engine's own defaults are the conservative ones, with
+the draft settings off; the example is the measured configuration. A single-stream decode near 43 tok/s means drafting
+is not paying: in #5 an env with only the paths plus `CONTEXT` / `PARALLEL` / `KV_DTYPE` decoded 43 tok/s, and the full
+example (`TF_DSV41_SPEC_DRAFT=1` and the rest) moved the same prompt to 72. The same holds for the Zig path: copy
+`config/prod-zig.env.example` whole, since `TF_DSV41_DRAFTS`, `TF_DSV41_SPEC_DRAFT` and the other draft settings are
+off in the engine. To check that drafting runs on the Zig server, read each reply's `tensorfold.drafted` and
+`tensorfold.rounds`, or `/health`'s `drafted_total` and `rounds_total`: with drafting off, drafted stays 0 and rounds
+about equal the generated tokens. The serving line's `drafts: on` only means `--no-drafts` was not given.
+
 **2. Weights** (on both nodes, byte-identical):
 
 ```bash

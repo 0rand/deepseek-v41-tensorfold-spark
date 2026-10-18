@@ -43,6 +43,7 @@ if [[ "$rank" == 0 ]]; then
     args+=(tensorfold-dsv41 serve /model --host "${HOST:-localhost}" --port "${PORT:-8000}"
            --parallel "$TF_DSV41_SLOTS" --context "$TF_DSV41_CONTEXT"
            --name DeepSeek-V4.1-Flash-TF --max-tokens 32768)
+    if [[ "${TF_DSV41_THINKING:-1}" == 0 ]]; then args+=(--no-thinking); fi  # the default; requests still override
 else
     args+=(tf-dsv41-m1 follow /model /assets)
 fi

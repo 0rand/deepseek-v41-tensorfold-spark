@@ -304,7 +304,7 @@ upstream TensorFold settings.
 | `TF_DSV41_DISCONNECT` | 1 | `1` | Cancel generation when client disconnects |
 | `TF_DSV41_DRAIN_S` | 20 | `20` | Seconds requests in progress may finish after SIGTERM before both ranks halt |
 | `TF_DSV41_SSE_KEEPALIVE_S` | 15 | `15` | Seconds between keepalives on a stream before its first token (0: none) |
-| `TF_DSV41_THINKING` | 1 | `1` | Default thinking mode; requests can override |
+| `TF_DSV41_THINKING` | 1 | `1` | Default thinking mode (`run-zig.sh` passes `--no-thinking` for 0); requests can override |
 | `TF_DSV41_DEFAULT_EFFORT` | high | `high` | Default effort (high = 75) |
 | `TF_DSV41_SCHEMA_PROMPT` | 1 | `1` | Include response-format schema in the prompt |
 | `TF_DSV41_IMAGES` | placeholder | `native` | Image input: DeepSeek's vision tower on rank 0 ([IMAGES](IMAGES.md#the-zig-serving-path)); `placeholder` turns each image into a notice, `reject` answers 400 |
