@@ -20,6 +20,18 @@ predate the q28-v2 ragged-expert loader; keep their original 2.9 bpw pack until 
 > **Work in progress.** Measured on one pair of Sparks, against one baseline. Read
 > [what is not solved](docs/KNOWN-ISSUES.md) before relying on it.
 
+## Candidate: the Flash-1017 pack (flash17), validation in progress
+
+A 2.80 bpw EXL3 pack of DeepSeek's 2026-10-17 update, `deepseek-ai/DeepSeek-V4.1-Flash-1017`:
+[`jayleaton/DeepSeek-V4.1-Flash-1017-EXL3-2.8bpw`](https://huggingface.co/jayleaton/DeepSeek-V4.1-Flash-1017-EXL3-2.8bpw)
+(**private while the upload completes**), 203.8 GB, vision included. It is **not the recommended pack yet**. Its
+candidate profile ([FLASH-1017](docs/FLASH-1017.md), [`config/prod-zig-flash17.env.example`](config/prod-zig-flash17.env.example))
+runs the same Zig `9131e10a` engine with the 1017 Engram shards, a 2.1M-token pool and a 2200 MHz GPU clock cap: at
+3.0M and 2.4M the head went under the 4 GiB floor during 4K prefills, and at 2.2M it reached 94 °C.
+Task results so far are **partial (235 of 356 items) and within noise** against Mia's 2.9 bpw pack and q28-v2; no
+gain is claimed. Short decode at the 3.0M pool measured +3.6 % (1 stream) and +7.3 % (4 streams) over q28-v2.
+Rollback is the unchanged q28-v2 profile.
+
 ## Latest merged kit: split KV and native images
 
 Two DGX Sparks (GB10, 128 GB each), TP=2 over CX7/RoCE, q28-v2 EXL3 2.8 bpw. Engine `9131e10a`,
@@ -157,6 +169,7 @@ Weights, Engram shards, requirements and unattended operation: [`docs/INSTALL.md
 | | |
 | --- | --- |
 | [ZIG-SERVE](docs/ZIG-SERVE.md) / [ZIG-RESULTS](docs/ZIG-RESULTS.md) | Zig build, TP=2 launch, exact settings, q28-v2 comparisons |
+| [FLASH-1017](docs/FLASH-1017.md) | candidate Flash-1017 pack: profile, memory and thermal findings, partial results |
 | [INSTALL](docs/INSTALL.md) | requirements, weights, Engram shards, build, start, watchdog |
 | [API](docs/API.md) / [IMAGES](docs/IMAGES.md) | endpoints, thinking and effort, image input |
 | [OPERATIONS](docs/OPERATIONS.md) | settings, memory gates, turning each lever off |

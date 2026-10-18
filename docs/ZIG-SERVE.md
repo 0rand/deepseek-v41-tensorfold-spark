@@ -4,6 +4,7 @@ Recommended weights: **q28-v2 EXL3 2.8 bpw**,
 [`jayleaton/DeepSeek-V4.1-Flash-EXL3-2.8bpw`](https://huggingface.co/jayleaton/DeepSeek-V4.1-Flash-EXL3-2.8bpw).
 Publication is pending and that repository name is provisional. The port loads EXL3 directly, including q28-v2's
 per-expert widths. There are two processes: `tensorfold-dsv41 serve` on rank 0 and `tf-dsv41-m1 follow` on rank 1.
+A candidate profile for the newer Flash-1017 pack, still being validated, is in [FLASH-1017](FLASH-1017.md).
 
 ## Availability and requirements
 
