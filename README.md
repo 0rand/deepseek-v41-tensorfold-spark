@@ -4,23 +4,40 @@ Support me here: https://buymeacoffee.com/jayleaton
 
 # DeepSeek-V4.1-Flash on TensorFold, 2x NVIDIA DGX Spark
 
-The recommended pack is **q28-v2 EXL3 2.8 bpw**:
-[`jayleaton/DeepSeek-V4.1-Flash-EXL3-2.8bpw`](https://huggingface.co/jayleaton/DeepSeek-V4.1-Flash-EXL3-2.8bpw)
-(publication pending; repository name provisional). Serve across two NVIDIA DGX Sparks, TP=2 over the 200 Gb/s CX7
-link, behind an OpenAI-compatible API.
+The recommended pack is **flash17, DeepSeek-V4.1-Flash-1017 EXL3 2.8 bpw**:
+[`jayleaton/DeepSeek-V4.1-Flash-1017-EXL3-2.8bpw`](https://huggingface.co/jayleaton/DeepSeek-V4.1-Flash-1017-EXL3-2.8bpw),
+with [its serving profile](docs/FLASH-1017.md). Serve across two NVIDIA DGX Sparks, TP=2 over the 200 Gb/s CX7 link,
+behind an OpenAI-compatible API. The previous pack, **q28-v2**
+([`jayleaton/DeepSeek-V4.1-Flash-EXL3-2.8bpw`](https://huggingface.co/jayleaton/DeepSeek-V4.1-Flash-EXL3-2.8bpw)),
+is the documented rollback.
 
-The [CUDA Zig serving path](docs/ZIG-SERVE.md) exports engine `9131e10a`, based on TensorFold 1.0.2 plus the DeepSeek CUDA port,
-with split KV, a shared 3.0M-token pool and native images. The latest measured gates and earlier benchmarks are separated below.
-Its source is included in [`engine/zig`](engine/zig), with the Apache-2.0 upstream license and provenance.
-The serving profile (4K prefill, the engine's own boot calibration) and generated AOT asset preparation are documented there. The existing Python
-recipe remains TensorFold 0.6.0 plus the two published patches, with exact DSpark speculative decoding, CED replay,
-four request slots, NVMe sessions, native image input, structured output and tool calls. The shipped Python patches
-predate the q28-v2 ragged-expert loader; keep their original 2.9 bpw pack until that engine update is exported.
+The [CUDA Zig serving path](docs/ZIG-SERVE.md) exports engine `9131e10a`, based on TensorFold 1.0.2 plus the DeepSeek
+CUDA port, with split KV, a shared paged KV pool (2.1M tokens for flash17, 3.0M for q28-v2) and native images. The
+latest measured gates and earlier benchmarks are separated below. Its source is included in [`engine/zig`](engine/zig),
+with the Apache-2.0 upstream license and provenance. The serving profile (4K prefill, the engine's own boot calibration)
+and generated AOT asset preparation are documented there. The existing Python recipe remains TensorFold 0.6.0 plus the
+two published patches, with exact DSpark speculative decoding, CED replay, four request slots, NVMe sessions, native
+image input, structured output and tool calls. The shipped Python patches predate the q28-v2 ragged-expert loader; keep
+their original 2.9 bpw pack until that engine update is exported.
 
 > **Work in progress.** Measured on one pair of Sparks, against one baseline. Read
 > [what is not solved](docs/KNOWN-ISSUES.md) before relying on it.
 
-## Latest merged kit: split KV and native images
+## Recommended pack: flash17 (DeepSeek-V4.1-Flash-1017, 2.80 bpw)
+
+A 2.80 bpw EXL3 pack of DeepSeek's 2026-10-17 update, `deepseek-ai/DeepSeek-V4.1-Flash-1017`, 203.8 GB, vision
+included: [`jayleaton/DeepSeek-V4.1-Flash-1017-EXL3-2.8bpw`](https://huggingface.co/jayleaton/DeepSeek-V4.1-Flash-1017-EXL3-2.8bpw).
+Its profile, [`config/prod-zig-flash17.env.example`](config/prod-zig-flash17.env.example), runs the same Zig `9131e10a`
+engine with the 1017 Engram shards and a **2.1M-token pool**: with 3.0M, q28-v2's pool, the 4K prefill workspace took
+the head under the 4 GiB floor. We suggest a 2100-2200 MHz GPU clock cap (`nvidia-smi -lgc 300,2100`) to help with
+temperature control. Details: [FLASH-1017](docs/FLASH-1017.md).
+
+On 353 of the 356 matched task items, flash17 scores at least as high as Mia's 2.9 bpw pack on every suite and at
+least as high as q28-v2; **every paired 95 % interval includes zero**, so no statistical superiority is claimed.
+Short decode at a 3.0M pool and 2250 MHz measured +3.6 % (1 stream) and +7.3 % (4 streams) over q28-v2; speed at the
+recommended profile is **[FINAL LAUNCH: PENDING]**. Rollback is the unchanged q28-v2 profile.
+
+## Previous pack q28-v2: latest merged kit, split KV and native images
 
 Two DGX Sparks (GB10, 128 GB each), TP=2 over CX7/RoCE, q28-v2 EXL3 2.8 bpw. Engine `9131e10a`,
 2026-10-11 09:22–09:28 UTC; same-window baseline: prior Zig kit `17add462`. **One warm repetition**, code workload;
@@ -41,7 +58,7 @@ One text prompt has a known T0 near-tie (`shorter` / `short`); the 75 image outp
 | Capacity / profile | Value | Evidence scope |
 | --- | ---: | --- |
 | Shared split-KV pool observed at boot | 3,000,320 token positions | `9131e10a`, 2026-10-11; both ranks report the same logical capacity, not twice the pool |
-| Requested pool in the profile | 3,000,000 tokens | [Serving profile](config/prod-zig.env.example); boot capacity includes allocation granularity |
+| Requested pool in the q28-v2 profile | 3,000,000 tokens | [Serving profile](config/prod-zig.env.example); boot capacity includes allocation granularity |
 | Configured context per slot / slots | 1,048,576 tokens / 4 | Configuration, not a receipt for four full-context requests |
 | Long requests completed (serial prefill) | 996,011 tokens ×2; about 740K tokens ×4 | Earlier merged engine `74ace4be`, 2026-10-10, same two Sparks; images off |
 | NVMe resume in that long-context gate | 1.3 s; 996,000 of 996,011 prompt tokens cached | `74ace4be`, 2026-10-10; restored reply identical |
@@ -156,6 +173,7 @@ Weights, Engram shards, requirements and unattended operation: [`docs/INSTALL.md
 
 | | |
 | --- | --- |
+| [FLASH-1017](docs/FLASH-1017.md) | the recommended flash17 pack: profile, memory, task results, rollback to q28-v2 |
 | [ZIG-SERVE](docs/ZIG-SERVE.md) / [ZIG-RESULTS](docs/ZIG-RESULTS.md) | Zig build, TP=2 launch, exact settings, q28-v2 comparisons |
 | [INSTALL](docs/INSTALL.md) | requirements, weights, Engram shards, build, start, watchdog |
 | [API](docs/API.md) / [IMAGES](docs/IMAGES.md) | endpoints, thinking and effort, image input |
