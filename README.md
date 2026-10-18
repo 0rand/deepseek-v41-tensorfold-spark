@@ -17,12 +17,14 @@ our EXL3 pack (**flash17**) and the TensorFold Zig engine that serves it, with t
 | Engine | TensorFold Zig, CUDA port `9131e10a` (source in [`engine/zig`](engine/zig)) |
 | Serving | 1M context, four slots, vision (native image input), tool calling, structured output |
 
+flash17 is serving as the production default on our two Sparks (model ID `DeepSeek-V4.1-Flash-TF`).
+
 > **Work in progress.** Measured on one pair of Sparks. Read [what is not solved](docs/KNOWN-ISSUES.md) before
 > relying on it.
 
 ## Results
 
-**Tasks.** 353 of 356 matched items (pass@1, greedy, thinking on, effort high), against Mia-AiLab's 2.9 bpw pack and
+**Tasks.** 356 matched items (pass@1, greedy, thinking on, effort high), against Mia-AiLab's 2.9 bpw pack and
 our previous q28-v2 pack:
 
 | Suite | flash17 | Mia 2.9 bpw | q28-v2 |
@@ -32,20 +34,25 @@ our previous q28-v2 pack:
 | MMLU-Pro STEM | 93 / 100 | 91 / 100 | 90 / 100 |
 | MATH-500 | 36 / 40 | 36 / 40 | 36 / 40 |
 | SciCode (first step) | 6 / 10 | 6 / 10 | 5 / 10 |
-| LiveCodeBench | 14 / 17 | 11 / 17 | 11 / 17 |
+| LiveCodeBench | 16 / 20 | 13 / 20 | 13 / 20 |
 | BFCL | 39 / 40 | 39 / 40 | 39 / 40 |
 | Tool chains | 6 / 6 | 6 / 6 | 4 / 6 |
 | MGSM | 40 / 40 | 40 / 40 | 40 / 40 |
 
 Small samples: every paired 95 % confidence interval includes zero, so these show no statistically significant
-difference. Intervals, method and limits are in [FLASH-1017](docs/FLASH-1017.md#task-results-353-of-356-items). The
-last 3 LiveCodeBench items are **[FINAL LAUNCH: PENDING]**.
+difference. Intervals, method and limits are in [FLASH-1017](docs/FLASH-1017.md#task-results-356-items).
 
 **Retention of the 1017 release, as served** (top-1 agreement with the release, with the serving expert pruning):
 code **95.17 %**, science **94.93 %**, tools **87.64 %**. The full table, with KL and the other packs:
 [FLASH-1017](docs/FLASH-1017.md#fidelity-to-the-release-retention-as-served).
 
-**Speed** at the recommended profile: **[FINAL LAUNCH: PENDING]**.
+**Speed** at the recommended profile (2.1M pool, 2100 MHz cap), single stream: short decode **87.9 tok/s**; decode
+after a 32K / 131K prompt 64.1 / 64.9 tok/s; prompt tokens over time to first token 2,349 / 2,198 tok/s (TTFT includes
+HTTP and admission). q28-v2's earlier measurements, under a different clock and its 3.0M pool, were 85.75, 66.7 / 64.5
+and 2,630 / 2,460; not a matched A/B. Details: [FLASH-1017](docs/FLASH-1017.md#speed).
+
+**Images and agents** at the recommended profile: VQA 20 / 20 plus 3 / 3 `image_url` probes; a clean OpenCode
+session passed (7 valid tool calls, normal stop).
 
 ## Quick start
 
