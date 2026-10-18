@@ -1,6 +1,8 @@
 # How the results were measured
 
-The headline tables are in the [README](../README.md#results); every table and the lever-by-lever history are in [RESULTS.md](RESULTS.md).
+The headline tables of the Python recipe are in
+[PREVIOUS-RESULTS](PREVIOUS-RESULTS.md#historical-29-bpw-results-python-vs-vllm); every table and the lever-by-lever
+history are in [RESULTS.md](RESULTS.md).
 
 The decode cells are G19's check of the shipped build (`7bd2d67` with the production words, mean of 2 boots,
 [`docs/campaign/G19-RESULTS.md`](campaign/G19-RESULTS.md)); at temperature 0.7: code 78.2, prose 48.0, structured

@@ -84,7 +84,7 @@ The tables above were measured with the replicated 1.4M pool. The profile now se
 
 ## Historical vLLM comparison
 
-The [existing Python vs vLLM table](../README.md#historical-29-bpw-results-python-vs-vllm) remains unchanged:
+The [existing Python vs vLLM table](PREVIOUS-RESULTS.md#historical-29-bpw-results-python-vs-vllm) remains unchanged:
 code greedy ×1 41.9–45.0, prose greedy ×1 32.5, aggregate ×1/×2/×4 32.2/46.7/37.6, and cold prefill
 8K/32K/64K/128K 1,073/1,075/1,060/1,031 tok/s for vLLM. Those runs use the older 2.9 bpw pack and different
 workloads. There is no matched q28-v2 Zig vs vLLM run here, so no new ratio is claimed.
