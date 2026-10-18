@@ -1,10 +1,13 @@
 # CUDA Zig serving on two DGX Sparks
 
-Recommended weights: **q28-v2 EXL3 2.8 bpw**,
-[`jayleaton/DeepSeek-V4.1-Flash-EXL3-2.8bpw`](https://huggingface.co/jayleaton/DeepSeek-V4.1-Flash-EXL3-2.8bpw).
-Publication is pending and that repository name is provisional. The port loads EXL3 directly, including q28-v2's
-per-expert widths. There are two processes: `tensorfold-dsv41 serve` on rank 0 and `tf-dsv41-m1 follow` on rank 1.
-A candidate profile for the newer Flash-1017 pack, still being validated, is in [FLASH-1017](FLASH-1017.md).
+Recommended weights: **flash17, DeepSeek-V4.1-Flash-1017 EXL3 2.8 bpw**,
+[`jayleaton/DeepSeek-V4.1-Flash-1017-EXL3-2.8bpw`](https://huggingface.co/jayleaton/DeepSeek-V4.1-Flash-1017-EXL3-2.8bpw),
+with [`config/prod-zig-flash17.env.example`](../config/prod-zig-flash17.env.example) ([FLASH-1017](FLASH-1017.md)). The
+previous pack, q28-v2
+([`jayleaton/DeepSeek-V4.1-Flash-EXL3-2.8bpw`](https://huggingface.co/jayleaton/DeepSeek-V4.1-Flash-EXL3-2.8bpw)), is
+the rollback with [`config/prod-zig.env.example`](../config/prod-zig.env.example). The port loads EXL3 directly,
+including both packs' per-expert widths. There are two processes: `tensorfold-dsv41 serve` on rank 0 and `tf-dsv41-m1
+follow` on rank 1.
 
 ## Availability and requirements
 
@@ -18,7 +21,8 @@ Required on both nodes:
 
 - Two DGX Sparks (GB10, 128 GB each), TP=2, cabled/addressed CX7 ports; Docker with NVIDIA Container Toolkit,
   RDMA devices and matching image contents. Set the interface/HCA values to your own link.
-- Identical q28-v2 model files; rank-specific packed Engram shards on local NVMe. [Engram packing](INSTALL.md)
+- Identical model files on both nodes; rank-specific packed Engram shards on local NVMe, from the pack's own release
+  (flash17: `DeepSeek-V4.1-Flash-1017`; q28-v2: the September release). [Engram packing](INSTALL.md)
   writes `engram-l{1,14}-r{rank}of2.bin`. The weights download alone is not sufficient.
 - Rank-specific `/assets/rope.bin`, `engram-host.bin`, and `aot/`: RoPE tables covering the configured context plus
   2,048 prefill rows (1,050,624 rows at the 1M context), native host lookup data, and Triton programs for all
@@ -51,17 +55,17 @@ was not repeated for this publication; the exported host build and host tests ar
    ```bash
    git clone --recurse-submodules https://github.com/jayleaton/deepseek-v41-tensorfold-spark.git
    cd deepseek-v41-tensorfold-spark
-   hf download jayleaton/DeepSeek-V4.1-Flash-EXL3-2.8bpw --local-dir /srv/models/q28-v2
-   cp config/prod-zig.env.example config/prod-zig.env
+   hf download jayleaton/DeepSeek-V4.1-Flash-1017-EXL3-2.8bpw --local-dir /srv/models/flash17
+   cp config/prod-zig-flash17.env.example config/prod-zig.env
    $EDITOR config/prod-zig.env
    ```
 
    Set the image, rank 0's link address, NIC/HCA settings and each node's own absolute directories. The engine
    settings must match on both ranks. Copy the dense-prefill tuning table into each node's `CACHE_DIR`
    (`cp config/pfdense-table.json "$CACHE_DIR/"`; the launcher does it when the file is missing).
-   `config/prod-zig.env` is ignored by git. The template is the measured
-   serving profile, with 4K prefill (it falls back to 2K per piece when memory is short); the pack URL remains
-   provisional until publication completes.
+   `config/prod-zig.env` is ignored by git. The template is the recommended flash17
+   serving profile, with 4K prefill (it falls back to 2K per piece when memory is short). For q28-v2 copy
+   `config/prod-zig.env.example` instead.
 
 2. Build the included source on an ARM64 build host:
 
@@ -150,7 +154,7 @@ for patch_file in patches/*.patch; do
   patch -d build/python-source -p1 < "$patch_file"
 done
 export PY_SOURCE="$PWD/build/python-source/src"
-export PACK=/srv/models/q28-v2
+export PACK=/srv/models/flash17
 export ASSETS=/srv/assets/rank-0
 mkdir -p "$ASSETS"
 # Run the following in the build image/environment, from engine/zig.
@@ -222,7 +226,7 @@ upstream TensorFold settings.
 | `TF_DSV41_SLOTS` | 1 | `4` | Concurrent live slots |
 | `TF_DSV41_SLOT_DRAFTS` | 0 | `1` | Per-slot drafts with batched verification |
 | `TF_DSV41_ROWS_CAP` | 16 | `64` | Maximum rows per decode forward; requires matching AOT |
-| `TF_DSV41_POOL_TOKENS` | unset: no paged pool | `3000000` | Shared paged KV capacity, not capacity per slot ([split KV and the pool](#split-kv-and-the-pool)) |
+| `TF_DSV41_POOL_TOKENS` | unset: no paged pool | `2100000` (q28-v2: `3000000`) | Shared paged KV capacity, not capacity per slot ([split KV and the pool](#split-kv-and-the-pool)) |
 | `TF_DSV41_KV_SPLIT` | 0 | `1` | Compressed KV rows sharded over the ranks instead of replicated; needs TP >= 2 and `POOL_TOKENS` |
 | `TF_DSV41_KV_SPLIT_COMPACT` | 0 | `1` | Split KV's owner-packed exchange where every rank's transport takes device lengths and the shard fits, else dense; `force` packs on any transport |
 | `TF_DSV41_KV_SPLIT_UNION_MIB` | 128 | `128 (unset)` | Byte budget of each block of a prefill's union of selected rows under split KV (bounds its exchange and staging) |
@@ -304,7 +308,7 @@ upstream TensorFold settings.
 | `TF_DSV41_DEFAULT_EFFORT` | high | `high` | Default effort (high = 75) |
 | `TF_DSV41_SCHEMA_PROMPT` | 1 | `1` | Include response-format schema in the prompt |
 | `TF_DSV41_IMAGES` | placeholder | `native` | Image input: DeepSeek's vision tower on rank 0 ([IMAGES](IMAGES.md#the-zig-serving-path)); `placeholder` turns each image into a notice, `reject` answers 400 |
-| `TF_DSV41_BIAS_VL` | unset: image rows route with the text bias | `/cache/dsv41-bias-vl` | Folder holding the release's `gate.bias_vl` tensors (`bias_vl.safetensors`), loaded on both ranks; boot fails if it names a folder without them |
+| `TF_DSV41_BIAS_VL` | unset: image rows route with the text bias | `/model` (q28-v2: `/cache/dsv41-bias-vl`) | Folder holding the release's `gate.bias_vl` tensors (`bias_vl.safetensors`), loaded on both ranks; boot fails if it names a folder without them |
 | `TF_DSV41_GRAMMAR` | 0 | `1` | Grammar-constrained structured output |
 | `TF_DSV41_TOOL_GRAMMAR` | 0 | `0` | Automatic tool-schema constraint; remains off |
 
@@ -346,11 +350,12 @@ exhausted memory.
 
 Without split KV every rank holds every compressed KV row, so the pool is bounded by one node's free memory. With
 `TF_DSV41_KV_SPLIT=1` each rank holds its share of the rows and the ranks exchange the selected rows each round, about
-1,060 bytes a token on each rank. That is what lets the profile's `TF_DSV41_POOL_TOKENS=3000000` boot where the
-replicated layout fits about 1.4M: one slot can fill its whole `TF_DSV41_CONTEXT` (1M), two slots 1M each, four live
-slots about 750K each. The pool is shared, so these are totals across live slots, not per-slot reservations.
-`TF_DSV41_FORMS_INPLACE=1` frees the dense forms' separate copy for the pool, and `TF_DSV41_KV_SPLIT_COMPACT=1` sends
-each rank's packed rows instead of the dense table where the transport allows it.
+1,060 bytes a token on each rank. That is what lets q28-v2's `TF_DSV41_POOL_TOKENS=3000000` boot where the replicated
+layout fits about 1.4M (flash17's profile uses 2,100,000 to keep the 4 GiB floor under 4K prefills;
+[FLASH-1017](FLASH-1017.md#memory-the-21m-pool)): one slot can fill its whole `TF_DSV41_CONTEXT` (1M), two slots 1M
+each, four live slots about 750K each. The pool is shared, so these are totals across live slots, not per-slot
+reservations. `TF_DSV41_FORMS_INPLACE=1` frees the dense forms' separate copy for the pool, and
+`TF_DSV41_KV_SPLIT_COMPACT=1` sends each rank's packed rows instead of the dense table where the transport allows it.
 
 The boot check prices the pool against each rank's measured memory at the end of boot and refuses a pool that would
 leave the worst predicted dip (`TF_DSV41_SERVE_DIP_GIB`, default 3.0 GiB) under the hard floor, so an oversized
