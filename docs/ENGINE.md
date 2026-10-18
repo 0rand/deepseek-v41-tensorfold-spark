@@ -1,4 +1,4 @@
-# The engine: TensorFold v0.6.0 + two patches
+# The engine: TensorFold v0.6.0 + three patches
 
 ## What ships
 
@@ -7,8 +7,10 @@
 | `vendor/TensorFold` | upstream [TensorFold](https://github.com/ashhart/TensorFold) at tag `v0.6.0` (commit `c464617`), unmodified submodule |
 | `patches/0001-spark-stack-060.patch` | `families/glm5_next/spark/`: the GLM-5.3-Flash two-Spark engine (TensorFold 0.3.4's GLM CUDA engine with the [glm53-tensorfold-spark](https://github.com/jayleaton/glm53-tensorfold-spark) patch series 0001-0620) rebased onto 0.6.0; the CUDA communicator interface (`cuda/comm.py`); a family `CUDA_SERVE` hook; a server fix for sockets past descriptor 1023. The DeepSeek family reuses its RoCE all-gather, communicator and HTTP server. |
 | `patches/0002-deepseek-v41-family.patch` | `families/deepseek_v41/` (MIT) and its tests; a device-side skip in the EXL3 linear (graph-safe), fp64 in the communicator's dtype table, `--kv-dtype fp8`, more model ids in `/v1/models`; G14's changes to the GLM stack's RoCE path (`GLM53_TF_ROCE_FAST`, the host mailbox `roce_msg.h` the round plan uses, `roce_bench` / `roce_split`); package data for the family's CUDA sources and headers; NOTICE and THIRD_PARTY_NOTICES entries |
+| `patches/0003-dsv41-literal-added-tokens.patch` | `families/deepseek_v41/cuda/literal_tokens.py` and its tests: a DeepSeek added token quoted inside a chat request (`</think>`, `<｜User｜>`, `<｜end▁of▁sentence｜>`, `<｜DSML｜>`, ...) stays text instead of becoming that token; `app.py` hides the literals before the template renders and encodes them as plain pieces |
 
-`docker/Dockerfile` applies both with `git apply` on a copy of the submodule and installs the result with pip.
+`docker/Dockerfile` applies all three in order with `git apply` on a copy of the submodule and installs the result
+with pip.
 
 ## How the patches were made, and what differs from production
 

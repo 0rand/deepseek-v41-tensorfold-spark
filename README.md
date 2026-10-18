@@ -16,7 +16,7 @@ CUDA port, with split KV, a shared paged KV pool (2.1M tokens for flash17, 3.0M 
 latest measured gates and earlier benchmarks are separated below. Its source is included in [`engine/zig`](engine/zig),
 with the Apache-2.0 upstream license and provenance. The serving profile (4K prefill, the engine's own boot calibration)
 and generated AOT asset preparation are documented there. The existing Python recipe remains TensorFold 0.6.0 plus the
-two published patches, with exact DSpark speculative decoding, CED replay, four request slots, NVMe sessions, native
+three published patches, with exact DSpark speculative decoding, CED replay, four request slots, NVMe sessions, native
 image input, structured output and tool calls. The shipped Python patches predate the q28-v2 ragged-expert loader; keep
 their original 2.9 bpw pack until that engine update is exported.
 

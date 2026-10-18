@@ -31,9 +31,10 @@ What it needs beyond the general Zig setup ([ZIG-SERVE](ZIG-SERVE.md)):
 - **Its own prepared and state folders.** Do not reuse another pack's prepared files, calibration tables or sessions.
 - **Chat template note.** 1017 ships no `chat_template.jinja`. The pack carries September's file (the same file
   q28-v2 has) only because some older TensorFold builds look for it at boot. Zig `9131e10a` renders prompts with its
-  own encoder and does not read it. That encoder does **not** include 1017's prompt change (a user turn holding only
-  tool results does not start a new turn); it only affects continuations that carry tool results without declaring
-  `tools`.
+  own encoder and does not read it. 1017's `encoding/encoding.py` is byte-identical to the September repository's
+  current one: DeepSeek's 2026-10-16 encoder fix (a user turn holding only tool results does not start a new turn) is
+  in both releases, so it is not a 1017 change. Zig `9131e10a`'s encoder predates that fix, for both packs alike; it
+  only affects continuations that carry tool results without declaring `tools`.
 
 ## Recommended serving profile
 
