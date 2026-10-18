@@ -1,7 +1,7 @@
 # TensorFold serving DeepSeek-V4.1-Flash on two DGX Sparks (GB10, sm_121, aarch64).
 #
 # Base: NVIDIA's PyTorch container (CUDA toolkit, PyTorch, Triton). TensorFold comes from the pinned submodule
-# (vendor/TensorFold = v0.6.0) with the two patches in patches/ applied, so the image is reproducible from this repo.
+# (vendor/TensorFold = v0.6.0) with the patches in patches/ applied in order, so the image is reproducible from this repo.
 # scripts/serve.sh build builds it on the head and ships it to the worker (docker save | ssh worker docker load).
 #
 # The production measurements in README.md ran an image of this content: the same base, xgrammar 0.2.8,

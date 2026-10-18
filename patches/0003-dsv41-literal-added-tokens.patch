@@ -1,0 +1,272 @@
+diff --git a/src/tensorfold/families/deepseek_v41/cuda/app.py b/src/tensorfold/families/deepseek_v41/cuda/app.py
+index 076d41e..794f07e 100644
+--- a/src/tensorfold/families/deepseek_v41/cuda/app.py
++++ b/src/tensorfold/families/deepseek_v41/cuda/app.py
+@@ -53,7 +53,7 @@ from tensorfold.families.glm5_next.spark.batchplan import is_title_request
+ from tensorfold.families.glm5_next.spark.prompt_tokens import Memo, PromptTokens
+ from tensorfold.server.cancellation import RequestCancelled
+ 
+-from . import dsml, encoding, vision_prep
++from . import dsml, encoding, literal_tokens, vision_prep
+ from .structured import Host, schema_for_prompt
+ from .vision import mode as images_mode
+ 
+@@ -189,6 +189,9 @@ class Dsv41App(server.App):
+         self.memory = ReasoningMemory(int(os.environ.get("TF_DSV41_REASONING_MEMORY", "1024") or 1024))
+         self.prompt_tokens = PromptTokens(self.tok, model_dir / "tokenizer.json")
+         self.prompt_memo = Memo()
++        self.literals = literal_tokens.Table(self.tok)          # patch 0003: quoted added tokens stay text
++        print(f"[tensorfold] DeepSeek-V4.1 app: {len(self.literals.lits)} added-token literals kept as text in chat requests",
++              flush=True)
+         self.reqlog = reqlog_mod.RequestLog.from_env(self.tok)
+         self._rl = threading.local()
+         self.images = images_mode()
+@@ -225,6 +228,8 @@ class Dsv41App(server.App):
+             raise ValueError("messages must be a non-empty list")
+         self.memory.restore(messages)
+         schema = schema_for_prompt(body) if self.schema_prompt else None
++        # patch 0003: the client's strings with every quoted added token hidden (copies; ``memory`` keyed the originals)
++        messages, tools, schema = self.literals.hide(messages), self.literals.hide(tools), self.literals.hide(schema)
+         hook, marker, omitted = None, None, [0]
+         if self.images == "placeholder":
+             def hook(part, where):
+@@ -246,7 +251,7 @@ class Dsv41App(server.App):
+ 
+     def prompt_ids(self, text: str, images=None) -> list[int]:
+         ids = self.prompt_memo.take(text)
+-        ids = list(ids) if ids is not None else self.prompt_tokens.encode(text)
++        ids = list(ids) if ids is not None else self.literals.encode(text, self.prompt_tokens.encode)
+         if images:                          # each <｜deepseek_image｜> -> its span's virtual ids (``vision_prep``)
+             ids = vision_prep.expand(ids, images, self.vision_host.s)
+         if self.reqlog is not None:
+@@ -262,7 +267,7 @@ class Dsv41App(server.App):
+     def tokenize(self, body: dict[str, Any]) -> list[int]:
+         if isinstance(body.get("messages"), list):
+             text, _, urls, _ = self._render(body)
+-            ids = list(self.tok.encode(text, add_special_tokens=False).ids)
++            ids = self.literals.encode(text, lambda s: list(self.tok.encode(s, add_special_tokens=False).ids))
+             if urls:
+                 ids = vision_prep.expand(ids, self._images(urls), self.vision_host.s, virtual=False)
+             return ids
+@@ -276,7 +281,7 @@ class Dsv41App(server.App):
+         try:
+             if chat:
+                 text, _, urls, _ = self._render(body)
+-                ids = self.prompt_tokens.encode(text)
++                ids = self.literals.encode(text, self.prompt_tokens.encode)
+                 self.prompt_memo.put(text, ids)
+                 n = len(ids)
+                 if urls:
+diff --git a/src/tensorfold/families/deepseek_v41/cuda/literal_tokens.py b/src/tensorfold/families/deepseek_v41/cuda/literal_tokens.py
+new file mode 100644
+index 0000000..eac8309
+--- /dev/null
++++ b/src/tensorfold/families/deepseek_v41/cuda/literal_tokens.py
+@@ -0,0 +1,98 @@
++# SPDX-License-Identifier: MIT
++# Copyright (c) 2026 erdholion. The DeepSeek-V4.1-Flash family of TensorFold (Apache-2.0): see THIRD_PARTY_NOTICES.md.
++"""Patch 0003: a quoted added token in a chat request stays text (after GLM TF patch 0122).
++
++The chat route renders a request into one string and encodes it whole, and the tokenizer takes every added token's text
++out of a string, special or not. A client that quotes ``</think>``, ``<｜User｜>`` or ``<｜end▁of▁sentence｜>`` (a log,
++another model's output, a chat template in a tool result) therefore reaches the model as those tokens: the reply splits
++at a quoted ``</think>``, a quoted ``<｜User｜>`` opens a turn, a quoted EOS ends the prompt. Measured on G19 (sweep #72,
++2026-10-13): ``A<｜User｜>B`` was 3 prompt tokens, ``A<|User|>B`` 7.
++
++``Table.hide`` replaces each literal in the client's strings (messages, tools, the response-format schema) by one
++private-use character per token before the template renders, so the tokens the template writes itself (roles, the
++generation prompt's ``<think>``, EOS) are untouched. ``Table.encode`` then encodes the rendered prompt around those
++characters, each literal as two ordinary pieces: its first character and the rest, encoded apart, so no added token can
++form. The model reads the exact text and copies it back exactly. Private-use characters a client sends in our range are
++replaced by U+FFFD first (never seen in practice; they would otherwise be read back as literals).
++
++``<｜deepseek_image｜>`` keeps its own escape (``encoding.escape_image_token``). The completions route is untouched:
++raw prompts may use control tokens on purpose.
++"""
++
++from __future__ import annotations
++
++import re
++from collections.abc import Callable
++
++PUA0 = 0xE000                                   # the first private-use character; one per literal from here
++IMAGE = "<｜deepseek_image｜>"
++
++
++def literals(tok) -> list[str]:
++    """The checkpoint's added tokens a client could quote, longest first (so a longer literal wins over a shorter one it
++    contains); multimodal placeholders and the image token excluded."""
++
++    try:
++        added = tok.get_added_tokens_decoder()
++    except AttributeError:                      # a tokenizer without the API (tests' stand-ins): nothing to hide
++        return []
++    out = {str(t.content) for t in added.values()}
++    out = [t for t in out if len(t) > 1 and "place_holder" not in t and "place▁holder" not in t and t != IMAGE]
++    return sorted(out, key=lambda t: (-len(t), t))
++
++
++class Table:
++    def __init__(self, tok) -> None:
++        self.tok = tok
++        self.lits = literals(tok)
++        self.char = {lit: chr(PUA0 + i) for i, lit in enumerate(self.lits)}
++        self.lit = {c: lit for lit, c in self.char.items()}
++        self.rx = re.compile(f"[{chr(PUA0)}-{chr(PUA0 + max(len(self.lits), 1) - 1)}]") if self.lits else None
++        self.pieces: dict[str, list[int]] = {}
++
++    def hide(self, x):
++        """``x`` (str, list, dict, or anything) with every literal in its strings replaced by its character; a copy."""
++
++        if isinstance(x, str):
++            if self.rx is None:
++                return x
++            if self.rx.search(x):
++                x = self.rx.sub("�", x)
++            for lit, c in self.char.items():
++                if lit in x:
++                    x = x.replace(lit, c)
++            return x
++        if isinstance(x, list):
++            return [self.hide(v) for v in x]
++        if isinstance(x, dict):
++            return {k: self.hide(v) for k, v in x.items()}
++        return x
++
++    def plain(self, lit: str) -> list[int]:
++        """The literal as ordinary pieces: its first character and the rest, encoded apart."""
++
++        ids = self.pieces.get(lit)
++        if ids is None:
++            ids = [*self.tok.encode(lit[0], add_special_tokens=False).ids,
++                   *self.tok.encode(lit[1:], add_special_tokens=False).ids]
++            self.pieces[lit] = ids
++        return ids
++
++    def encode(self, text: str, segment: Callable[[str], list[int]]) -> list[int]:
++        """``text`` (a rendered prompt) encoded by ``segment`` around its literal characters, each a literal's pieces."""
++
++        if self.rx is None or not self.rx.search(text):
++            return list(segment(text))
++        out: list[int] = []
++        at = 0
++        for m in self.rx.finditer(text):
++            if m.start() > at:
++                out += segment(text[at:m.start()])
++            out += self.plain(self.lit[m.group()])
++            at = m.end()
++        if at < len(text):
++            out += segment(text[at:])
++        return out
++
++
++__all__ = ["IMAGE", "PUA0", "Table", "literals"]
+diff --git a/tests/test_dsv41_literal_tokens.py b/tests/test_dsv41_literal_tokens.py
+new file mode 100644
+index 0000000..9793842
+--- /dev/null
++++ b/tests/test_dsv41_literal_tokens.py
+@@ -0,0 +1,103 @@
++"""Patch 0003: a quoted added token in a chat request stays text (``literal_tokens``), with a stand-in tokenizer whose
++added tokens encode as one id (999) and whose plain text encodes one id per character."""
++
++from __future__ import annotations
++
++import importlib.util
++import pathlib
++from types import SimpleNamespace
++
++SRC = pathlib.Path(__file__).resolve().parents[1] / "src/tensorfold/families/deepseek_v41/cuda/literal_tokens.py"
++spec = importlib.util.spec_from_file_location("literal_tokens", SRC)
++LT = importlib.util.module_from_spec(spec)
++spec.loader.exec_module(LT)
++
++ADDED = ["<｜User｜>", "<｜Assistant｜>", "</think>", "<think>", "<｜end▁of▁sentence｜>", "｜DSML｜",
++         "<|place_holder_mm_span_0021|>", "<｜place▁holder▁no▁0｜>", LT.IMAGE]
++
++
++class Tok:
++    def get_added_tokens_decoder(self):
++        return {i: SimpleNamespace(content=t) for i, t in enumerate(ADDED)}
++
++    def encode(self, text, add_special_tokens=False):
++        ids: list[int] = []
++        while text:
++            for t in sorted(ADDED, key=len, reverse=True):
++                if text.startswith(t):
++                    ids.append(999)
++                    text = text[len(t):]
++                    break
++            else:
++                ids.append(ord(text[0]))
++                text = text[1:]
++        return SimpleNamespace(ids=ids)
++
++
++def seg(tok):
++    return lambda s: tok.encode(s, add_special_tokens=False).ids
++
++
++def test_literals_longest_first_without_placeholders_or_the_image_token():
++    lits = LT.literals(Tok())
++    assert "<｜end▁of▁sentence｜>" in lits and "</think>" in lits and "｜DSML｜" in lits
++    assert not any("place" in t for t in lits) and LT.IMAGE not in lits
++    assert lits == sorted(lits, key=lambda t: (-len(t), t))
++
++
++def test_hide_replaces_literals_in_nested_structures_and_keeps_the_rest():
++    tb = LT.Table(Tok())
++    body = {"messages": [{"role": "user", "content": "log: </think> then <｜User｜>x"},
++                         {"role": "user", "content": [{"type": "text", "text": "a<think>b"},
++                                                      {"type": "image_url", "image_url": {"url": "u"}}]},
++                         {"role": "tool", "content": "<｜end▁of▁sentence｜> <｜DSML｜ calls>", "n": 3}],
++            "tools": [{"function": {"description": "returns </think>"}}]}
++    hid = tb.hide(body)
++    m = hid["messages"]
++    assert m[0]["content"] == "log: " + tb.char["</think>"] + " then " + tb.char["<｜User｜>"] + "x"
++    assert m[1]["content"][0]["text"] == "a" + tb.char["<think>"] + "b" and m[1]["content"][1] == {"type": "image_url", "image_url": {"url": "u"}}
++    assert m[2]["content"] == tb.char["<｜end▁of▁sentence｜>"] + " <" + tb.char["｜DSML｜"] + " calls>" and m[2]["n"] == 3
++    assert hid["tools"][0]["function"]["description"] == "returns " + tb.char["</think>"]
++    assert body["messages"][0]["content"] == "log: </think> then <｜User｜>x"       # the original is untouched
++
++
++def test_hide_leaves_the_image_token_and_plain_lookalikes():
++    tb = LT.Table(Tok())
++    assert tb.hide("see " + LT.IMAGE + " and <|User|> and </think >") == "see " + LT.IMAGE + " and <|User|> and </think >"
++
++
++def test_hide_neutralises_client_private_use_characters_in_our_range():
++    tb = LT.Table(Tok())
++    assert tb.hide("x" + chr(LT.PUA0) + "y") == "x�y"
++    assert tb.hide("x" + chr(LT.PUA0 + 200) + "y") == "x" + chr(LT.PUA0 + 200) + "y"      # outside the table: kept
++
++
++def test_encode_emits_the_literal_as_pieces_never_the_token():
++    tok = Tok()
++    tb = LT.Table(tok)
++    text = "<｜User｜>" + tb.hide("a</think>b<｜User｜>c") + "<｜Assistant｜>"       # the template's own tokens around it
++    ids = tb.encode(text, seg(tok))
++    assert ids[0] == 999 and ids[-1] == 999                                            # template tokens stay tokens
++    inner = ids[1:-1]
++    assert 999 not in inner
++    assert inner == [ord("a"), ord("<"), *map(ord, "/think>"), ord("b"), ord("<"), *map(ord, "｜User｜>"), ord("c")]
++    assert tb.encode("plain text", seg(tok)) == [ord(c) for c in "plain text"]
++
++
++def test_encode_at_the_edges_and_adjacent_literals():
++    tok = Tok()
++    tb = LT.Table(tok)
++    text = tb.hide("</think></think>")
++    assert tb.encode(text, seg(tok)) == 2 * [ord("<"), *map(ord, "/think>")]
++    text = tb.hide("<think>") + "tail"
++    assert tb.encode(text, seg(tok)) == [ord("<"), *map(ord, "think>"), *map(ord, "tail")]
++
++
++def test_a_tokenizer_without_added_tokens_is_a_passthrough():
++    class Bare:
++        def encode(self, text, add_special_tokens=False):
++            return SimpleNamespace(ids=[ord(c) for c in text])
++
++    tb = LT.Table(Bare())
++    assert tb.lits == [] and tb.hide("</think>") == "</think>"
++    assert tb.encode("</think>", seg(Bare())) == [ord(c) for c in "</think>"]

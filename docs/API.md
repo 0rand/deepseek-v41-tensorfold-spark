@@ -4,6 +4,12 @@ OpenAI-compatible on `HOST:PORT` (`127.0.0.1:8000` by default: put your own prox
 `/v1/chat/completions` (streaming, tool calls, `response_format`), `/v1/completions` (text or token ids),
 `/tokenize`, `/v1/models` (`max_model_len`), `/health`, `/metrics`.
 
+A DeepSeek added token quoted inside a chat request (`</think>`, `<think>`, `<｜User｜>`, `<｜Assistant｜>`,
+`<｜end▁of▁sentence｜>`, `<｜DSML｜>`, the tool-call markers; 59 literals read from `tokenizer.json` at start) is
+text to the model, never the token (`patches/0003`): a tool result or a pasted log that contains `</think>` cannot end
+the reasoning or inject a turn boundary. The literals are hidden before the chat template renders, so the template's
+own tokens are untouched; the `/v1/completions` route sends what it is given.
+
 Thinking follows DeepSeek-V4.1's encoding (`Reasoning Effort: N (range 1-100)`), on by default
 (`TF_DSV41_THINKING=0` turns it off). Both the top-level `reasoning_effort` and
 `chat_template_kwargs.reasoning_effort` are read (the kwargs win):
