@@ -20,16 +20,19 @@ predate the q28-v2 ragged-expert loader; keep their original 2.9 bpw pack until 
 > **Work in progress.** Measured on one pair of Sparks, against one baseline. Read
 > [what is not solved](docs/KNOWN-ISSUES.md) before relying on it.
 
-## Candidate: the Flash-1017 pack (flash17), validation in progress
+## Candidate: the Flash-1017 pack (flash17), not yet recommended
 
 A 2.80 bpw EXL3 pack of DeepSeek's 2026-10-17 update, `deepseek-ai/DeepSeek-V4.1-Flash-1017`:
 [`jayleaton/DeepSeek-V4.1-Flash-1017-EXL3-2.8bpw`](https://huggingface.co/jayleaton/DeepSeek-V4.1-Flash-1017-EXL3-2.8bpw)
 (**private while the upload completes**), 203.8 GB, vision included. It is **not the recommended pack yet**. Its
 candidate profile ([FLASH-1017](docs/FLASH-1017.md), [`config/prod-zig-flash17.env.example`](config/prod-zig-flash17.env.example))
-runs the same Zig `9131e10a` engine with the 1017 Engram shards, a 2.1M-token pool and a 2200 MHz GPU clock cap: at
-3.0M and 2.4M the head went under the 4 GiB floor during 4K prefills, and at 2.2M it reached 94 °C.
-Task results so far are **partial (235 of 356 items) and within noise** against Mia's 2.9 bpw pack and q28-v2; no
-gain is claimed. Short decode at the 3.0M pool measured +3.6 % (1 stream) and +7.3 % (4 streams) over q28-v2.
+runs the same Zig `9131e10a` engine with the 1017 Engram shards, a 2.1M-token pool and a 2000 MHz GPU clock cap. At
+3.0M and 2.4M the head went under the 4 GiB floor during 4K prefills; at 2.1M memory held (sampled minimum about
+5.1 GiB in the final run). The final run stopped on temperature: the worker reached 92 °C even at 2000 MHz and one
+request at a time, in a hot room without air conditioning. q28-v2 also reached 92 °C there, so this is an environment
+limit, not a property of the pack. Task results are **partial (300 of 356 items; MGSM and 15 LiveCodeBench items not
+run) and within noise** against Mia's 2.9 bpw pack and q28-v2; no gain is claimed. Short decode at the 3.0M pool and
+2250 MHz measured +3.6 % (1 stream) and +7.3 % (4 streams) over q28-v2; speed at 2000 MHz was not measured.
 Rollback is the unchanged q28-v2 profile.
 
 ## Latest merged kit: split KV and native images

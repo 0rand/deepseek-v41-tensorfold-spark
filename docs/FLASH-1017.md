@@ -1,10 +1,12 @@
 # Flash-1017 pack (flash17) on two DGX Sparks: candidate profile
 
 **Status: candidate, not the recommended pack.** The recommended pack and profile remain q28-v2 with
-[`config/prod-zig.env.example`](../config/prod-zig.env.example). The task results below are **PARTIAL (235 of 356
-items)** and all within noise. The Hugging Face repository is still **private** while its upload completes. The
-profile's pool (2.1M tokens) and clock cap (2200 MHz) are approved for the final validation run; that run's numbers
-are marked **PENDING** below and will be filled in from its receipts.
+[`config/prod-zig.env.example`](../config/prod-zig.env.example). The final validation run (2.1M pool, clock ladder
+2200 → 2100 → 2000 MHz) **passed memory but stopped on temperature**: the worker reached the 92 °C stop at 2000 MHz
+and one request at a time, in a hot room without air conditioning. q28-v2 also reached 92 °C on the same nodes during
+a restore, so this is treated as a limit of the test environment, not a property of the pack. The task results are
+**PARTIAL (300 of 356 items)** and all within noise. The Hugging Face repository is still **private** while its upload
+completes.
 
 ## The pack
 
@@ -50,14 +52,15 @@ are all unchanged.
 | `PREPARED_DIR` / `STATE_DIR` | q28-v2's | **fresh** | prepared files and calibration belong to one pack |
 | `TF_DSV41_BIAS_VL` | `/cache/dsv41-bias-vl` | **`/model`** | the 1017 learned image biases |
 | `TF_DSV41_POOL_TOKENS` | 3000000 | **2100000** | memory headroom ([below](#memory-and-thermal-findings)) |
-| GPU clock cap (host, both nodes) | 2250 MHz on the test nodes | **2200 MHz** | thermal headroom ([below](#memory-and-thermal-findings)) |
+| GPU clock cap (host, both nodes) | 2250 MHz on the test nodes | **2000 MHz** | thermal headroom ([below](#clock-ladder)) |
 
-The test nodes ran 2250 MHz caps through a host clock-cap service; set the cap with your own platform tooling and
-check the applied clock on both nodes before load. It is not an engine setting.
+The clock cap is a host setting, not an engine setting. The test nodes apply it through their existing clock-cap
+service with `nvidia-smi -lgc 300,2000`, and it persists across reboots on both nodes, for q28-v2 as well. Check the
+applied clock on both nodes before load.
 
 Each path key is set per node, so the measured candidate changed nine entries: model, prepared, Engram and state
-folders on each of the two nodes, plus `TF_DSV41_BIAS_VL`. The pool and clock cap were changed afterwards for memory
-and temperature.
+folders on each of the two nodes, plus `TF_DSV41_BIAS_VL`. The pool and the clock cap were changed afterwards, for
+memory and then for temperature.
 
 With a 2.1M-token pool, one slot can still fill its 1M context and two slots 1M each; four live slots share about
 525K each. The pool is shared across live slots, not reserved per slot.
@@ -69,22 +72,29 @@ CONFIG=config/prod-zig-flash17.env scripts/run-zig.sh 1               # rank 1, 
 ```
 
 Before any load, check both ranks: after-boot MemAvailable minus the 3.0 GiB serving dip must leave at least
-4.25 GiB (the 4 GiB floor plus 0.25 GiB margin). Then watch the head's MemAvailable and temperature during the first
-long prompts, not just at idle.
+4.25 GiB (the 4 GiB floor plus 0.25 GiB margin). Then watch both ranks' MemAvailable and temperature under load, not
+just at idle; on the test nodes the worker ran hotter and set the thermal limit.
 
 ## Memory and thermal findings
 
-All on the same two Sparks, Zig `9131e10a`, unchanged knobs except the pool, 2026-10-17/18 UTC. Lows are sampled
-about every 2 s, not continuous.
+All on the same two Sparks, Zig `9131e10a`, unchanged knobs except the pool and the clock cap, 2026-10-17/18 UTC.
+Lows and temperatures are sampled about every 1.4-2 s, not continuous. "Conc." is the number of generation
+requests admitted at once (the server keeps four slots).
 
-| Run | Pool (tokens) | Clock cap | Head / worker before load (GiB) | Engine guard worst point (GiB) | Observed low head / worker (GiB) | Outcome |
-| --- | ---: | --- | --- | --- | --- | --- |
-| q28-v2 restores (reference) | 3,000,000 | 2250 MHz | 7.54-7.58 / 7.57 | 4.54-4.58 / 4.57 | no matched load run | prod |
-| flash17, first boot | 3,000,000 | 2250 MHz | 6.93 / 6.95 (after canaries) | not retained | **3.977** / 5.106 | stop: memory |
-| flash17, reboot (populated state) | 3,000,000 | 2250 MHz | 7.52 / 7.64 | 4.42 / 4.63 | **3.558** / 4.13 (engine log) | stop: memory, first 4K prefill |
-| flash17 | 2,400,000 | 2250 MHz | 8.14 / 7.91 | 5.09 / 4.91 | **3.960** / 4.361 | stop: memory, first 4K prefill |
-| flash17 | 2,200,000 | 2250 MHz | 8.23 / 8.46 | 5.27 / 5.53 | 4.153 / 4.974 | **stop: head 94.1 °C** |
-| **flash17 (final validation)** | **2,100,000** | **2200 MHz** | **PENDING** | **PENDING** | **PENDING** | **PENDING** |
+| Run | Pool (tokens) | Clock cap | Conc. | Head / worker before load (GiB) | Engine guard worst point (GiB) | Observed low head / worker (GiB) | Outcome |
+| --- | ---: | --- | ---: | --- | --- | --- | --- |
+| q28-v2 restores (reference) | 3,000,000 | 2250 MHz | - | 7.54-7.58 / 7.57 | 4.54-4.58 / 4.57 | no matched load run | prod |
+| flash17, first boot | 3,000,000 | 2250 MHz | 4 | 6.93 / 6.95 (after canaries) | not retained | **3.977** / 5.106 | stop: memory |
+| flash17, reboot (populated state) | 3,000,000 | 2250 MHz | 4 | 7.52 / 7.64 | 4.42 / 4.63 | **3.558** / 4.13 (engine log) | stop: memory, first 4K prefill |
+| flash17 | 2,400,000 | 2250 MHz | 4 | 8.14 / 7.91 | 5.09 / 4.91 | **3.960** / 4.361 | stop: memory, first 4K prefill |
+| flash17 | 2,200,000 | 2250 MHz | 4 | 8.23 / 8.46 | 5.27 / 5.53 | 4.153 / 4.974 | stop: head 94.1 °C |
+| flash17, with the 4K prefill replay | 2,100,000 | 2200 MHz | 4 | 8.41 / 8.74 | 5.47 / 5.43 | 4.226 / 5.132 | stop: worker 92.1 °C |
+| flash17 | 2,100,000 | 2200 MHz | 1 | 8.28 / 8.49 | 5.46 / 5.58 | 5.735 / 6.415 | stop: fourth thermal pause in 30 min |
+| **flash17, final ladder** | **2,100,000** | **2200 → 2100 → 2000 MHz** | **1** | **8.229 / 8.105** | **5.37 / 5.19** | **5.095 / 5.819** | **stop: worker 92 °C at 2000 MHz** |
+
+**Memory passes at 2.1M.** In the final ladder the sampled minimum was about 5.1 GiB (head 5.095 GiB), and no run at
+2.1M went under the 4 GiB floor: the lowest was 4.226 GiB on the head, during the same 4K-prefill agent replay that
+took 3.0M and 2.4M under it. All three 2.1M runs stopped on temperature, none on memory.
 
 **The 4K prefill workspace, not the pack, sets the low point.** Each long prompt allocates a transient 2,268 MiB
 (~2.27 GB) 4K prefill workspace on both ranks and releases it after the prompt. The engine admits it when current
@@ -100,18 +110,49 @@ flash17 also starts about 0.62 GiB a rank lower after boot than q28-v2 on the sa
 weights (the prepared rank folders); the rest is symmetric across ranks and not attributed. The head is the binding
 rank because it also holds the HTTP server, the request log, the image cache and the vision tower.
 
-The boot guard prices the pool at about 0.987 GiB a rank per million tokens, so 2.1M frees about 0.1 GiB a rank more
-than 2.2M, whose observed head low was 4.153 GiB (0.153 GiB over the floor). That arithmetic is not a measurement;
-the final run decides.
+### Thermal limit
 
-**Thermal.** At 2.2M the head stayed above 4 GiB but its thermal-zone maximum reached **94.1 °C** with the 2250 MHz
-caps, which tripped the 94 °C safety stop (set below the 95-97 °C range where failures were seen earlier); the worker
-peaked at 92.2 °C. Earlier flash17 runs peaked at 93.1 / 92.3 °C; the reboot's memory stop happened at 66 °C. This is
-a hardware and profile observation under sustained load, not evidence that the quantization causes heat. The
-2200 MHz cap is the approved response.
+At the 2.1M runs an admission gate in front of the server enforced the thermal policy. It admits no new request at
+90 °C or above and resumes only when both nodes are at 85 °C or below. It stops the run at 92 °C, or at a fourth
+pause within 30 minutes. A separate guard stops the containers at 94 °C or under 4 GiB.
 
-Final run: **PENDING**: head and worker maximum temperature, head low MemAvailable, and whether the full 356-item
-suite completes.
+| Run | Clock cap | Conc. | Head / worker max (°C) | What stopped it |
+| --- | --- | ---: | --- | --- |
+| flash17, 2.2M | 2250 MHz | 4 | 94.1 / 92.2 | 94 °C guard (before the 92 °C rule existed) |
+| flash17, 2.1M | 2200 MHz | 4 | 89.5 / 92.1 (MMLU-Pro STEM) | 92 °C stop on the worker |
+| q28-v2 restore after that run | 2200 MHz | restore checks | 90.9 / 92.0 | (restore; 32K / 131K long-context checks) |
+| flash17, 2.1M | 2200 MHz | 1 | 90.5 / 91.6 | fourth pause in 30 min |
+| flash17, 2.1M, final ladder | 2100 → 2000 MHz | 1 | 91.5 / 92.1 | 92 °C stop on the worker, at 2000 MHz |
+| q28-v2 restore after the ladder | 2000 MHz | 1 | 89.0 / 88.8 | none (restore passed) |
+
+The final ladder's maxima by suite and cap:
+
+| Suite / cap | Head max (°C) | Worker max (°C) | Head min available (GiB) | Worker min available (GiB) |
+| --- | ---: | ---: | ---: | ---: |
+| MATH-500 / 2100 MHz | 91.5 | 88.9 | 5.954 | 6.345 |
+| MMLU-Pro STEM / 2100 MHz | 89.0 | 89.5 | 6.190 | 6.466 |
+| SciCode / 2100 MHz | 89.5 | 90.1 | 5.650 | 6.268 |
+| SciCode / 2000 MHz | 89.3 | 89.5 | 5.845 | 6.295 |
+| LiveCodeBench / 2000 MHz | 90.3 | 92.1 | 5.095 | 5.819 |
+
+**This is an environment limit, not a property of the pack.** The runs were in a hot room without air conditioning.
+q28-v2, the recommended pack, also reached 92.0 °C on the worker on the same nodes at 2200 MHz during its restore
+checks. No matched thermal run of q28-v2 under the same task load exists, so these numbers do not show that flash17
+runs hotter or cooler than q28-v2. Even at 2000 MHz and one request at a time, this room did not keep the worker under
+92 °C for a sustained benchmark. 2000 MHz was the lowest approved cap, and the stop thresholds were not relaxed; the
+next attempt needs a cooler room or better node cooling, and resumes the remaining 56 items.
+
+### Clock ladder
+
+| Step | Cap (both nodes) | When (UTC, 2026-10-18) | Why |
+| --- | --- | --- | --- |
+| prior production | 2250 MHz | - | the 2.2M run reached 94.1 °C here |
+| approved | 2200 MHz | from 02:26 | 2.1M runs at concurrency 4, then 1 |
+| ladder step 1 | 2100 MHz | 05:32:55 / 05:32:59 | applied while idle |
+| ladder step 2 | 2000 MHz | 05:57:21 | after five minutes at or above 88 °C on the worker; applied idle at 81.4 / 81.0 °C |
+| now | **2000 MHz, persistent** | - | kept after rollback, for q28-v2 too |
+
+Speed at 2000 MHz was not measured, for flash17 or for q28-v2.
 
 ## Fidelity to the release (retention, as served)
 
@@ -135,52 +176,55 @@ pack keeps of September on science, math, chat and multilingual, ties on code, a
 of 1017 on code and tools. Teacher-forced short-context fidelity did not predict task results for q28-v2, so the
 task suite decides usefulness.
 
-## Task results: PARTIAL (235 of 356 items)
+## Task results: PARTIAL (300 of 356 items)
 
-**PARTIAL. All differences are within noise; every interval includes zero.** No claim is made that flash17 beats
+**PARTIAL: MGSM (40 items) and 15 of the 20 LiveCodeBench items were not run, nor one MBPP+ item; the thermal stop
+ended the run.** All differences are within noise: every interval includes zero. No claim is made that flash17 beats
 Mia's pack or q28-v2 on tasks.
 
 Same frozen items and scorers as the matched baseline: greedy (T0, top_p 1, seed 0), thinking on, effort high,
-max_tokens 32,768, concurrency 4, pass@1 (strict score == 1). Conservative paired 95 % intervals: Bonferroni
-Clopper-Pearson 97.5 % bounds on each comparison's win and loss counts, per suite, not simultaneous across suites.
+max_tokens 32,768, pass@1 (strict score == 1). Conservative paired 95 % intervals: Bonferroni Clopper-Pearson 97.5 %
+bounds on the two discordant counts of each comparison, per suite, not simultaneous across suites. Half-width is half
+the interval's width.
 
-| Suite (observed / planned) | flash17 | Mia 2.9 bpw | q28-v2 | Δ vs Mia, points [95 % CI] | Δ vs q28-v2, points [95 % CI] |
+| Suite (completed / planned) | flash17 | Mia 2.9 bpw | q28-v2 | Δ vs Mia, points [95 % CI]; half-width | Δ vs q28-v2, points [95 % CI]; half-width |
 | --- | ---: | ---: | ---: | --- | --- |
-| HumanEval+ 40 / 40 | 34 / 40 | 34 / 40 | 33 / 40 | +0.00 [-14.89, +14.89] | +2.50 [-10.34, +14.92] |
-| MBPP+ 59 / 60 | 50 / 59 | 49 / 59 | 50 / 59 | +1.69 [-10.05, +13.05] | +0.00 [-12.79, +12.79] |
-| MMLU-Pro STEM 90 / 100 | 86 / 90 | 85 / 90 | 83 / 90 | +1.11 [-4.74, +6.88] | +3.33 [-4.22, +10.42] |
-| BFCL 40 / 40 | 39 / 40 | 39 / 40 | 39 / 40 | +0.00 [-10.38, +10.38] | +0.00 [-10.38, +10.38] |
-| Tool chains 6 / 6 | 6 / 6 | 6 / 6 | 4 / 6 | +0.00 [-51.83, +51.83] | +33.33 [-48.82, +81.61] |
-| LiveCodeBench 0 / 20 | **PENDING** | 13 / 20 | 13 / 20 | **PENDING** | **PENDING** |
-| MATH-500 0 / 40 | **PENDING** | 36 / 40 | 36 / 40 | **PENDING** | **PENDING** |
-| MGSM 0 / 40 | **PENDING** | 40 / 40 | 40 / 40 | **PENDING** | **PENDING** |
-| SciCode first step 0 / 10 | **PENDING** | 6 / 10 | 5 / 10 | **PENDING** | **PENDING** |
+| HumanEval+ (40 / 40) | 34 / 40 | 34 / 40 | 33 / 40 | +0.0 [-14.9, +14.9]; 14.9 | +2.5 [-10.3, +14.9]; 12.6 |
+| MBPP+ (59 / 60) | 50 / 59 | 49 / 59 | 50 / 59 | +1.7 [-10.0, +13.0]; 11.5 | +0.0 [-12.8, +12.8]; 12.8 |
+| LiveCodeBench (5 / 20) | 5 / 5 | 4 / 5 | 4 / 5 | +20.0 [-58.1, +76.4]; 67.3 | +20.0 [-58.1, +76.4]; 67.3 |
+| MMLU-Pro STEM (100 / 100) | 93 / 100 | 91 / 100 | 90 / 100 | +2.0 [-4.1, +7.9]; 6.0 | +3.0 [-5.3, +10.9]; 8.1 |
+| MATH-500 (40 / 40) | 36 / 40 | 36 / 40 | 36 / 40 | +0.0 [-10.4, +10.4]; 10.4 | +0.0 [-10.4, +10.4]; 10.4 |
+| SciCode first step (10 / 10) | 6 / 10 | 6 / 10 | 5 / 10 | +0.0 [-35.5, +35.5]; 35.5 | +10.0 [-35.4, +49.1]; 42.2 |
+| BFCL (40 / 40) | 39 / 40 | 39 / 40 | 39 / 40 | +0.0 [-10.4, +10.4]; 10.4 | +0.0 [-10.4, +10.4]; 10.4 |
+| Tool chains (6 / 6) | 6 / 6 | 6 / 6 | 4 / 6 | +0.0 [-51.8, +51.8]; 51.8 | +33.3 [-48.8, +81.6]; 65.2 |
+| MGSM (0 / 40) | not run | - | - | unavailable | unavailable |
 
-The Mia and q28-v2 counts in the pending rows are their full-suite baseline results, shown for reference only.
+The Mia and q28-v2 columns are their results on the same completed items. All science items (MMLU-Pro STEM, MATH-500,
+SciCode) are complete. One saved MMLU-Pro STEM row exhausted the 32,768-token limit without an answer; it counts as a
+failure and was not retried. Requests cut off by a stop are excluded as infrastructure errors, not counted as wrong.
 
 Limits of these partial results:
 
-- **Selection.** Suites ran science first and stopped early; the 90 STEM items are the ones that finished first. The
+- **Selection.** Suites ran in a fixed order and stopped early, so the completed subset is completion-selected. The
   intervals describe the observed paired items only.
-- **Mixed runtime.** 145 items (HumanEval+, MBPP+, BFCL, chains) ran at the 3.0M pool; the 90 STEM items at 2.2M.
+- **Mixed runtime.** The 300 rows ran across the attempts above: 145 at 3.0M / 2250 MHz, 90 at 2.2M / 2250 MHz, 7 at
+  2.1M / 2200 MHz, 50 at 2.1M / 2100 MHz and 8 at 2.1M / 2000 MHz. Generation settings were the same throughout;
+  admission concurrency was 4 in the earlier attempts and 1 in the last two.
 - **Different engines and bases.** The Mia and q28-v2 references ran on the Python engine `8474f31` with pools of
   524,288 and 1,400,000 tokens; flash17 ran on Zig `9131e10a`. 1017 is also a newer base model than September, so a
   task difference would not by itself be a quantization difference.
 - GPQA-Diamond is not in the suite (gated access). SciCode is first subproblems only; tool chains are simulated.
 
-Final run (pool 2.1M, 2200 MHz): **PENDING**: the complete 356-item table with paired intervals against both
-references, replacing the partial rows above.
-
 ## Images, tools and agent sessions
 
 | Check | Result | Config |
 | --- | --- | --- |
-| VQA (20 questions) | 20 / 20 | pools 3.0M, 2.4M and 2.2M |
-| `image_url` chart, screenshot and photo probes | 3 / 3, answers reviewed | pools 3.0M, 2.4M and 2.2M |
-| BFCL subset / tool chains | 39 / 40, 6 / 6 | pool 3.0M |
-| OpenCode sessions (multi-file build, bug fix, read / edit / bash) | 3 / 3, protected tests unchanged | pool 3.0M |
-| OpenCode multi-file build | completed, visible and held-out tests passed; strict harness false (one sandbox permission denial, recovered) | pool 2.2M |
-| Final run | **PENDING** | pool 2.1M, 2200 MHz |
+| VQA (20 questions) | 20 / 20 | pools 3.0M, 2.4M, 2.2M (2250 MHz) and 2.1M (2200 MHz), concurrency 4 |
+| `image_url` chart, screenshot and photo probes | 3 / 3, answers reviewed | the same four configs |
+| BFCL subset / tool chains | 39 / 40, 6 / 6 | pool 3.0M, 2250 MHz |
+| OpenCode sessions (multi-file build, bug fix, read / edit / bash) | 3 / 3, protected tests unchanged | pool 3.0M, 2250 MHz |
+| OpenCode multi-file build | completed, visible and held-out tests passed; strict harness false (one sandbox permission denial, recovered) | pools 2.2M (2250 MHz) and 2.1M (2200 MHz) |
+| Final ladder (2.1M, 2100 / 2000 MHz) | not run: the thermal stop came first | - |
 
 ## Speed
 
@@ -201,13 +245,14 @@ The prompts encode to 37,985 and 154,194 tokens for flash17 (37,977 and 154,186 
 prompt tokens over time to first token (flash17: 14.409 s and 62.593 s), including HTTP overhead. The pool and the
 clock cap both changed for the candidate profile, so these numbers do not describe it.
 
-Final run (pool 2.1M, 2200 MHz): **PENDING**: the same cells, with q28-v2 at its own profile for comparison.
+**Speed at the final clock (2000 MHz) was not measured**, for flash17 or q28-v2: the thermal stop came before the speed
+gate. Expect lower decode than the table above at a 2000 MHz cap.
 
 ## Rollback to q28-v2
 
 The q28-v2 profile is unchanged by this candidate. Stop rank 0 first and let it drain, then start both ranks with the
 q28-v2 config (its own model, Engram, prepared and state folders, `TF_DSV41_BIAS_VL=/cache/dsv41-bias-vl`, pool
-3,000,000) and restore the clock cap you ran q28-v2 with:
+3,000,000). Keep the clock cap your room needs; the test nodes keep 2000 MHz for q28-v2 too:
 
 ```bash
 docker stop -t $((DRAIN_S + 60)) tensorfold-zig-r0   # rank 0 node
@@ -218,4 +263,6 @@ CONFIG=config/prod-zig.env scripts/run-zig.sh 1      # rank 1, then rank 0 on it
 Check the answer to the quick-start canary (391) and, if you kept them, your saved replies. Keep the q28-v2 pack,
 Engram shards and prepared folders on disk while evaluating flash17; the rollback needs them, and rebuilding the
 prepared folders takes several minutes. Every measured flash17 attempt above ended by restoring q28-v2 on the same
-engine; each restore passed the saved-reply, long-context hash, image and health checks.
+engine. The final restore at 2000 MHz passed the 16 saved replies, both long-context hashes, the image probe and the
+health checks. One earlier restore at 2200 MHz could not finish its long-context check: it was paused for temperature
+(see the thermal table).
