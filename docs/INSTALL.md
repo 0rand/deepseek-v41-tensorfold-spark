@@ -63,6 +63,23 @@ curl -s localhost:8000/v1/chat/completions -H 'Content-Type: application/json' -
 scripts/serve.sh status | logs [0|1] | canary | stop | restart
 ```
 
+**The 1017 release.** [deepseek-ai/DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017)
+has the same architecture and config as V4.1-Flash, with new weights. These steps serve it unchanged, with four
+differences:
+
+- The pack is [LibertAIDAI/DeepSeek-V4.1-Flash-1017-EXL3-2.9bpw](https://huggingface.co/LibertAIDAI/DeepSeek-V4.1-Flash-1017-EXL3-2.9bpw),
+  whose tensors match Mia-AiLab's 2.9 bpw pack.
+- Its Engram tables changed. Pack them from the 1017 repo's shards 47 and 48 (`pack_engram.py --list` names them).
+- It ships no chat template, and the server stops without one. `encoding/encoding.py` is byte-identical in the two
+  releases, so Mia-AiLab's `chat_template.jinja` applies: copy it into the pack on both nodes.
+- `serve.sh cache` fetches the image routing bias from the older release when none is there. Fetch the 1017 one first:
+  `python -m tensorfold.families.deepseek_v41.cuda.bias_vl_fetch $TF_DSV41_BIAS_VL --repo deepseek-ai/DeepSeek-V4.1-Flash-1017`
+  in the image, on both nodes.
+
+On two Sparks it measured 100.6 tok/s on code at one stream and 155.8 at four (recipe defaults), with
+[BobClawblaw/deepseek-v41-flash-1017-2x-dgx-sparks](https://github.com/BobClawblaw/deepseek-v41-flash-1017-2x-dgx-sparks)
+scripting these steps.
+
 **5. Run it unattended** (optional): a watchdog tick every minute (heals after 3 bad ticks, at most every 30 min; a
 fail-fast exit, code 70, heals on the first tick, at most every 2 min) and a start at boot.
 

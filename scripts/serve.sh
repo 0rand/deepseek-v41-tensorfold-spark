@@ -68,6 +68,8 @@ container_args() { # $1 = rank: `docker run` options of that rank's container (n
     a+=" -e TF_DSV41_LAUNCH_T0=$(date +%s.%N)"
     a+=" $(env | grep -E '^(TF_DSV41_[A-Z0-9_]+|GLM53_TF_[A-Z0-9_]+|(MI)?MALLOC_[A-Z_]+)=' | grep -vE '^TF_DSV41_(LAUNCH_T0|IMAGE_ID)=' | sort | sed 's/^/-e /' | tr '\n' ' ')"
     a+=" -e NCCL_SOCKET_IFNAME=$NCCL_SOCKET_IFNAME -e NCCL_IB_HCA=$NCCL_IB_HCA -e GLOO_SOCKET_IFNAME=$NCCL_SOCKET_IFNAME"
+    # GB10: NCCL's cuMem allocations exhausted the driver's pool at boot (NV_ERR_NO_MEMORY), failing later starts
+    a+=" -e NCCL_CUMEM_HOST_ENABLE=${NCCL_CUMEM_HOST_ENABLE:-0} -e NCCL_CUMEM_ENABLE=${NCCL_CUMEM_ENABLE:-0}"
     echo "$a"
 }
 
