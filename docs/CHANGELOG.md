@@ -16,8 +16,9 @@ The production engine went `767ad9f` (G13) -> `356a188` (G14) -> `7954c1d` (G15a
   served copy (rewritten shards, hard links for the rest), verified by narrowing back to the source bytes; only
   needed until `engine/zig` has the half-stored F32 natives loader change.
 - **`config/prod-zig-eaq.env.example`** for Mia's AI Lab's DeepSeek-V4.1-Flash-1017 EXL3 EAQ v1 2.9 bpw pack (MIT,
-  experimental), with its own folders and the pool and prefill floor left to measure; Mia's AI Lab found which
-  tensors it stores F16. Speed and quality are pending Spark measurements ([PACKS](PACKS.md)).
+  experimental), with its own folders and tested benchmark memory values (pool 170000, prefill workspace floor
+  4.75 GiB, graph floor 64 GiB: eager decode); Mia's AI Lab found which tensors it stores F16. Measured on 2x Spark:
+  code decode level with flash17, quality 316/356 vs 320/356 (paired -1.12 pp), ~170K pool ([PACKS](PACKS.md)).
 - **Docs**: [PACKS](PACKS.md); low memory headroom (smaller pool, 2K prefill segments, eager decode windows and
   `TF_DSV41_GRAPH_FLOOR_GIB`) in [KNOWN-ISSUES](KNOWN-ISSUES.md#low-memory-headroom).
 

@@ -35,7 +35,8 @@
 
 A larger pack, a larger pool or other software on a node takes the engine into its low-memory fallbacks. None of
 them changes the output; they cost speed, and the decode one is easy to miss. The EAQ pack
-([PACKS](PACKS.md)) is 3.18 GiB a rank larger than flash17, so expect all three until its profile is measured.
+([PACKS](PACKS.md)) is 3.18 GiB a rank larger than flash17 and meets all three on 2x Spark; its profile sets a
+170K pool and forces eager decode (`TF_DSV41_GRAPH_FLOOR_GIB=64`).
 
 - **A smaller pool.** The boot check prices the pool against each rank's measured memory and refuses one that would
   leave the worst predicted dip under the 4 GiB hard floor; its log names the largest pool that fits
