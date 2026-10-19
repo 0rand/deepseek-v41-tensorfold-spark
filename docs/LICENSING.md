@@ -11,6 +11,7 @@
 | Ported upstream code in `patches/0001` | from later TensorFold releases (0.3.6.2, 0.5.0), MIT, Copyright (c) 2026 TensorFold contributors; each ported piece names its source commit. |
 | xgrammar (structured output) | Apache-2.0 ([mlc-ai/xgrammar](https://github.com/mlc-ai/xgrammar)), installed into the image by pip, not vendored. |
 | Docker base image | NVIDIA Deep Learning Container License (`nvcr.io/nvidia/pytorch:26.07-py3`) |
+| Model weights, optional second pack (not included) | [`Mia-AiLab/DeepSeek-V4.1-Flash-1017-EXL3-EAQ-v1-2.9-bpw`](https://huggingface.co/Mia-AiLab/DeepSeek-V4.1-Flash-1017-EXL3-EAQ-v1-2.9-bpw) @ `6d54be4f` ([PACKS](PACKS.md)): **MIT, Mia's AI Lab**; experimental, quality not measured by its authors. Downloaded by the user, not redistributed; its base is `deepseek-ai/DeepSeek-V4.1-Flash-1017` (MIT). No code from Mia's Apache-2.0 serving recipe is included: `scripts/check_pack.py` and `scripts/widen_pack.py` are this project's own. |
 | Model weights (not included) | `dealignai/DeepSeek-V4.1-Flash-UNCENSORED-EXL3-2.9bpw` (measured here), its base `Mia-AiLab/DeepSeek-V4.1-Flash-EXL3-2.9bpw`, and `deepseek-ai/DeepSeek-V4.1-Flash` (for the Engram tables): each under its model card's terms. The uncensored weights have refusals removed; you are responsible for how you use them. |
 
 Nothing from the MiaAI-Lab DeepSeek kit's AGPL-3.0 code is included: the engine reads the pack and the Engram shard

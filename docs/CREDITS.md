@@ -14,6 +14,11 @@
   [2.9 bpw EXL3 pack](https://huggingface.co/Mia-AiLab/DeepSeek-V4.1-Flash-EXL3-2.9bpw) on Hugging Face
   ([Mia-AiLab](https://huggingface.co/Mia-AiLab)); their GLM-5.3 kit's fat-expert MoE design also lives on in
   `patches/0001`.
+- Mia's AI Lab ([Mia-AiLab](https://huggingface.co/Mia-AiLab)): the
+  [DeepSeek-V4.1-Flash-1017 EXL3 EAQ v1 2.9 bpw pack](https://huggingface.co/Mia-AiLab/DeepSeek-V4.1-Flash-1017-EXL3-EAQ-v1-2.9-bpw)
+  (MIT), the optional second pack ([PACKS](PACKS.md)), and the finding, in their
+  [1017 serving recipe](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks), of which of its
+  tensors are stored F16 and must be widened for this engine (our tools re-implement that step; no code copied).
 - [dealignai](https://huggingface.co/dealignai/DeepSeek-V4.1-Flash-UNCENSORED-EXL3-2.9bpw): the uncensored 2.9 bpw
   variant measured here.
 - [turboderp / ExLlamaV3](https://github.com/turboderp-org/exllamav3): the EXL3 format.

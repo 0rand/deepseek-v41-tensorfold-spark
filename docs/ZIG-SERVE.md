@@ -374,3 +374,10 @@ drop `KV_SPLIT` and `KV_SPLIT_COMPACT` and set `POOL_TOKENS=1400000`.
 `PREFILL_PIECES=1`, replay mode and the multi-segment AOT programs `aot-needs` lists under them.
 Do not equate the serving profile with enabling every experimental knob: the engine has more default-off paths
 than the profile uses.
+
+### Low memory headroom
+
+A larger pack (EAQ: 3.18 GiB a rank more than flash17, [PACKS](PACKS.md)), a larger pool or other software on a node
+lowers the boot check's maximum pool, sends 4K prefill pieces to 2K segments and can stop new decode CUDA graphs from
+capturing (they run eagerly while under the floor). How to see each one in `/health` and the logs, and the
+`TF_DSV41_GRAPH_FLOOR_GIB` trade-off: [KNOWN-ISSUES, low memory headroom](KNOWN-ISSUES.md#low-memory-headroom).

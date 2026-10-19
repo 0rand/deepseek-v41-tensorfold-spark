@@ -3,6 +3,24 @@
 The production engine went `767ad9f` (G13) -> `356a188` (G14) -> `7954c1d` (G15a) -> `da5ae43` (G16) -> `cd4245a`
 (G18) -> **`7bd2d67`** (G19). Each window's write-up is in [`docs/campaign/`](campaign/README.md).
 
+## Optional second pack (EAQ) and pack tools
+
+- **`PACK` selects the served pack** in `scripts/run-zig.sh`: unset or `flash17` reads `config/prod-zig.env` as
+  before; `PACK=eaq` reads `config/prod-zig-eaq.env`. A profile that names its pack claims its `STATE_DIR`
+  (`pack-id`), so one pack's draft calibration is never reused for another, and the launcher refuses engine
+  settings still holding a `<placeholder>`.
+- **`scripts/check_pack.py`**: checks an EXL3 1017-layout pack from its index and headers against what engine
+  `9131e10a` loads (native dtypes per store class, `mul1` markers and codebook, gate = up widths, leftovers), lists
+  its EXL3 widths and its size against flash17.
+- **`scripts/widen_pack.py`**: exact F16 / BF16 -> F32 widening of the router bias and DSpark confidence head into a
+  served copy (rewritten shards, hard links for the rest), verified by narrowing back to the source bytes; only
+  needed until `engine/zig` has the half-stored F32 natives loader change.
+- **`config/prod-zig-eaq.env.example`** for Mia's AI Lab's DeepSeek-V4.1-Flash-1017 EXL3 EAQ v1 2.9 bpw pack (MIT,
+  experimental), with its own folders and the pool and prefill floor left to measure; Mia's AI Lab found which
+  tensors it stores F16. Speed and quality are pending Spark measurements ([PACKS](PACKS.md)).
+- **Docs**: [PACKS](PACKS.md); low memory headroom (smaller pool, 2K prefill segments, eager decode windows and
+  `TF_DSV41_GRAPH_FLOOR_GIB`) in [KNOWN-ISSUES](KNOWN-ISSUES.md#low-memory-headroom).
+
 ## Bugs fixed
 
 - **A duplicate image in one request killed both ranks** (G16). The vision row store counted a reference per
