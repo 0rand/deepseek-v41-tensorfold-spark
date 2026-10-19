@@ -4,18 +4,35 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 rank=${1:?usage: run-zig.sh 0|1 [--dry-run|--check-aot]}
 [[ "$rank" == 0 || "$rank" == 1 ]] || { echo 'rank must be 0 or 1' >&2; exit 2; }
-config=${CONFIG:-config/prod-zig.env}
-[[ -f "$config" ]] || { echo "missing $config; copy config/prod-zig.env.example first" >&2; exit 2; }
+# PACK picks the served weight pack's config (docs/PACKS.md): unset or flash17 reads config/prod-zig.env (the
+# recommended flash17 profile copied there), any other id reads config/prod-zig-<id>.env (eaq:
+# config/prod-zig-eaq.env from config/prod-zig-eaq.env.example). CONFIG names a file directly and wins.
+selected=${PACK:-}
+[[ -z "$selected" || "$selected" =~ ^[a-z0-9][a-z0-9._-]*$ ]] || { echo "PACK=$selected: use a pack id such as eaq" >&2; exit 2; }
+if [[ -z "$selected" || "$selected" == flash17 ]]; then default_config=config/prod-zig.env
+else default_config=config/prod-zig-$selected.env; fi
+config=${CONFIG:-$default_config}
+[[ -f "$config" ]] || { echo "missing $config; copy its config/*.env.example first (docs/PACKS.md)" >&2; exit 2; }
+unset PACK
 set -a
 source "$config"
 set +a
+# A config may name its pack (PACK=<id>); a selected PACK must agree with it.
+declared=${PACK:-}
+if [[ -n "$selected" && -n "$declared" && "$selected" != "$declared" ]]; then
+    echo "PACK=$selected selected, but $config is the profile of pack $declared" >&2; exit 2
+fi
 for key in IMAGE TF_TP_MASTER NCCL_SOCKET_IFNAME NCCL_IB_HCA MODEL_DIR ENGRAM_DIR ASSETS_DIR PREPARED_DIR STATE_DIR CACHE_DIR; do
     [[ -n "${!key:-}" && "${!key}" != *'<'* ]] || { echo "set $key in $config" >&2; exit 2; }
 done
-# Pass values by environment name, preserving spaces in values.
+# Pass values by environment name, preserving spaces in values. A value still holding a <placeholder> stops here:
+# some engine knobs fall back to their default on a value they cannot parse.
 envs=()
 while IFS='=' read -r key value; do
-    case "$key" in TF_DSV41_*|GLM53_TF_*|NCCL_*) envs+=(-e "$key");; esac
+    case "$key" in TF_DSV41_*|GLM53_TF_*|NCCL_*)
+        [[ "$value" != *'<'* ]] || { echo "set $key in $config (still the placeholder $value)" >&2; exit 2; }
+        envs+=(-e "$key");;
+    esac
 done < <(env)
 # --check-aot: every Triton variant this env launches, checked against this rank's aot/ (host only, no GPU work).
 # Run it before the first start and after any serving-setting change; it needs the fill's sigs.json in ASSETS_DIR.
@@ -79,4 +96,17 @@ if [[ "$table" == /cache/* && ! -e "$CACHE_DIR/${table#/cache/}" ]]; then
     echo "copied config/pfdense-table.json to $CACHE_DIR/${table#/cache/} (TF_DSV41_PF_DENSE_TABLE=$table)" >&2
 fi
 mkdir -p "$PREPARED_DIR" "$STATE_DIR/sessions"
+# A config that names its pack owns its state folder: the draft calibration under it is not keyed by pack at
+# engine 9131e10a, so a state folder that served another pack is refused rather than silently reused.
+if [[ -n "$declared" ]]; then
+    owner_file="$STATE_DIR/pack-id"
+    if [[ -f "$owner_file" ]]; then
+        owner=$(< "$owner_file")
+        [[ "$owner" == "$declared" ]] || {
+            echo "STATE_DIR $STATE_DIR belongs to pack $owner ($owner_file), not $declared: give each pack its own" >&2
+            exit 2; }
+    else
+        printf '%s\n' "$declared" > "$owner_file"
+    fi
+fi
 exec "${args[@]}"

@@ -154,7 +154,7 @@ for patch_file in patches/*.patch; do
   patch -d build/python-source -p1 < "$patch_file"
 done
 export PY_SOURCE="$PWD/build/python-source/src"
-export PACK=/srv/models/flash17
+export MODEL_PATH=/srv/models/flash17   # the served pack's model folder
 export ASSETS=/srv/assets/rank-0
 mkdir -p "$ASSETS"
 # Run the following in the build image/environment, from engine/zig.
@@ -171,9 +171,9 @@ python tools/zig/triton_fill.py compile --py "$PY_SOURCE" --needs "$ASSETS/needs
   --options tools/zig/dsv41_triton_options.json --arch 121 --out "$ASSETS/aot"
 # rows default to TF_DSV41_CONTEXT + 2048 from the sourced env (1,050,624 at the 1M context)
 PYTHONPATH="$PY_SOURCE" python tools/zig/dsv41_rope_tables.py \
-  --config "$PACK/config.json" --out "$ASSETS/rope.bin"
-python tools/zig/dsv41_engram_host.py --py-src "$PY_SOURCE" --config "$PACK/config.json" \
-  --tokenizer "$PACK/tokenizer.json" --out "$ASSETS/engram-host.bin"
+  --config "$MODEL_PATH/config.json" --out "$ASSETS/rope.bin"
+python tools/zig/dsv41_engram_host.py --py-src "$PY_SOURCE" --config "$MODEL_PATH/config.json" \
+  --tokenizer "$MODEL_PATH/tokenizer.json" --out "$ASSETS/engram-host.bin"
 ```
 
 For the asset environment, build the builder stage with `docker build --target build -f docker/zig/Dockerfile
@@ -328,6 +328,11 @@ upstream TensorFold settings.
 
 `IMAGE`, `MODEL_DIR`, `ENGRAM_DIR`, `ASSETS_DIR`, `PREPARED_DIR`, `STATE_DIR`, and `CACHE_DIR` are required
 launcher inputs, not engine knobs. `HOST=localhost` and `PORT=8000` are launcher defaults for the HTTP listener.
+`PACK` selects the served pack's profile: unset or `flash17` reads `config/prod-zig.env` (unchanged), another id reads
+`config/prod-zig-<id>.env` (`PACK=eaq scripts/run-zig.sh 1`; [PACKS](PACKS.md)), and `CONFIG=<file>` still wins. A
+profile that sets `PACK=<id>` itself must agree with the selection and claims its `STATE_DIR` for that pack
+(`STATE_DIR/pack-id`); a start with another pack's state folder is refused. The launcher also refuses any engine
+setting still holding a `<placeholder>`.
 The maximum reply is 32768 tokens and the served model ID is `DeepSeek-V4.1-Flash-TF` in this small launcher.
 
 ### 4K prefill and its fallback
