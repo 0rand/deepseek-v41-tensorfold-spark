@@ -69,6 +69,7 @@ def main():
     parser.add_argument("--config", required=True)
     args = parser.parse_args()
     config = load_config(args.config)
+    period = config.get("sampler_period_s", 2.0)
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
         while True:
             started = time.monotonic()
@@ -76,11 +77,13 @@ def main():
             jobs = {"0": executor.submit(local_sample), "1": executor.submit(worker_sample, config)}
             for rank, job in jobs.items():
                 try:
+                    # Fixed per-rank bound (ssh 4 s, job 5 s) stays under the 6 s freshness window for every
+                    # period; a slow rank stretches this loop rather than overlapping samples.
                     result["samples"][rank] = job.result(timeout=5)
                 except Exception as exc:
                     result["errors"][rank] = str(exc)
             atomic(config["samples_path"], result)
-            time.sleep(max(0.1, 2 - (time.monotonic() - started)))
+            time.sleep(max(0.1, period - (time.monotonic() - started)))
 
 
 if __name__ == "__main__":

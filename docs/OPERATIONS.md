@@ -177,6 +177,20 @@ What it does (`scripts/guard`, standard-library Python 3.11+, no packages):
   prove the engine finished a request (a cut stream), it keeps that reservation and admits nothing new until the
   engine reports idle (reconciliation). `/__thermal/status` shows the queue, each waiter's reason and the
   reservations.
+- **Short-prompt admission (off by default).** Set `decode_admission_max_prompt_tokens` in `limits` (1..2048; absent
+  or 0 is off) to let short text prompts start together instead of one sample apart. The guard then counts each
+  generation request's prompt with the engine's `/tokenize` (3 s timeout) before admission. A prompt at or under the
+  limit does not take the prefill lane and does not make later requests wait for a post-token sample. Everything else
+  still applies to it: FIFO order (a short request behind a waiting long one keeps its place), the in-flight limit,
+  the admission cooldown, fresh telemetry, the 4.25 GiB margin over every retained reservation, its own reservation
+  until the engine finishes it, the engine health check and STOP. It still waits while a longer request holds the
+  lane and for the sample after that request's first token. Images, other routes, a failed or slow count and
+  watchdog probes take the normal path. `REQUEST_ADMITTED` events then carry `class` (`decode` or `prefill`) and
+  `prompt_tokens`. Keep the limit at or below the smaller of `TF_DSV41_PREFILL_CHUNK` and `TF_DSV41_PREFILL_ROWS`, so
+  such a prompt is one prefill segment.
+- **Sampler period.** `sampler_period_s` (2.0; 0.25..2.0) sets the sampler's interval (the 2 s above). A shorter period
+  shortens the post-token wait between long requests; each sample still opens one SSH connection to rank 1.
+  The 6 s freshness window and the per-node sample timeout do not change.
 - **Identity fences.** Generation is forwarded only while the serving env file's SHA-256 matches a snapshotted
   profile and both containers still have that profile's image, mounts, inference environment and host CPU set.
 - **Durable STOP evidence.** Before it cancels anything, a STOP writes (fsync) the raw and validated per-node samples,

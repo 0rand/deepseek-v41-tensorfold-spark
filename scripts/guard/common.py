@@ -161,6 +161,12 @@ def load_config(path):
     seconds = limits.get("queue_seconds", 1200)
     if type(seconds) is not int or not 1 <= seconds <= 1200:
         raise ValueError("queue timeout must be 1..1200 s")
+    decode = limits.get("decode_admission_max_prompt_tokens", 0)
+    if type(decode) is not int or not 0 <= decode <= 2048:
+        raise ValueError("decode admission prompt limit must be an integer 1..2048 tokens (absent or 0 = off)")
+    period = config.get("sampler_period_s", 2.0)
+    if type(period) not in (int, float) or not math.isfinite(period) or not 0.25 <= period <= 2.0:
+        raise ValueError("sampler period must be finite 0.25..2.0 s")
     if not re.fullmatch(r"[A-Za-z0-9_.@:-]+", config["worker_ssh"]) or config["worker_ssh"].startswith("-"):
         raise ValueError("invalid worker SSH target")
     return config

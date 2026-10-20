@@ -27,6 +27,7 @@
  "worker_ssh": "user@rank1.example",
  "containers": {"0": "tensorfold-zig-r0", "1": "tensorfold-zig-r1"},
  "watchdog_units": ["tf-zig-watchdog.timer"],
+ "sampler_period_s": 2.0,
  "limits": {
   "max_inflight": 4,
   "max_pending": 8,
@@ -37,7 +38,8 @@
   "upstream_seconds": 1800,
   "memory_transient_reserve_gib": 0.5,
   "prefill_admission_pause_c": 78,
-  "prefill_admission_resume_c": 70
+  "prefill_admission_resume_c": 70,
+  "decode_admission_max_prompt_tokens": 0
  },
  "profiles": {}
 }

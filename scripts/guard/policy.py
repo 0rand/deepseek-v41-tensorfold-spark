@@ -19,6 +19,7 @@ class Policy:
         self.active = {}
         self.request_metadata = {}
         self.prefill_request = None
+        self.admission_probe = None  # Decode-class native health probe token; never held past admission.
         self.prefill_completed_epoch = 0
         self.prefill_sample_epochs = {}
         self.memory_reservations = {}

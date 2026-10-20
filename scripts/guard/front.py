@@ -140,6 +140,13 @@ class Front(http.server.BaseHTTPRequestHandler):
             raise ValueError("incomplete body")
         return raw
 
+    def token_count(self, body):
+        """Bounded native /tokenize (3 s); any failure is a reason, never an exception."""
+        try:
+            return self.server.manager.backend.request_token_count(body, self.path), None
+        except Exception as exc:
+            return {}, type(exc).__name__
+
     def dispatch(self):
         manager, policy = self.server.manager, self.server.manager.policy
         if self.path == "/__thermal/status" and self.command == "GET":
@@ -249,13 +256,25 @@ class Front(http.server.BaseHTTPRequestHandler):
             if generation:
                 watcher = threading.Thread(target=watch_disconnect, name="guard-client-disconnect", daemon=True)
                 watcher.start()
-                admitted = self.server.admit(request_id, cancelled, probe=watchdog_probe)
+                # Decode-class admission (off unless configured): a natively counted short text prompt skips the
+                # prefill lane. Multimodal, unsupported routes, tokenize errors and probes keep the normal path.
+                decode_limit = self.server.config["limits"].get("decode_admission_max_prompt_tokens", 0)
+                counts = count_error = None
+                if decode_limit and not watchdog_probe:
+                    counts, count_error = self.token_count(body)
+                decode = (counts is not None and counts.get("count_source") == "native_tokenize"
+                          and type(counts.get("prompt_tokens")) is int and 0 <= counts["prompt_tokens"] <= decode_limit)
+                admitted = self.server.admit(request_id, cancelled, probe=watchdog_probe, decode=decode)
                 if not admitted:
                     self.close_connection = True
                     if watchdog_probe and not policy.data["terminal_stop"]:
                         return self.reply(429, {"code": "watchdog_deferred"})
                     return self.reply(503, {"error": "durable thermal STOP" if policy.data["terminal_stop"]
                                            else "thermal/memory queue deadline exceeded"})
+                admission = {}
+                if decode_limit:
+                    admission = {"class": "decode" if decode else "prefill",
+                                 "prompt_tokens": (counts or {}).get("prompt_tokens")}
                 with policy.lock:
                     policy.event(
                         "REQUEST_ADMITTED",
@@ -264,18 +283,20 @@ class Front(http.server.BaseHTTPRequestHandler):
                         body_sha256=body_sha,
                         inflight=policy.inflight,
                         admitted_clock_mhz=policy.data["clock_mhz"],
+                        **admission,
                     )
                 manager.verify_generation()
                 metadata = {"epoch": time.time(), "body_sha256": body_sha,
                             "prompt_tokens": None, "resumed_tokens": None, "count_source": "unavailable"}
                 with policy.lock:
                     policy.request_metadata[request_id] = metadata
-                try:
-                    counts = manager.backend.request_token_count(body, self.path)
-                    with policy.lock:
-                        metadata.update(counts)
-                except Exception as exc:
-                    metadata["count_error"] = type(exc).__name__
+                if counts is None:
+                    # Count once: reuse the pre-admission count (or its error) when decode admission is on.
+                    counts, count_error = self.token_count(body)
+                with policy.lock:
+                    metadata.update(counts)
+                    if count_error:
+                        metadata["count_error"] = count_error
             upstream = http.client.HTTPConnection(
                 "127.0.0.1",
                 self.server.upstream.port,
@@ -413,8 +434,12 @@ class Server(http.server.ThreadingHTTPServer):
         self.buffers = threading.BoundedSemaphore(config["limits"]["body_buffers"])
         self.connections = threading.BoundedSemaphore(config["limits"]["max_connections"])
 
-    def admit(self, request_id, cancelled=None, probe=False):
-        """Atomic prefill lane + per-request transient budget, before inflight increment."""
+    def admit(self, request_id, cancelled=None, probe=False, decode=False):
+        """Atomic prefill lane + per-request transient budget, before inflight increment.
+
+        decode=True (a natively counted short text prompt) neither takes the lane nor sets the post-token sample
+        wait; it still waits behind a lane held by a normal request and honors that request's post-token wait.
+        """
         policy = self.manager.policy
         limits = self.config["limits"]
         reserve = limits.get("memory_transient_reserve_gib", 0.5)
@@ -437,8 +462,11 @@ class Server(http.server.ThreadingHTTPServer):
                         return False
                     if recovering:
                         reason = None if policy.inflight == 0 else "native_completion_unverified"
+                    lane = not decode or recovering  # The idle proof of recovery keeps the lane path.
                     if policy.prefill_request is not None:
                         reason = "prefill_lane_busy"
+                    elif policy.admission_probe is not None:
+                        reason = "native_health_probe_busy"
                     elif policy.inflight >= limits["max_inflight"]:
                         reason = "inflight_limit"
                     other_waiters = any(key != request_id for key in policy.admission_waiters)
@@ -450,7 +478,16 @@ class Server(http.server.ThreadingHTTPServer):
                         policy.admission_waiters[request_id] = reason
                         policy.lock.wait(min(0.05, max(0, deadline - time.monotonic())))
                         continue
-                    policy.prefill_request = request_id
+                    # A decode-class request holds only a probe token across the unlocked health I/O below, so
+                    # one health observation is outstanding at a time, as with the lane. The token is cleared in
+                    # the same lock hold that commits the decision (reservation + inflight increment, or refusal),
+                    # so the next admission's health read and memory recheck already include this one; two
+                    # admissions can never both act on one observation taken before either increment. The FIFO
+                    # head rule orders this today; the token keeps it explicit and is never held past admission.
+                    if lane:
+                        policy.prefill_request = request_id
+                    else:
+                        policy.admission_probe = request_id
                     policy.admission_waiters[request_id] = "native_health_probe"
                 native_ready = False
                 health = {}
@@ -464,6 +501,8 @@ class Server(http.server.ThreadingHTTPServer):
                 except (OSError, ValueError, TypeError, AttributeError, http.client.HTTPException):
                     pass
                 with policy.lock:
+                    if policy.admission_probe == request_id:
+                        policy.admission_probe = None
                     if policy.data["terminal_stop"] or (cancelled is not None and cancelled.is_set()):
                         return False
                     # A user may arrive while the low-priority health I/O is unlocked.
@@ -488,7 +527,8 @@ class Server(http.server.ThreadingHTTPServer):
                         policy.inflight += 1
                         admitted = True
                         return True
-                    policy.prefill_request = None
+                    if policy.prefill_request == request_id:
+                        policy.prefill_request = None
                     if not recovering:
                         policy.admission_waiters[request_id] = "native_health_or_recheck_hold"
                     policy.lock.notify_all()
@@ -501,6 +541,8 @@ class Server(http.server.ThreadingHTTPServer):
                 policy.admission_waiters.pop(request_id, None)
                 if not admitted and policy.prefill_request == request_id:
                     policy.prefill_request = None
+                if policy.admission_probe == request_id:
+                    policy.admission_probe = None
                 policy.lock.notify_all()
 
     def process_request(self, request, client_address):
