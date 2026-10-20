@@ -77,6 +77,16 @@ MiaAI-Lab DeepSeek-V4.1 kit output (results/campaign/, results/kit-baseline/)
   Logs, metrics and benchmark output of the kit (https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-EXL3-2x-DGX-Sparks)
   as measured on our pair, including its effective configuration; no kit code.
 
+MiaAI-Lab DeepSeek-V4.1-Flash-1017 2x DGX Sparks recipe (bench/speed.py, scripts/preflight.py)
+  https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks (commit e65785cd), Apache License 2.0,
+  Copyright 2026 MiaAI-Lab. bench/speed.py quotes one prompt verbatim from that project's tools/bench.py (the
+  printing-press essay decode prompt, "Write a long, detailed essay about the history of the printing press, ..."),
+  so its decode and multi-stream numbers are comparable with that recipe's. Everything else in bench/speed.py and
+  scripts/preflight.py is this project's own implementation of ideas from that recipe: its benchmark suites and
+  wall-window aggregate, needle, exactness and prompt-reuse checks, the Anthropic Messages checks (its
+  tools/anthropiccheck.py, by Eduardo Florencio), the prompt-interleave measurement (Coinupbtc's work there),
+  Engram tables on each node's local disk and a memory check at start. No other code or text is copied.
+
 MMLU (bench/data/mmlu200.jsonl)
   200 questions of the MMLU test set (Hendrycks et al., https://github.com/hendrycks/test), MIT License.
 
