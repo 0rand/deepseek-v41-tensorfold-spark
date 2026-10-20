@@ -243,12 +243,12 @@ pub const Sessions = struct {
         try s.reset();
     }
 
-    fn restoreFn(ptr: *anyopaque, id: u32, ids: []const i64) anyerror!void {
+    fn restoreFn(ptr: *anyopaque, id: u32, want: fwd.Forward.Want, ids: []const i64) anyerror!void {
         const s: *Sessions = @ptrCast(@alignCast(ptr));
         const p = try s.gpa.alloc(u32, ids.len);
         defer s.gpa.free(p);
         for (ids, p) |t, *y| y.* = @intCast(t);
-        _ = try s.restore(id, if (ids.len > 0) p else null);
+        _ = try s.restoreAs(id, want, if (ids.len > 0) p else null);
     }
 
     /// A follower: the leader's admission (forward.zig op_sess_admit: [op, need, n, spilled ids...]).
@@ -522,8 +522,10 @@ pub const Sessions = struct {
         const n = prompt.len;
         // out of RAM no tokens are indexed: the history is the prompt's prefix (rounds.py `_admit`)
         const ids: ?[]const u32 = if (s.store.entry(h.id).ram) null else prompt[0..@intCast(h.pos)];
-        try s.f.sendRestore(h.id, ids);
-        if (!try s.restore(h.id, ids)) return .{ .damaged = true };
+        // the entry by its position and key too: a follower whose own entry under the id is another one refuses it
+        const want: fwd.Forward.Want = .{ .pos = h.pos, .key = s.store.entry(h.id).key };
+        try s.f.sendRestore(h.id, want, ids);
+        if (!try s.restoreAs(h.id, want, ids)) return .{ .damaged = true };
         std.log.scoped(.dsv41).info("sessions: slot {d} resumed {d} of {d} prompt tokens from {s}", .{ s.cur(), h.pos, n, if (h.ram) "RAM" else "NVMe" });
         return .{ .at = h.pos };
     }
@@ -556,21 +558,30 @@ pub const Sessions = struct {
 
     /// Entry `id` into the empty slot, agreed (lockstep.zig); false: not back on some rank, so a miss everywhere.
     pub fn restore(s: *Sessions, id: u32, ids: ?[]const u32) !bool {
+        return s.restoreAs(id, null, ids);
+    }
+
+    /// `restore` of the leader's entry `want` (the plan's restore, every rank): a rank whose own entry under `id` is not
+    /// that one fails its part (NotTheEntry), so every rank takes it as a miss and prefills afresh.
+    pub fn restoreAs(s: *Sessions, id: u32, want: ?fwd.Forward.Want, ids: ?[]const u32) !bool {
         if (s.f.slot.pos != 0 or s.kx.slot.len != 0) return error.SlotNotEmpty;
         try s.active();
-        const pos = s.store.entry(id).pos;
+        const pos = if (want) |w| w.pos else s.store.entry(id).pos;
         const g: ?lockstep.Agree = if (s.agreement) |*a| blk: {
             const x = a.agree();
             break :blk .{ .ctx = x.ctx, .all = x.all };
         } else null;
-        if (!try lockstep.agreed(g, s.restoreOn(id, ids), "a session restore", s.f.comm.rank())) {
+        if (!try lockstep.agreed(g, s.restoreOn(id, want, ids), "a session restore", s.f.comm.rank())) {
             try s.kx.truncate(0);
             s.f.slot = .{};
             s.hist[s.cur()].clearRetainingCapacity();
             s.ds_valid[s.cur()] = 0;
-            // a cache miss from here: the entry out of RAM and its file deleted, on every rank alike
-            if (s.store.entry(id).ram) try s.store.drop(id);
-            if (s.store.entry(id).live) try s.store.forget(id); // drop removed an entry no file holds
+            // a cache miss from here: the entry out of RAM and its file deleted, on every rank alike (a rank whose
+            // index holds no entry under the id has none to let go of)
+            if (s.store.has(id)) {
+                if (s.store.entry(id).ram) try s.store.drop(id);
+                if (s.store.entry(id).live) try s.store.forget(id); // drop removed an entry no file holds
+            }
             s.stats.damaged += 1;
             std.log.scoped(.dsv41).warn("sessions: slot {d}: the entry of {d} tokens did not come back; its prompt prefills from 0", .{ s.cur(), pos });
             return false;
@@ -580,7 +591,14 @@ pub const Sessions = struct {
     }
 
     /// This rank's restore of `id`: pages and bounded state (RAM or NVMe), the position, the slot's history.
-    fn restoreOn(s: *Sessions, id: u32, ids: ?[]const u32) !void {
+    /// `want`: the leader's entry; another entry here under the id (this rank's index went its own way) is refused before
+    /// any page moves.
+    fn restoreOn(s: *Sessions, id: u32, want: ?fwd.Forward.Want, ids: ?[]const u32) !void {
+        if (want) |w| if (!s.store.holds(id, w.pos, w.key)) {
+            const here: u64 = if (s.store.has(id) and s.store.entry(id).live) s.store.entry(id).pos else 0;
+            std.log.scoped(.dsv41).warn("sessions: rank {d}: entry {d} here is not the leader's (here {d} tokens, the leader's {d})", .{ s.f.comm.rank(), id, here, w.pos });
+            return error.NotTheEntry;
+        };
         const e = s.store.entry(id);
         const pos = e.pos;
         if (e.ram) {

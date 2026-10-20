@@ -567,8 +567,9 @@ pub const Forward = struct {
         ptr: *anyopaque,
         commit: *const fn (ptr: *anyopaque, ids: []const u32) anyerror!void,
         save: *const fn (ptr: *anyopaque) anyerror!void,
-        /// `ids`: an NVMe entry's ids (the leader's prompt prefix: its tokens are not indexed)
-        restore: *const fn (ptr: *anyopaque, id: u32, ids: []const i64) anyerror!void,
+        /// `want`: the leader's entry under `id`; `ids`: an NVMe entry's ids (the leader's prompt prefix: its tokens are
+        /// not indexed)
+        restore: *const fn (ptr: *anyopaque, id: u32, want: Want, ids: []const i64) anyerror!void,
         /// CED replay's prompt snapshot: an entry at the slot's position, the slot keeps going (sessions_gpu.zig)
         prompt: *const fn (ptr: *anyopaque) anyerror!void,
         /// the slot empty: its pages back, the committed ids cleared
@@ -576,6 +577,11 @@ pub const Forward = struct {
         /// a request's pool admission (op_sess_admit's message): the leader's spills evicted, its pages reserved
         admit: ?*const fn (ptr: *anyopaque, msg: []const i64) anyerror!void = null,
     };
+
+    /// The entry a restore names, as the leader holds it: its position and key. A follower whose own entry under the id
+    /// is not this one fails its part of the restore, so every rank prefills the prompt afresh (sessions_gpu.zig
+    /// `restoreOn`) instead of the ranks going on from different positions.
+    pub const Want = struct { pos: u64, key: [16]u8 };
 
     /// 64-67: dsq-zig-calib (TF_DSV41_CALIB=measure, calib_gpu.zig). 64: [op] every rank synchronizes its device and
     /// reads its clock (a timed run's start or end); 65: [op, n] every rank's n samples (the marks paired up, ns)
@@ -649,25 +655,28 @@ pub const Forward = struct {
         f.slot = .{};
     }
 
-    /// Rank 0: a restore to the followers, with the entry's ids when it is not in RAM ([op, id, ids...]).
-    pub fn sendRestore(f: *Forward, id: u32, ids: ?[]const u32) !void {
+    /// Rank 0: a restore to the followers: the entry, its position and key (`Want`), and its ids when it is not in RAM
+    /// ([op, id, pos, key as two words, ids...]).
+    pub fn sendRestore(f: *Forward, id: u32, want: Want, ids: ?[]const u32) !void {
         if (!f.leads()) return;
         const extra = if (ids) |x| x.len else 0;
-        const msg = try f.gpa.alloc(i64, 2 + extra);
+        const msg = try f.gpa.alloc(i64, 5 + extra);
         defer f.gpa.free(msg);
         msg[0] = op_sess_restore;
         msg[1] = id;
-        if (ids) |x| for (x, msg[2..]) |t, *y| {
+        msg[2] = @intCast(want.pos);
+        msg[3] = std.mem.readInt(i64, want.key[0..8], .little);
+        msg[4] = std.mem.readInt(i64, want.key[8..16], .little);
+        if (ids) |x| for (x, msg[5..]) |t, *y| {
             y.* = t;
         };
         try f.link.?.send(msg);
     }
 
-    /// Rank 0: a session operation to the followers (before running it).
-    pub fn sendSess(f: *Forward, op: enum { save, restore, prompt }, id: u32) !void {
+    /// Rank 0: a session operation to the followers (before running it); a restore goes through `sendRestore`.
+    pub fn sendSess(f: *Forward, op: enum { save, prompt }, id: u32) !void {
         if (f.leads()) try f.link.?.send(&.{ switch (op) {
             .save => op_sess_save,
-            .restore => op_sess_restore,
             .prompt => op_sess_prompt,
         }, id });
     }
@@ -794,8 +803,11 @@ pub const Forward = struct {
             },
             op_sess_restore => {
                 const x = f.sess orelse return error.BadPlan;
-                if (msg.len < 2) return error.BadPlan;
-                try x.restore(x.ptr, @intCast(msg[1]), msg[2..]);
+                if (msg.len < 5) return error.BadPlan;
+                var key: [16]u8 = undefined;
+                std.mem.writeInt(i64, key[0..8], msg[3], .little);
+                std.mem.writeInt(i64, key[8..16], msg[4], .little);
+                try x.restore(x.ptr, @intCast(msg[1]), .{ .pos = @intCast(msg[2]), .key = key }, msg[5..]);
             },
             op_sess_prompt => {
                 const x = f.sess orelse return error.BadPlan;

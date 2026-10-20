@@ -215,3 +215,76 @@ test "two split ranks make the same decisions on the same calls and each restore
     try restart(gpa, root, 2, 1);
     try testing.expectEqualSlices(u64, t0.items, t1.items);
 }
+
+/// Chats parked one after another through a small tier, so its budget trims files. On odd page counts a split rank's
+/// file holds a page more or less of each split family than the other rank's (rank 0 stores logical pages 0, 2, 4, ...):
+/// a budget counted by each rank's file sizes trimmed at different points on the two ranks, their indexes parted, and
+/// the plan then named entries by ids one rank no longer held, or held for another chat. Returns a trace of what the tier
+/// counts and holds after every turn.
+fn trimScenario(gpa: std.mem.Allocator, root: []const u8, world: u32, rank: u32, trace: *std.ArrayList(u64)) !void {
+    var r: Rank = undefined;
+    try r.init(gpa, root, world, rank, .{ .chats = 1, .skip_covered = false, .delta = false });
+    defer r.deinit();
+    r.disk.opts.budget = 400 << 10; // two or three of these files
+    const s = try r.pool.newSlot(64 * page);
+    var chat: u32 = 1;
+    while (chat <= 16) : (chat += 1) {
+        const ids = try chatIds(gpa, chat, (3 + 2 * (chat % 3)) * page); // 3, 5 or 7 pages
+        defer gpa.free(ids);
+        try testing.expectEqualStrings("fresh", try turn(gpa, &r, s, chat, ids));
+        try trace.appendSlice(gpa, &.{ chat, r.disk.used, r.disk.stats.evicted, r.store.stats.parks });
+        var id = r.disk.oldest;
+        while (id != disk_mod.none) : (id = r.disk.recs.items[id].newer) try trace.append(gpa, std.mem.readInt(u64, r.disk.recs.items[id].key[0..8], .little));
+        var e: u32 = 0;
+        while (e < r.store.index.entries.items.len) : (e += 1) {
+            const x = r.store.entry(e);
+            if (x.live) try trace.appendSlice(gpa, &.{ e, x.pos, @intFromBool(x.ram), @intFromBool(x.extra.file) });
+        }
+    }
+    try testing.expect(r.disk.stats.evicted >= 8); // the budget did trim, many times
+    try testing.expect(r.disk.used <= r.disk.opts.budget);
+}
+
+test "two split ranks trim the same NVMe files: the budget counts a file alike on every rank" {
+    const gpa = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var t0: std.ArrayList(u64) = .empty;
+    defer t0.deinit(gpa);
+    var t1: std.ArrayList(u64) = .empty;
+    defer t1.deinit(gpa);
+    const root = try tmpRoot(gpa, &tmp, "trim");
+    defer gpa.free(root);
+    try trimScenario(gpa, root, 2, 0, &t0);
+    try trimScenario(gpa, root, 2, 1, &t1);
+    try testing.expectEqualSlices(u64, t0.items, t1.items);
+}
+
+test "holds: an entry by its id, position and key" {
+    const gpa = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmpRoot(gpa, &tmp, "holds");
+    defer gpa.free(root);
+    var r: Rank = undefined;
+    try r.init(gpa, root, 1, 0, .{});
+    defer r.deinit();
+    const s = try r.pool.newSlot(64 * page);
+    const a = try chatIds(gpa, 1, 4 * page);
+    defer gpa.free(a);
+    try s.ensure(a.len);
+    r.write(s, 1, 0);
+    const id = (try r.store.save(s, try HostBounded.make(gpa, 1, a.len), a, 1, 0)).?;
+    _ = try s.releaseAll();
+    const e = r.store.entry(id);
+    var other = e.key;
+    other[0] +%= 1;
+    try testing.expect(r.store.holds(id, e.pos, e.key));
+    try testing.expect(!r.store.holds(id, e.pos - 1, e.key));
+    try testing.expect(!r.store.holds(id, e.pos, other));
+    try testing.expect(!r.store.has(id + 1000) and !r.store.holds(id + 1000, e.pos, e.key));
+    const pos = e.pos;
+    const key = e.key;
+    try r.store.drop(id); // out of RAM with no file: out of the index
+    try testing.expect(!r.store.holds(id, pos, key));
+}

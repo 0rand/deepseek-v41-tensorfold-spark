@@ -148,6 +148,19 @@ pub const Store = struct {
         return s.index.get(id);
     }
 
+    /// Entry `id` is in the index here (live or not): a plan names entries by id, and a rank whose index went its own
+    /// way may hold fewer.
+    pub fn has(s: *Store, id: u32) bool {
+        return id < s.index.entries.items.len;
+    }
+
+    /// Entry `id` is live here and is the entry at `pos` with `key`: the entry a plan's restore names by id, on every rank.
+    pub fn holds(s: *Store, id: u32, pos: u64, key: Digest) bool {
+        if (!s.has(id)) return false;
+        const e = s.index.get(id);
+        return e.live and e.pos == pos and std.mem.eql(u8, &e.key, &key);
+    }
+
     /// The longest stored entry (RAM or NVMe) whose ids strictly prefix prompt, with the same tag.
     pub fn find(s: *Store, tag: u32, prompt: []const i32) !?Hit {
         const d = try s.digests(tag, prompt);
@@ -336,7 +349,7 @@ pub const Store = struct {
         try s.index.idsOf(id, j.ids);
         j.lists = try s.familyLists(e.extra.pages, first, true);
         j.blobs = try e.extra.bounded.?.vtable.blobs(e.extra.bounded.?.ptr, s.gpa);
-        j.src = .{ .key = e.key, .base = base, .tag = e.tag, .kind = e.extra.kind, .page = page, .pos = e.pos, .first_page = first, .npages = npages, .ids = j.ids[first * page ..], .store = s.pages, .fence = try s.pages.fence(), .families = s.pool.layout.families, .pages = j.lists, .blobs = j.blobs };
+        j.src = .{ .key = e.key, .base = base, .tag = e.tag, .kind = e.extra.kind, .page = page, .pos = e.pos, .first_page = first, .npages = npages, .ids = j.ids[first * page ..], .store = s.pages, .fence = try s.pages.fence(), .families = s.pool.layout.families, .pages = j.lists, .blobs = j.blobs, .measure = e.extra.bounded.?.vtable.nbytes(e.extra.bounded.?.ptr) };
         if (base) |b| d.get(b).?.refs += 1; // held while the job runs: a trim cannot take the base
         e.extra.job = j;
         try s.pending.append(s.gpa, j);
