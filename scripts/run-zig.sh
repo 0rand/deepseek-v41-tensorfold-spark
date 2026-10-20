@@ -34,6 +34,44 @@ while IFS='=' read -r key value; do
         envs+=(-e "$key");;
     esac
 done < <(env)
+# STATE_DIR ownership, settled before anything is written into STATE_DIR (--check-aot writes aot-needs-r*.json, a
+# start makes sessions/). The draft calibration under it (calib-zig) is not keyed by pack at engine 9131e10a, so one
+# pack must never start on another pack's state. A config that names its pack claims the folder (STATE_DIR/pack-id)
+# only while it is new or empty; a used folder without pack-id (it served flash17 or q28-v2 before packs were
+# marked) is refused, never adopted. A config that names no pack (the default config/prod-zig.env) claims nothing but
+# is refused a folder marked for any pack other than the selected one (flash17 when PACK is unset).
+claim_state() {
+    local pack=${declared:-${selected:-flash17}} owner_file="$STATE_DIR/pack-id" owner tmp
+    [[ "$pack" =~ ^[a-z0-9][a-z0-9._-]*$ ]] || { echo "PACK=$pack in $config: use a pack id such as eaq" >&2; exit 2; }
+    mkdir -p "$STATE_DIR"
+    if [[ -n "$declared" && ! -e "$owner_file" && ! -L "$owner_file" ]]; then
+        # Empty but for another launcher's claim in flight (.pack-id.*): claim with a complete temp file hard-linked
+        # into place. ln never replaces an existing pack-id, so of racing launchers exactly one claims.
+        if [[ -z "$(find "$STATE_DIR" -mindepth 1 -maxdepth 1 ! -name '.pack-id.*' -print -quit)" ]]; then
+            tmp=$(mktemp "$STATE_DIR/.pack-id.XXXXXX")
+            printf '%s\n' "$declared" > "$tmp"
+            ln "$tmp" "$owner_file" 2> /dev/null || true
+            rm -f "$tmp"
+        elif [[ ! -e "$owner_file" ]]; then
+            echo "STATE_DIR $STATE_DIR is in use but marked for no pack; refusing to claim it for pack $declared." >&2
+            echo "  Its draft calibration may be another pack's (docs/PACKS.md). Give $declared its own new STATE_DIR, or," >&2
+            echo "  only if this folder served $declared alone: printf '%s\\n' $declared > $owner_file" >&2
+            exit 2
+        fi
+        [[ -e "$owner_file" ]] || { echo "could not create $owner_file" >&2; exit 2; }
+    fi
+    if [[ -e "$owner_file" || -L "$owner_file" ]]; then
+        [[ -f "$owner_file" && ! -L "$owner_file" ]] || { echo "$owner_file is not a regular file" >&2; exit 2; }
+        owner=$(< "$owner_file")
+        [[ "$owner" =~ ^[a-z0-9][a-z0-9._-]*$ ]] || {
+            echo "$owner_file holds no pack id; fix or remove it only once you know which pack used $STATE_DIR" >&2
+            exit 2; }
+        [[ "$owner" == "$pack" ]] || {
+            echo "STATE_DIR $STATE_DIR belongs to pack $owner ($owner_file), not $pack: give each pack its own" >&2
+            exit 2; }
+    fi
+}
+if [[ "${2:-}" != --dry-run ]]; then claim_state; fi
 # --check-aot: every Triton variant this env launches, checked against this rank's aot/ (host only, no GPU work).
 # Run it before the first start and after any serving-setting change; it needs the fill's sigs.json in ASSETS_DIR.
 if [[ "${2:-}" == --check-aot ]]; then
@@ -96,17 +134,4 @@ if [[ "$table" == /cache/* && ! -e "$CACHE_DIR/${table#/cache/}" ]]; then
     echo "copied config/pfdense-table.json to $CACHE_DIR/${table#/cache/} (TF_DSV41_PF_DENSE_TABLE=$table)" >&2
 fi
 mkdir -p "$PREPARED_DIR" "$STATE_DIR/sessions"
-# A config that names its pack owns its state folder: the draft calibration under it is not keyed by pack at
-# engine 9131e10a, so a state folder that served another pack is refused rather than silently reused.
-if [[ -n "$declared" ]]; then
-    owner_file="$STATE_DIR/pack-id"
-    if [[ -f "$owner_file" ]]; then
-        owner=$(< "$owner_file")
-        [[ "$owner" == "$declared" ]] || {
-            echo "STATE_DIR $STATE_DIR belongs to pack $owner ($owner_file), not $declared: give each pack its own" >&2
-            exit 2; }
-    else
-        printf '%s\n' "$declared" > "$owner_file"
-    fi
-fi
 exec "${args[@]}"

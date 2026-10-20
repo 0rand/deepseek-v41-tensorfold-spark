@@ -330,9 +330,9 @@ upstream TensorFold settings.
 launcher inputs, not engine knobs. `HOST=localhost` and `PORT=8000` are launcher defaults for the HTTP listener.
 `PACK` selects the served pack's profile: unset or `flash17` reads `config/prod-zig.env` (unchanged), another id reads
 `config/prod-zig-<id>.env` (`PACK=eaq scripts/run-zig.sh 1`; [PACKS](PACKS.md)), and `CONFIG=<file>` still wins. A
-profile that sets `PACK=<id>` itself must agree with the selection and claims its `STATE_DIR` for that pack
-(`STATE_DIR/pack-id`); a start with another pack's state folder is refused. The launcher also refuses any engine
-setting still holding a `<placeholder>`.
+profile that sets `PACK=<id>` itself must agree with the selection and claims its new or empty `STATE_DIR` for that
+pack (`STATE_DIR/pack-id`); a start with another pack's state folder, or a used folder marked for no pack, is refused
+([PACKS](PACKS.md)). The launcher also refuses any engine setting still holding a `<placeholder>`.
 The maximum reply is 32768 tokens and the served model ID is `DeepSeek-V4.1-Flash-TF` in this small launcher.
 
 ### 4K prefill and its fallback

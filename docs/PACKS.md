@@ -75,6 +75,11 @@ PACK=eaq scripts/run-zig.sh 1                                    # rank 1, then 
 - `PACK=eaq` makes `scripts/run-zig.sh` read `config/prod-zig-eaq.env`. Without `PACK` it reads
   `config/prod-zig.env` as before, so flash17 users change nothing. To go back, stop rank 0, then start both ranks
   without `PACK`.
+- The first `--check-aot` or start claims the new, empty `STATE_DIR` for the pack (`STATE_DIR/pack-id`). A state
+  folder that is already in use but has no `pack-id` (it served flash17 or q28-v2 before packs were marked) is
+  refused, not claimed: its draft calibration could be another pack's. Give the pack its own new `STATE_DIR`; only
+  if the folder served that pack alone, mark it yourself (`printf '%s\n' <id> > STATE_DIR/pack-id`). A folder marked
+  for another pack is refused too, also for a profile without `PACK` (counted as flash17, or the `PACK` selected).
 
 ### The profile
 
@@ -82,7 +87,7 @@ PACK=eaq scripts/run-zig.sh 1                                    # rank 1, then 
 
 | Setting | flash17 profile | EAQ profile | Why |
 | --- | --- | --- | --- |
-| `PACK` | `flash17` | `eaq` | selection; claims `STATE_DIR` for the pack |
+| `PACK` | `flash17` | `eaq` | selection; claims a new or empty `STATE_DIR` for the pack |
 | `MODEL_DIR` | flash17 pack | the **widened** EAQ folder | the weights |
 | `PREPARED_DIR` / `STATE_DIR` | flash17's | **its own** | prepared images are per pack; the draft calibration in `STATE_DIR/calib-zig` is keyed without the pack at `9131e10a` |
 | `TF_DSV41_CALIB_FILE` | optional | **unset** until this pack's table is measured on an idle pair | never flash17's table |
