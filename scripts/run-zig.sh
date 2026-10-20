@@ -78,5 +78,13 @@ if [[ "$table" == /cache/* && ! -e "$CACHE_DIR/${table#/cache/}" ]]; then
     cp config/pfdense-table.json "$CACHE_DIR/${table#/cache/}"
     echo "copied config/pfdense-table.json to $CACHE_DIR/${table#/cache/} (TF_DSV41_PF_DENSE_TABLE=$table)" >&2
 fi
+# PREFLIGHT=1 (default off): scripts/preflight.py first (Engram on local disk and its shards, memory, docs/ZIG-SERVE.md
+# Preflight). A failure stops the start; warnings print and the start goes on. PREFLIGHT_ARGS adds options.
+if [[ "${PREFLIGHT:-0}" == 1 ]]; then
+    rc=0
+    read -r -a pf_args <<< "${PREFLIGHT_ARGS:-}"
+    python3 scripts/preflight.py --rank "$rank" "${pf_args[@]}" || rc=$?
+    if (( rc >= 2 )); then echo "rank $rank: preflight failed (exit $rc); fix the above or unset PREFLIGHT" >&2; exit 2; fi
+fi
 mkdir -p "$PREPARED_DIR" "$STATE_DIR/sessions"
 exec "${args[@]}"
