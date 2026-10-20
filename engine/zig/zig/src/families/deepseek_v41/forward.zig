@@ -567,8 +567,7 @@ pub const Forward = struct {
         ptr: *anyopaque,
         commit: *const fn (ptr: *anyopaque, ids: []const u32) anyerror!void,
         save: *const fn (ptr: *anyopaque) anyerror!void,
-        /// `want`: the leader's entry under `id`; `ids`: an NVMe entry's ids (the leader's prompt prefix: its tokens are
-        /// not indexed)
+        /// `want`: the leader's entry under `id`; `ids`: an NVMe entry's ids (the leader's prompt prefix, not indexed)
         restore: *const fn (ptr: *anyopaque, id: u32, want: Want, ids: []const i64) anyerror!void,
         /// CED replay's prompt snapshot: an entry at the slot's position, the slot keeps going (sessions_gpu.zig)
         prompt: *const fn (ptr: *anyopaque) anyerror!void,
@@ -578,9 +577,7 @@ pub const Forward = struct {
         admit: ?*const fn (ptr: *anyopaque, msg: []const i64) anyerror!void = null,
     };
 
-    /// The entry a restore names, as the leader holds it: its position and key. A follower whose own entry under the id
-    /// is not this one fails its part of the restore, so every rank prefills the prompt afresh (sessions_gpu.zig
-    /// `restoreOn`) instead of the ranks going on from different positions.
+    /// The entry a restore names, as the leader holds it (a follower holding another one under the id refuses it).
     pub const Want = struct { pos: u64, key: [16]u8 };
 
     /// 64-67: dsq-zig-calib (TF_DSV41_CALIB=measure, calib_gpu.zig). 64: [op] every rank synchronizes its device and
@@ -655,8 +652,7 @@ pub const Forward = struct {
         f.slot = .{};
     }
 
-    /// Rank 0: a restore to the followers: the entry, its position and key (`Want`), and its ids when it is not in RAM
-    /// ([op, id, pos, key as two words, ids...]).
+    /// Rank 0: a restore to the followers ([op, id, pos, key as two words, ids...]; the ids when it is not in RAM).
     pub fn sendRestore(f: *Forward, id: u32, want: Want, ids: ?[]const u32) !void {
         if (!f.leads()) return;
         const extra = if (ids) |x| x.len else 0;

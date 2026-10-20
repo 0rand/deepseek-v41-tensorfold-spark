@@ -561,8 +561,7 @@ pub const Sessions = struct {
         return s.restoreAs(id, null, ids);
     }
 
-    /// `restore` of the leader's entry `want` (the plan's restore, every rank): a rank whose own entry under `id` is not
-    /// that one fails its part (NotTheEntry), so every rank takes it as a miss and prefills afresh.
+    /// `restore` of the leader's entry `want`: a rank holding another entry under `id` fails it, a miss on every rank.
     pub fn restoreAs(s: *Sessions, id: u32, want: ?fwd.Forward.Want, ids: ?[]const u32) !bool {
         if (s.f.slot.pos != 0 or s.kx.slot.len != 0) return error.SlotNotEmpty;
         try s.active();
@@ -576,9 +575,8 @@ pub const Sessions = struct {
             s.f.slot = .{};
             s.hist[s.cur()].clearRetainingCapacity();
             s.ds_valid[s.cur()] = 0;
-            // a cache miss from here: the entry out of RAM and its file deleted, on every rank alike (a rank whose
-            // index holds no entry under the id has none to let go of)
-            if (s.store.has(id)) {
+            // a cache miss from here: the entry out of RAM and its file deleted, on every rank holding one
+            if (s.store.index.has(id)) {
                 if (s.store.entry(id).ram) try s.store.drop(id);
                 if (s.store.entry(id).live) try s.store.forget(id); // drop removed an entry no file holds
             }
@@ -590,12 +588,10 @@ pub const Sessions = struct {
         return true;
     }
 
-    /// This rank's restore of `id`: pages and bounded state (RAM or NVMe), the position, the slot's history.
-    /// `want`: the leader's entry; another entry here under the id (this rank's index went its own way) is refused before
-    /// any page moves.
+    /// This rank's restore of `id`: pages and bounded state (RAM or NVMe), position, history; refused if not `want`.
     fn restoreOn(s: *Sessions, id: u32, want: ?fwd.Forward.Want, ids: ?[]const u32) !void {
-        if (want) |w| if (!s.store.holds(id, w.pos, w.key)) {
-            const here: u64 = if (s.store.has(id) and s.store.entry(id).live) s.store.entry(id).pos else 0;
+        if (want) |w| if (!s.store.index.holds(id, w.pos, w.key)) {
+            const here: u64 = if (s.store.index.has(id) and s.store.entry(id).live) s.store.entry(id).pos else 0;
             std.log.scoped(.dsv41).warn("sessions: rank {d}: entry {d} here is not the leader's (here {d} tokens, the leader's {d})", .{ s.f.comm.rank(), id, here, w.pos });
             return error.NotTheEntry;
         };

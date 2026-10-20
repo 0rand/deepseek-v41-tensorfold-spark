@@ -148,19 +148,6 @@ pub const Store = struct {
         return s.index.get(id);
     }
 
-    /// Entry `id` is in the index here (live or not): a plan names entries by id, and a rank whose index went its own
-    /// way may hold fewer.
-    pub fn has(s: *Store, id: u32) bool {
-        return id < s.index.entries.items.len;
-    }
-
-    /// Entry `id` is live here and is the entry at `pos` with `key`: the entry a plan's restore names by id, on every rank.
-    pub fn holds(s: *Store, id: u32, pos: u64, key: Digest) bool {
-        if (!s.has(id)) return false;
-        const e = s.index.get(id);
-        return e.live and e.pos == pos and std.mem.eql(u8, &e.key, &key);
-    }
-
     /// The longest stored entry (RAM or NVMe) whose ids strictly prefix prompt, with the same tag.
     pub fn find(s: *Store, tag: u32, prompt: []const i32) !?Hit {
         const d = try s.digests(tag, prompt);

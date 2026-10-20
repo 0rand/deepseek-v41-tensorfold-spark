@@ -216,11 +216,7 @@ test "two split ranks make the same decisions on the same calls and each restore
     try testing.expectEqualSlices(u64, t0.items, t1.items);
 }
 
-/// Chats parked one after another through a small tier, so its budget trims files. On odd page counts a split rank's
-/// file holds a page more or less of each split family than the other rank's (rank 0 stores logical pages 0, 2, 4, ...):
-/// a budget counted by each rank's file sizes trimmed at different points on the two ranks, their indexes parted, and
-/// the plan then named entries by ids one rank no longer held, or held for another chat. Returns a trace of what the tier
-/// counts and holds after every turn.
+/// One rank of the trim scenario: chats of 3, 5 and 7 pages through a small tier (odd counts: the ranks' files differ).
 fn trimScenario(gpa: std.mem.Allocator, root: []const u8, world: u32, rank: u32, trace: *std.ArrayList(u64)) !void {
     var r: Rank = undefined;
     try r.init(gpa, root, world, rank, .{ .chats = 1, .skip_covered = false, .delta = false });
@@ -279,12 +275,12 @@ test "holds: an entry by its id, position and key" {
     const e = r.store.entry(id);
     var other = e.key;
     other[0] +%= 1;
-    try testing.expect(r.store.holds(id, e.pos, e.key));
-    try testing.expect(!r.store.holds(id, e.pos - 1, e.key));
-    try testing.expect(!r.store.holds(id, e.pos, other));
-    try testing.expect(!r.store.has(id + 1000) and !r.store.holds(id + 1000, e.pos, e.key));
+    try testing.expect(r.store.index.holds(id, e.pos, e.key));
+    try testing.expect(!r.store.index.holds(id, e.pos - 1, e.key));
+    try testing.expect(!r.store.index.holds(id, e.pos, other));
+    try testing.expect(!r.store.index.has(id + 1000) and !r.store.index.holds(id + 1000, e.pos, e.key));
     const pos = e.pos;
     const key = e.key;
     try r.store.drop(id); // out of RAM with no file: out of the index
-    try testing.expect(!r.store.holds(id, pos, key));
+    try testing.expect(!r.store.index.holds(id, pos, key));
 }

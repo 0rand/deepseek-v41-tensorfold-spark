@@ -128,6 +128,18 @@ pub fn Index(comptime Extra: type) type {
             return x.by_key.get(key);
         }
 
+        /// Entry `id` is in the index, live or not (an index gone its own way may hold fewer ids than a plan names).
+        pub fn has(x: *const Self, id: u32) bool {
+            return id < x.entries.items.len;
+        }
+
+        /// Entry `id` is live and is the entry at `pos` with `key` (a plan's restore names the leader's entry by id).
+        pub fn holds(x: *const Self, id: u32, pos: u64, key: Digest) bool {
+            if (!x.has(id)) return false;
+            const e = &x.entries.items[id];
+            return e.live and e.pos == pos and std.mem.eql(u8, &e.key, &key);
+        }
+
         fn newNode(x: *Self, digest: Digest, parent: u32, depth: u32) !u32 {
             const id: u32 = if (x.free_nodes.pop()) |i| i else blk: {
                 try x.nodes.append(x.gpa, undefined);
