@@ -140,6 +140,36 @@ was not repeated for this publication; the exported host build and host tests ar
 
    Check that the answer is 391; do not infer readiness from a live container alone.
 
+### Preflight (optional)
+
+`scripts/preflight.py` checks one node, read-only and standard library only. Run it on both nodes. It takes the paths
+from the environment or from `config/prod-zig.env`. `scripts/run-zig.sh` runs it before the container starts only
+when `PREFLIGHT=1` is set. A failure stops the start, and warnings are printed. `PREFLIGHT_ARGS` passes extra
+options, for example `PREFLIGHT_ARGS="--min-avail-gib 100"`. Without `PREFLIGHT` the launcher behaves as before.
+
+```bash
+python3 scripts/preflight.py --rank 1                 # before the boot, on rank 1's node; then --rank 0 on rank 0's
+PREFLIGHT=1 scripts/run-zig.sh 1                      # the same check, then the start
+python3 scripts/preflight.py --rank 0 --after-boot --url http://localhost:8000   # once the rank is up
+```
+
+Exit 0 means all ok, 1 a warning, 2 a failure. `--json` prints one JSON object instead of the text report.
+
+| check | what it looks at |
+| --- | --- |
+| `engram-fs` | `ENGRAM_DIR` must be on a local filesystem, found from `/proc/self/mountinfo`. NFS, CIFS, sshfs and other network or FUSE mounts fail, and so does tmpfs. Mia's recipe measured a random 4 KiB Engram read at 942 µs over NFS and 90 µs from a local copy. |
+| `engram-files` | This rank's `engram-l{L}-r{rank}of2.bin` shards: the header (the `scripts/pack_engram.py` format) and the size (header + rows × 264 B). When `MODEL_DIR/config.json` is readable, each row range must match the range the pack's Engram layout gives this rank. Leftover `*.bin.tmp` files warn. |
+| `engram-latency` | 256 random 4 KiB reads of the largest shard, O_DIRECT where the filesystem allows it. Reports p50 and p99 and warns when p50 is above 300 µs (`--latency-warn-us`). `--no-probe` skips it. |
+| `memory` | MemAvailable, MemTotal and `/dev/shm` use (shared memory counts against MemAvailable). Before a boot it also prints an estimate: weights (`MODEL_DIR`'s `*.safetensors` / 2) + pool (`TF_DSV41_POOL_TOKENS` × ~1,060 B with split KV) + the 3.0 GiB dip + the 4 GiB hard floor. This is an estimate, so it only warns. The engine's boot check decides. `--min-avail-gib N` turns MemAvailable under N into a failure. |
+| `pool` (`--after-boot`) | Reads the engine's boot-check lines (`docker logs tensorfold-zig-r<rank>`, or `--boot-log FILE`): the pool, the bytes per token and the worst serving point. Prints the largest `TF_DSV41_POOL_TOKENS` that keeps that point at the hard floor + 0.25 GiB (`--margin-gib`), the 4.25 GiB rule of [FLASH-1017](FLASH-1017.md#memory-the-21m-pool). Without the log it falls back to MemAvailable now and labels the figure approximate. |
+| `health` (`--after-boot --url`) | `/health` is ok and no graph cache is under its memory floor. |
+
+The suggested pool comes from the engine's own model, and that model does not include the transient 4K prefill
+workspace (2,268 MiB per rank). On flash17 the model allowed 3.0M tokens, but 2.1M was the largest pool that held the
+4 GiB floor under 4K prefills. Treat a larger suggestion as a starting point to measure under load, not a setting.
+The checks follow two ideas from Mia's recipe: Engram tables on each Spark's own disk, and a memory check at start
+that reports `/dev/shm`.
+
 ## Generate runtime assets
 
 Prepare the already-public Python reference source from the recipe root. Use a GPU-capable ARM64 environment

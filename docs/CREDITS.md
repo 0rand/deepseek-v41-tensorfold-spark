@@ -14,6 +14,13 @@
   [2.9 bpw EXL3 pack](https://huggingface.co/Mia-AiLab/DeepSeek-V4.1-Flash-EXL3-2.9bpw) on Hugging Face
   ([Mia-AiLab](https://huggingface.co/Mia-AiLab)); their GLM-5.3 kit's fat-expert MoE design also lives on in
   `patches/0001`.
+- Mia / MiaAI-Lab's [DeepSeek-V4.1-Flash-1017 2x DGX Sparks recipe](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks):
+  the ideas behind `bench/speed.py` (its benchmark suites and wall-window aggregate, the needle, exactness and
+  prompt-reuse checks; its printing-press decode prompt is quoted so numbers are comparable, see NOTICE) and
+  `scripts/preflight.py` (Engram tables on each Spark's own disk, a memory check at start). In that recipe,
+  **Eduardo Florencio** (eduffd) wrote the Anthropic Messages checks our `anthropic` suite re-implements, and
+  **[Coinupbtc](https://github.com/Coinupbtc)** wrote the prompt-interleave patch whose measurement our `interleave`
+  suite repeats.
 - [dealignai](https://huggingface.co/dealignai/DeepSeek-V4.1-Flash-UNCENSORED-EXL3-2.9bpw): the uncensored 2.9 bpw
   variant measured here.
 - [turboderp / ExLlamaV3](https://github.com/turboderp-org/exllamav3): the EXL3 format.

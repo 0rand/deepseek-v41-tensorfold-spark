@@ -77,3 +77,18 @@ The dense-prefill tile table (G17's sweep on GB10, 10 shapes): best 68-78 TFLOP/
 [`config/pfdense-table.json`](../config/pfdense-table.json) and `results/campaign/G17-20261004/sweep.txt`.
 
 **Still open:** the items under [What is not solved](KNOWN-ISSUES.md).
+
+## Tools
+
+- **`bench/speed.py`**: one HTTP client for speed and serving checks, with these suites: prefill, decode, multi,
+  needle, interleave, exact, reuse and anthropic. Multi-stream cells report the wall-window aggregate
+  (Σ tokens − N) / (last token − first token), which is Mia's `tools/bench.py` definition. They also report the
+  all-live rate and the first-token spread. Our older `bench_http` aggregate summed the per-stream rates, which
+  overstates staggered cells. `--compare` diffs saved runs (Mia's `tools/bench.py` files too) and lists every
+  setting that differs. See [BENCHMARKS](BENCHMARKS.md#3-speed-needle-and-serving-checks-benchspeedpy).
+- **`scripts/preflight.py`** (opt-in, `PREFLIGHT=1 scripts/run-zig.sh`): checks that the Engram shards are on a
+  local filesystem with valid headers, sizes and row ranges, and runs a 4 KiB read-latency probe. It reports
+  MemAvailable and `/dev/shm` before a boot. After a boot it reads the engine's boot-check lines and prints the
+  largest pool that keeps the floor. See [ZIG-SERVE](ZIG-SERVE.md#preflight-optional). The launcher's default
+  behaviour is unchanged.
+- Both follow ideas from Mia's recipe (credited in [CREDITS](CREDITS.md) and NOTICE).

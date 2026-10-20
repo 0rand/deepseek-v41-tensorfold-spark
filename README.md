@@ -98,6 +98,7 @@ in [INSTALL](docs/INSTALL.md).
 | [API](docs/API.md) / [IMAGES](docs/IMAGES.md) | endpoints, thinking and effort, image input |
 | [OPERATIONS](docs/OPERATIONS.md) | settings, memory gates, turning each lever off |
 | [METHOD](docs/METHOD.md) / [RESULTS](docs/RESULTS.md) / [BENCHMARKS](docs/BENCHMARKS.md) | how it was measured, every table, how to rerun |
+| [`bench/speed.py`](docs/BENCHMARKS.md#3-speed-needle-and-serving-checks-benchspeedpy) / [`scripts/preflight.py`](docs/ZIG-SERVE.md#preflight-optional) | speed, needle, interleave and exactness suites with run-to-run compare; opt-in per-node checks (Engram on local disk, memory, pool size) |
 | [CHANGELOG](docs/CHANGELOG.md) | bug fixes and new levers since G13 |
 | [KNOWN-ISSUES](docs/KNOWN-ISSUES.md) | what is not solved |
 | [PROJECT](docs/PROJECT.md) / [ENGINE](docs/ENGINE.md) / [ARCHITECTURE](docs/ARCHITECTURE.md) / [DECODE](docs/DECODE.md) | patches, layout, model split, decode roofline |

@@ -93,7 +93,69 @@ Common flags: `--base http://127.0.0.1:8000 --model DeepSeek-V4.1-Flash-TF --out
 both nodes while they run (`awk '/MemAvailable/' /proc/meminfo` every second; avoid polling `nvidia-smi` every second,
 see the README).
 
-## 3. The kit baseline
+## 3. Speed, needle and serving checks: `bench/speed.py`
+
+One standard-library client for every speed number taken over HTTP. Each run writes one JSON file that the
+tool can compare later. It talks to the OpenAI-compatible server (the Zig server, or any other). Every request runs at
+temperature 0 with seed 1234 and thinking off (`--thinking` turns it on). Requests are streamed with
+`stream_options.include_usage`.
+
+```bash
+python3 bench/speed.py --url http://127.0.0.1:8000 --out runs/base.json            # prefill, decode, multi, needle
+python3 bench/speed.py --suite decode,multi --prompts mia --streams 1,2,4 --out runs/mia.json
+python3 bench/speed.py --suite interleave --cancel-at 10 --health --out runs/il.json
+python3 bench/speed.py --suite exact --out runs/exact-ref.json                      # before a change
+python3 bench/speed.py --suite exact --exact-ref runs/exact-ref.json                # after it: exit 1 on a difference
+python3 bench/speed.py --suite reuse,anthropic
+python3 bench/speed.py --compare runs/base.json runs/new.json                       # no server needed
+```
+
+| suite | what it measures |
+| --- | --- |
+| `prefill` | A cold prompt of each `--lengths` (default 1K, 8K, 32K, 131K tokens) with max_tokens 1. Reports TTFT and prefill tok/s = (prompt − cached) / TTFT, plus the server's own prefill seconds when the reply has a `tensorfold` block. The filler (`--family prose\|code`) is random text from the seed and a salt. The salt comes first in the prompt, so the prefix cache cannot serve it. A reply with more than a few cached tokens is flagged. Prompts are sized with `/tokenize`, and the reply's `prompt_tokens` is recorded. |
+| `decode` | One stream of `--tokens` (256) for each `--prompts` (`mia`, `code`, `prose`). tok/s = (completion − 1) / (last token − first token). When the server reports rounds, it adds tokens per decode round and accepted / drafted. `--ignore-eos` runs every stream to `--tokens`. |
+| `multi` | `--streams` (1, 2, 4) concurrent streams released together. Reports each stream's own rate, `wall_tok_s`, `live_tok_s` and `first_spread_s` (below). |
+| `needle` | A unique 7-digit code hidden at each `--depths` (0.1, 0.5, 0.9) of a haystack for each `--needle-lengths`. A cell passes when the reply contains the code. Every cell gets a fresh haystack, so TTFT is cold. The result is printed as a pass / fail grid. |
+| `interleave` | One stream decodes. Once it is emitting, a cold prompt of `--interleave-lengths` (131,072) is sent. Reports the decoding stream's longest and p99 gap between tokens while that prompt runs, its tokens in that time, and the long prompt's TTFT. `--cancel-at S` closes the decoding client S seconds into the long prompt, then polls `/health` every 100 ms to see when the server drops it. When the drop cannot be measured, the output says why. |
+| `exact` | A fixed prompt set: code, prose, the printing-press prompt, a 2K document, a group of 4 concurrent requests, the same 4 alone, and a repeat. Records a SHA-256 of each reply's text, and of its token ids when the server returns them (`return_token_ids`). The concurrent / solo and repeat pairs must match within the run. `--exact-ref FILE` compares every case with a reference run. Use it as the all-off gate when a flag or the image changes. |
+| `reuse` | An agent conversation: a ~2K-token system prompt and `--reuse-history` (30K) tokens of history. Then three rounds of another conversation with the same system prompt, each followed by the agent's next turn. Each agent turn must report at least 90% of its prompt as cached (`usage.prompt_tokens_details.cached_tokens`). If the server reports no count, the result is "unmeasured" and the exit is 0, unless `--require-counter`. |
+| `anthropic` | `/v1/messages`: the message shape and usage. `count_tokens` must be within 8 tokens of `usage.input_tokens`. A streamed `tool_use` must have `input_json_delta` fragments that join into valid JSON with an array argument. Also checks a `tool_result` turn, `stop_sequences` and the 400 `invalid_request_error` shape. |
+
+**Multi-stream totals.** `wall_tok_s` = (Σ tokens − N) / (latest last token − earliest first token). It is the
+same definition as Mia's `tools/bench.py` aggregate, so its numbers compare directly with hers. `live_tok_s` counts
+the tokens streamed while all N streams are emitting, divided by that span. This is the engine's rate with no
+admission or prefill stagger in it. `first_spread_s` is the latest first token minus the earliest, which is that
+stagger. `sum_per_stream_tok_s` adds up each stream's own rate, each over its own window. It overstates the
+total when starts are staggered, which is the flaw in our older `bench_http` aggregate, and is kept only to show the
+difference.
+
+**Comparing with Mia's numbers.** `--prompts mia` sends her decode prompt verbatim (the printing-press essay, with
+her variation tag). Her decode and multi cells and ours with `--prompts mia` therefore use the same prompt and the
+same aggregate. Prefill filler differs: hers is random prose from her word list, ours is from ours. Compare prefill
+by the reported `prompt_tokens`, not by the target size. `--compare` reads her `tools/bench.py` JSON as well and maps
+her cells onto ours (`multi.N.aggregate_tok_s` → `multi.mia.N.wall_tok_s`).
+
+**`--compare A.json B.json [C.json ...]`** prints every cell's median per file and its change against the first
+file. It lists the settings that differ between files (model, thinking, tokens, ignore_eos, filler version,
+prompt texts), and marks prefill / needle / interleave cells whose actual prompt sizes differ by more than 2%.
+Mismatched runs are therefore never compared silently. `--strict` makes such a mismatch exit 1.
+
+The JSON holds the tool's SHA-256 and git revision, the settings and salt, every request's raw figures, and the
+medians (`summary`). `--health` / `--metrics` store `/health` and `/metrics` before and after the run, plus the
+`/health` counter deltas: rounds, drafted, accepted, and each graph cache's eager steps and floor hits. Exit 1 on a
+request error, a missed needle, an exact difference, a reuse turn under the threshold or a failed Anthropic check.
+`interleave`, `exact`, `reuse` and `anthropic` run only when named in `--suite`.
+
+The suites, the aggregate and the needle, exactness and prompt-reuse checks come from Mia's recipe
+([MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks):
+`tools/bench.py`, `tools/needle.py`, `tools/exact.py`, `tools/prompt_reuse.py`). The Anthropic checks come from its
+`tools/anthropiccheck.py`, written by Eduardo Florencio (eduffd). The interleave measurement comes from Coinupbtc's
+prompt-interleave patch there, which measured a 1.3 s longest gap (90 s before the patch) on a 120K cold prompt. Our
+engine interleaves prompt pieces with other slots' decode through `TF_DSV41_PREFILL_PIECES=1` and
+`TF_DSV41_PREFILL_SHARE`, and this suite measures that. The code is our own. Only the printing-press prompt is
+quoted (see NOTICE).
+
+## 4. The kit baseline
 
 The kit's cells come from the GLM recipe's HTTP clients against the kit's server: `bench/glmbench.py` (suites tf,
 tweet, kit, edit), `bench/multiturn.py concurrent --streams 1,2,4`, `bench/quality.py` (MMLU-200) and a long-prefill
