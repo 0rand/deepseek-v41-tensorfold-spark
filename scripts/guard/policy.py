@@ -27,6 +27,7 @@ class Policy:
         self.transient_reserve_gib = 0.5
         self.unresolved_requests = set()
         self.admission_waiters = {}
+        self.native_generation = 0  # Bumped on any native doubt; keys the optional generation-verify cache.
         self.fresh = self.owned = False
         self.samples = {}
         now = time.time() if now is None else now
@@ -135,6 +136,7 @@ class Policy:
         if self.data["terminal_stop"] and (not hard or self.data["hard_stop"]):
             return
         self.data.update(terminal_stop=True, paused=True, hard_stop=hard or self.data["hard_stop"])
+        self.native_changed()
         self.data["stop_reason"] = reason
         if hard:
             self.data["pending_action"] = "stop_owned"
@@ -146,6 +148,11 @@ class Policy:
         evidence = {"stop_evidence": self.data["stop_evidence"]} if "stop_evidence" in self.data else {}
         self.event("HARD_STOP" if hard else "FLOOR_STOP", now, reason=reason, inflight=self.inflight, **evidence)
         self.lock.notify_all()
+
+    def native_changed(self):
+        """A failed health read, a native error or an unverified completion: a cached identity is no longer trusted."""
+        with self.lock:
+            self.native_generation += 1
 
     def condition(self, token, reason, now):
         if token in self.data["consumed"] or self.data["terminal_stop"]:

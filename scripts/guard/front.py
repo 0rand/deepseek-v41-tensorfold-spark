@@ -252,6 +252,12 @@ class Front(http.server.BaseHTTPRequestHandler):
                     return self.reply(429 if watchdog_probe else 503,
                                       {"code": "watchdog_deferred", "error": "bounded body buffers busy"})
                 body = self.read_body()
+                small = self.server.config["limits"].get("small_body_release_bytes", 0)
+                if generation and small and len(body) <= small:
+                    # The slot bounds bodies being read; a small held body stays bounded by the pending queue
+                    # ((max_pending + max_inflight) x small), so admission and verification no longer hold it.
+                    self.server.buffers.release()
+                    buffered = False
             body_sha = hashlib.sha256(body).hexdigest()
             if generation:
                 watcher = threading.Thread(target=watch_disconnect, name="guard-client-disconnect", daemon=True)
@@ -390,6 +396,8 @@ class Front(http.server.BaseHTTPRequestHandler):
                 self.server.buffers.release()
             if admitted:
                 with policy.lock:
+                    if not complete or (response_status or 0) >= 500:
+                        policy.native_changed()
                     policy.release_prefill(request_id)
                     policy.active.pop(request_id, None)
                     policy.request_metadata.pop(request_id, None)
@@ -501,6 +509,8 @@ class Server(http.server.ThreadingHTTPServer):
                 except (OSError, ValueError, TypeError, AttributeError, http.client.HTTPException):
                     pass
                 with policy.lock:
+                    if health.get("ok") is not True:
+                        policy.native_changed()  # Unhealthy or unreadable native: re-inspect before dispatch.
                     if policy.admission_probe == request_id:
                         policy.admission_probe = None
                     if policy.data["terminal_stop"] or (cancelled is not None and cancelled.is_set()):

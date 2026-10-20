@@ -37,6 +37,8 @@ class Manager:
         self.check_clock()
         self.last_action = 0
         self.boot_lock = threading.Lock()
+        self.verify_lock = threading.Lock()
+        self.verified = None  # (key, monotonic expiry, identities) when limits.generation_verify_cache_s is on.
 
     def check_clock(self):
         try:
@@ -148,6 +150,30 @@ class Manager:
         state = self.policy.snapshot()
         if not state["ready"]:
             raise ValueError("guard state changed before upstream")
+        ttl = self.config.get("limits", {}).get("generation_verify_cache_s", 0)
+        if not ttl:
+            return self.verify_identities(state)
+        # Single flight: concurrent requests share one container inspection. Ownership and the serving-profile SHA
+        # are local reads and are rechecked on every request; a hit also needs the same profile, the same verified
+        # container IDs and no native doubt (policy.native_changed) since the inspection began.
+        with self.verify_lock:
+            owned, _ = self.backend.ownership()
+            sha, _ = self.backend.profile()
+            with self.policy.lock:
+                key = (state["profile"], self.policy.native_generation, str(self.policy.data.get("boot_verified_ids")))
+            cached = self.verified
+            if owned and sha == state["profile"] and cached and cached[0] == key and time.monotonic() < cached[1]:
+                return cached[2]
+            self.verified = None
+            started = time.monotonic()
+            identities = self.verify_identities(state)
+            with self.policy.lock:
+                # A doubt raised during the inspection keeps the old generation in the key, so the next call misses.
+                key = (key[0], key[1], str(self.policy.data.get("boot_verified_ids")))
+            self.verified = (key, started + ttl, identities)
+            return identities
+
+    def verify_identities(self, state):
         identities = {rank: self.backend.identity(rank, state["profile"]) for rank in RANKS}
         current_ids = {rank: value["id"] for rank, value in identities.items()}
         with self.boot_lock:

@@ -164,6 +164,12 @@ def load_config(path):
     decode = limits.get("decode_admission_max_prompt_tokens", 0)
     if type(decode) is not int or not 0 <= decode <= 2048:
         raise ValueError("decode admission prompt limit must be an integer 1..2048 tokens (absent or 0 = off)")
+    cache = limits.get("generation_verify_cache_s", 0)
+    if type(cache) not in (int, float) or not math.isfinite(cache) or not 0 <= cache <= 5:
+        raise ValueError("generation verify cache must be finite 0..5 s (absent or 0 = off)")
+    small = limits.get("small_body_release_bytes", 0)
+    if type(small) is not int or not 0 <= small <= min(1024 * 1024, limits["max_body_bytes"]):
+        raise ValueError("small body release must be an integer 0..min(1 MiB, max_body_bytes) (absent or 0 = off)")
     period = config.get("sampler_period_s", 2.0)
     if type(period) not in (int, float) or not math.isfinite(period) or not 0.25 <= period <= 2.0:
         raise ValueError("sampler period must be finite 0.25..2.0 s")

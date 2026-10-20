@@ -191,6 +191,27 @@ What it does (`scripts/guard`, standard-library Python 3.11+, no packages):
 - **Sampler period.** `sampler_period_s` (2.0; 0.25..2.0) sets the sampler's interval (the 2 s above). A shorter period
   shortens the post-token wait between long requests; each sample still opens one SSH connection to rank 1.
   The 6 s freshness window and the per-node sample timeout do not change.
+- **Dispatch cost (both off by default).** Between admission and the engine, each generation request inspects both
+  containers (the identity fences below; rank 1 over SSH), about 0.4 s, while its body buffer (`body_buffers`, 2) is
+  still held. Four short requests that arrive together therefore reach the engine in two waves about 0.4 s apart.
+  Two settings in `limits` remove that:
+  - `generation_verify_cache_s` (0..5 s; 2 is a good value) reuses one inspection of both containers for that long.
+    Concurrent requests share one inspection. Ownership, the serving env file's SHA-256 and the guard state are still
+    checked on every request. A failed or unreadable engine health check, a request that does not complete, a 5xx
+    from the engine, or a STOP discards the cached result, so the next request inspects again and re-proves the boot
+    if a container changed.
+  - `small_body_release_bytes` (0..1 MiB, at most `max_body_bytes`; 262144 is a good value) frees a generation
+    request's body buffer as soon as a body of at most that size has been read, instead of at dispatch. Larger
+    bodies keep the buffer until dispatch. The held small bodies stay bounded by the queue: at most
+    (`max_pending` + `max_inflight`) x this size.
+
+  Neither changes what is checked or the admission rules: the hard limits, the reservation and margin, FIFO order,
+  the in-flight limit, the cooldown and telemetry freshness are as above.
+- **Reading memory minima.** The guard and an independent sampler read the same `MemAvailable`, so their minima agree;
+  the guard's reservations are bookkeeping, not allocations, and its own memory is the buffered request bodies on
+  rank 0. `MemAvailable` drifts down over a long-running engine boot, so compare a setting against an off block
+  that ran right before and right after it on the same boot, with the same prompts (or both with fresh ones), rather
+  than against one earlier block.
 - **Identity fences.** Generation is forwarded only while the serving env file's SHA-256 matches a snapshotted
   profile and both containers still have that profile's image, mounts, inference environment and host CPU set.
 - **Durable STOP evidence.** Before it cancels anything, a STOP writes (fsync) the raw and validated per-node samples,
