@@ -1,4 +1,4 @@
-//! Frozen server goldens for `zig build test-golden`, with the seven differences that are still known.
+//! Frozen server goldens for `zig build test-golden`, with the differences that are still known.
 const std = @import("std");
 const posix = std.posix;
 const Io = std.Io;
@@ -16,6 +16,13 @@ const known_diffs = [_]Known{
     .{ .group = "metrics-open", .name = "metrics" },
     .{ .group = "metrics-open", .name = "v1-metrics" },
     .{ .group = "keys", .name = "metrics-counted" },
+    // Anthropic stream heads count the prompt (port of upstream #672 by kky42); frozen Python goldens open with 0.
+    .{ .group = "anthropic", .name = "plain-stream" },
+    .{ .group = "anthropic", .name = "thinking-stream" },
+    .{ .group = "anthropic", .name = "tool-use-stream" },
+    .{ .group = "anthropic", .name = "tool-use-think-stream" },
+    .{ .group = "anthropic", .name = "stop-sequence-stream" },
+    .{ .group = "anthropic", .name = "max-tokens" },
 };
 
 fn isKnown(group: []const u8, name: []const u8) bool {
@@ -23,6 +30,18 @@ fn isKnown(group: []const u8, name: []const u8) bool {
         if (std.mem.eql(u8, k.group, group) and std.mem.eql(u8, k.name, name)) return true;
     }
     return false;
+}
+
+/// Why a known difference never covers this outcome: the reply's own counting, which holds whatever a frozen body says.
+const gated_prefix = "INVARIANT: ";
+
+fn isGated(why: []const []const u8) bool {
+    for (why) |w| if (std.mem.startsWith(u8, w, gated_prefix)) return true;
+    return false;
+}
+
+fn isTolerated(r: Outcome) bool {
+    return r.verdict == .differ and isKnown(r.group, r.name) and !isGated(r.why);
 }
 
 const Conn = struct {
@@ -199,6 +218,66 @@ const Outcome = struct { group: []const u8, name: []const u8, verdict: Verdict, 
 
 var outcomes: std.ArrayList(Outcome) = .empty;
 
+const Usage = struct { total: ?i64 = null, problem: ?[]const u8 = null };
+
+fn named(a: std.mem.Allocator, comptime fmt: []const u8, args: anytype) []const u8 {
+    return std.fmt.allocPrint(a, "{s}" ++ fmt, .{gated_prefix} ++ args) catch gated_prefix ++ "the usage blob is malformed";
+}
+
+/// A Messages usage blob's prompt total (input, cache_read, cache_creation); an omitted cache field reads as 0.
+fn usageTotal(a: std.mem.Allocator, usage: std.json.Value, kind: []const u8) Usage {
+    if (usage != .object) return .{ .problem = named(a, "{s}'s usage is not an object", .{kind}) };
+    var total: i64 = 0;
+    for ([_][]const u8{ "input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens" }) |field| {
+        const v = usage.object.get(field) orelse continue;
+        if (v == .null) continue;
+        if (v != .integer) return .{ .problem = named(a, "{s}'s {s} is not an integer", .{ kind, field }) };
+        total += v.integer;
+    }
+    return .{ .total = total };
+}
+
+/// The usage of one Messages stream event; message_start nests it under "message".
+fn eventUsage(a: std.mem.Allocator, ev: std.json.Value, kind: []const u8) Usage {
+    const node = if (std.mem.eql(u8, kind, "message_start")) (ev.object.get("message") orelse .null) else ev;
+    const usage = if (node == .object) (node.object.get("usage") orelse .null) else .null;
+    return usageTotal(a, usage, kind);
+}
+
+/// Counts a Messages stream against the Anthropic streaming invariant, naming every way its totals can break.
+fn promptCountProblem(a: std.mem.Allocator, body: []const u8) !?[]const u8 {
+    var start_total: ?i64 = null;
+    var delta_total: ?i64 = null;
+    var ended = false;
+    var lines = std.mem.splitScalar(u8, body, '\n');
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, "data: {\"type\": \"")) continue;
+        const v = std.json.parseFromSliceLeaky(std.json.Value, a, line[6..], .{}) catch continue;
+        if (v != .object) continue;
+        const kind = v.object.get("type") orelse continue;
+        if (kind != .string) continue;
+        if (std.mem.eql(u8, kind.string, "error")) {
+            ended = true;
+            continue;
+        }
+        if (std.mem.eql(u8, kind.string, "message_start")) {
+            const got = eventUsage(a, v, kind.string);
+            if (got.problem) |p| return p;
+            start_total = got.total;
+        } else if (std.mem.eql(u8, kind.string, "message_delta")) {
+            const got = eventUsage(a, v, kind.string);
+            if (got.problem) |p| return p;
+            delta_total = got.total;
+        }
+    }
+    if (start_total == null and delta_total == null) return null;
+    if (ended) return named(a, "the stream ended in an error event, so its counts are not a reply (start {?}, delta {?})", .{ start_total, delta_total });
+    if (start_total == null) return named(a, "the stream carries a message_delta with no message_start to count it against", .{});
+    if (delta_total == null) return named(a, "message_start opened a stream that never reached its message_delta", .{});
+    if (start_total.? == delta_total.?) return null;
+    return named(a, "message_start's {d} is not message_delta's input plus cache fields {d}", .{ start_total.?, delta_total.? });
+}
+
 fn runCase(a: std.mem.Allocator, io: Io, golden_dir: []const u8, port: u16, case: std.json.Value) !void {
     const group = case.object.get("group").?.string;
     const name = case.object.get("name").?.string;
@@ -299,6 +378,9 @@ fn runCase(a: std.mem.Allocator, io: Io, golden_dir: []const u8, port: u16, case
                 var at: usize = 0;
                 while (at < gb.len and at < n.body.len and gb[at] == n.body[at]) at += 1;
                 try why.append(a, try std.fmt.allocPrint(a, "reply {d} body differs at {d}: golden [{s}] zig [{s}]", .{ i, at, gb[at..@min(gb.len, at + 60)], n.body[at..@min(n.body.len, at + 60)] }));
+            }
+            if (std.mem.eql(u8, group, "anthropic")) {
+                if (try promptCountProblem(a, n.body)) |problem| try why.append(a, problem);
             }
             if (!std.mem.eql(u8, go.get("interim").?.string, n.interim)) try why.append(a, try std.fmt.allocPrint(a, "reply {d} interim differs", .{i}));
             var head_ok = true;
@@ -478,10 +560,11 @@ pub fn main(init: std.process.Init) !void {
         }
         if (g == null) groups.append(gpa, .{ .name = r.group }) catch return error.OutOfMemory;
         g = &groups.items[groups.items.len - 1];
+        const known = isTolerated(r);
         switch (r.verdict) {
             .equal => g.?.equal += 1,
             .differ => {
-                if (isKnown(r.group, r.name)) g.?.known += 1 else {
+                if (known) g.?.known += 1 else {
                     g.?.differ += 1;
                     failed += 1;
                 }
@@ -492,7 +575,6 @@ pub fn main(init: std.process.Init) !void {
             },
         }
         if (r.verdict != .equal) {
-            const known = r.verdict == .differ and isKnown(r.group, r.name);
             std.debug.print("{s} {s}/{s}\n", .{ if (known) "KNOWN-DIFFER" else if (r.verdict == .no_golden) "NO-GOLDEN" else "MISMATCH", r.group, r.name });
             for (r.why, 0..) |w, i| {
                 if (i == 3) break;

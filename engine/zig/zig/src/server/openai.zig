@@ -30,8 +30,8 @@ pub const Out = struct {
     vt: *const VTable,
 
     pub const VTable = struct {
-        /// 200 with text/event-stream: the stream's head.
-        open: *const fn (ctx: *anyopaque) error{Closed}!void,
+        /// 200 with text/event-stream: the stream's head, carrying the prepared prompt's token count.
+        open: *const fn (ctx: *anyopaque, prompt_len: usize) error{Closed}!void,
         /// One ``data:`` payload; null is ``[DONE]``.
         event: *const fn (ctx: *anyopaque, payload: ?Value) error{Closed}!void,
         /// A whole JSON reply.
@@ -65,7 +65,7 @@ const ClientOut = struct {
         return .{ .ctx = c, .vt = &.{ .open = open, .event = event, .reply = reply, .keepalive = keepalive } };
     }
 
-    fn open(ctx: *anyopaque) error{Closed}!void {
+    fn open(ctx: *anyopaque, _: usize) error{Closed}!void {
         const c: *ClientOut = @ptrCast(@alignCast(ctx));
         return sse.open(c.conn);
     }
@@ -446,7 +446,7 @@ const Run = struct {
     /// A context-window refusal on a stream: the role chunk when there are no tools, then the error event and [DONE].
     fn streamedContext(r: *Run, cx: *const Cx, tools: bool, field: []const u8) void {
         const a = r.a;
-        r.out.vt.open(r.out.ctx) catch return;
+        r.out.vt.open(r.out.ctx, 0) catch return;
         if (!tools and r.is_chat) r.emit(r.chunk(roleDelta(a) catch return, null) catch return) catch return;
         logRefused(r.id, cx.message);
         const body = errorBody(a, cx, field) catch return;
@@ -572,7 +572,7 @@ const Run = struct {
         };
         var handed = false; // generate gives the preparing count back from here on
         defer if (!handed) chat.release(r.srv, prepared.preparing);
-        r.out.vt.open(r.out.ctx) catch return;
+        r.out.vt.open(r.out.ctx, prepared.prompt_len) catch return;
         if (!tools and r.is_chat) r.emit(r.chunk(roleDelta(a) catch return, null) catch return) catch return;
         var sink_state: StreamSink = .{ .run = r, .tools = tools };
         handed = true;
@@ -622,8 +622,8 @@ const Run = struct {
         const last = r.chunk(.{ .string = "" }, if (reply.finish_reason.len > 0) reply.finish_reason else "length") catch return;
         if (compaction) |s| compact.stamp(&cx, &reply, s) catch return;
         if (r.srv.config.wire == .spark) {
-            // the last chunk carries usage only when asked for, then the engine's stats
-            if (r.plan.separate_usage) last.object.put(a, "usage", r.usage(&reply) catch return) catch return;
+            // usage rides the last chunk, include_usage or not (Messages sends none); server.py only when asked (#49)
+            last.object.put(a, "usage", r.usage(&reply) catch return) catch return;
             r.extras(last.object, &reply) catch return;
             r.emit(last) catch return;
             return r.out.vt.event(r.out.ctx, null) catch {};

@@ -40,6 +40,30 @@ EXPECTED = {
     ("tools", "bad_tool-single"): "a call to a tool the request did not offer goes out under its own name (PR #415); Python keeps the old rule",
     ("tools", "bad_tool-single-stream"): "a call to a tool the request did not offer goes out under its own name (PR #415); Python keeps the old rule",
     ("errors", "stream-context"): "a refused streamed request answers 400 before its stream opens (#388); Python answers 200 and an error event",
+    ("anthropic", "plain-stream"): (
+        "the stream head carries the prompt's token count (port of upstream #672 by kky42); "
+        "the Python reference predates it and opens with 0"
+    ),
+    ("anthropic", "thinking-stream"): (
+        "the stream head carries the prompt's token count (port of upstream #672 by kky42); "
+        "the Python reference predates it and opens with 0"
+    ),
+    ("anthropic", "tool-use-stream"): (
+        "the stream head carries the prompt's token count (port of upstream #672 by kky42); "
+        "the Python reference predates it and opens with 0"
+    ),
+    ("anthropic", "tool-use-think-stream"): (
+        "the stream head carries the prompt's token count (port of upstream #672 by kky42); "
+        "the Python reference predates it and opens with 0"
+    ),
+    ("anthropic", "stop-sequence-stream"): (
+        "the stream head carries the prompt's token count (port of upstream #672 by kky42); "
+        "the Python reference predates it and opens with 0"
+    ),
+    ("anthropic", "max-tokens"): (
+        "the stream head carries the prompt's token count (port of upstream #672 by kky42); "
+        "the Python reference predates it and opens with 0"
+    ),
 }
 
 
