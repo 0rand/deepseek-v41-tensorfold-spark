@@ -325,6 +325,7 @@ upstream TensorFold settings.
 | `TF_TP_KERNEL_IMAGE` | unset | image's tp_mailbox.fatbin (launcher) | TP kernel image |
 | `NCCL_SOCKET_IFNAME` | library auto-selection | your link interface | NCCL network interface |
 | `NCCL_IB_HCA` | library auto-selection | your cabled RDMA devices | NCCL/RoCE HCA selection |
+| `TF_TP_ROCE_HCA` | the first two active RDMA devices | the two devices on this rank's cable to its peer, e.g. `rocep1s0f0,roceP2p1s0f0` | RoCE device selection for `TF_COMM_BACKEND=roce` (`name[:gid],name[:gid]`); set it when a node has more than one cabled peer |
 
 `IMAGE`, `MODEL_DIR`, `ENGRAM_DIR`, `ASSETS_DIR`, `PREPARED_DIR`, `STATE_DIR`, and `CACHE_DIR` are required
 launcher inputs, not engine knobs. `HOST=localhost` and `PORT=8000` are launcher defaults for the HTTP listener.

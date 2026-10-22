@@ -15,7 +15,7 @@ done
 # Pass values by environment name, preserving spaces in values.
 envs=()
 while IFS='=' read -r key value; do
-    case "$key" in TF_DSV41_*|GLM53_TF_*|NCCL_*) envs+=(-e "$key");; esac
+    case "$key" in TF_DSV41_*|GLM53_TF_*|NCCL_*|TF_TP_ROCE_HCA) envs+=(-e "$key");; esac
 done < <(env)
 # --check-aot: every Triton variant this env launches, checked against this rank's aot/ (host only, no GPU work).
 # Run it before the first start and after any serving-setting change; it needs the fill's sigs.json in ASSETS_DIR.
