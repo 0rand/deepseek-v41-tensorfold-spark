@@ -140,7 +140,7 @@ def scan_history(rules) -> list[tuple[str, str, str]]:
         capture_output=True,
         check=True,
     )
-    found, commit, path = [], "?", "?"
+    found, commit, path, allow = [], "?", "?", ALLOW.relative_to(ROOT).as_posix()
     for raw in log.stdout.decode("utf-8", "replace").splitlines():
         if raw.startswith("\0commit "):
             commit, path = raw.split()[1], "(message)"
@@ -148,6 +148,8 @@ def scan_history(rules) -> list[tuple[str, str, str]]:
             path = "?"
         elif raw.startswith("+++ "):
             path = raw[6:] if raw.startswith("+++ b/") else raw[4:]
+        elif path == allow:  # its lines are regexes, not values
+            continue
         elif path == "(message)" or (raw.startswith("+") and not raw.startswith("+++")):
             line = raw if path == "(message)" else raw[1:]
             found += [
