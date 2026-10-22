@@ -117,3 +117,11 @@ The multimodal rotary and image-feature integration is adapted from MiaAI-Lab's
 [Flash Next vision patch 0008](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold/blob/a3aa89835022c55ca8e55008c37785954834e04f/patches/0008-flash-next-vision.patch),
 MIT License, Copyright (c) 2026 MiaAI-Lab. The license is included in `LICENSES/MiaAI-Lab-MIT.txt`.
 The port preserves the v0.5 CUDA execution APIs and adds an offline EXL3 vision adapter.
+
+## WebP decoding in the Zig image front end
+
+The WebP decoder in `zig/src/families/deepseek_v41/vision/` (`webp*.zig`) is a Zig port of
+[libwebp](https://chromium.googlesource.com/webm/libwebp) 1.6.0's decoder: the VP8L lossless decoder and its
+transforms, the VP8 lossy decoder, the fancy upsampler and YUV to RGB conversion, the ALPH plane and its unfilters,
+and the first-frame behaviour of `WebPAnimDecoder`. BSD 3-Clause License, Copyright (c) 2010, Google Inc.
+See [the license text](LICENSES/libwebp-BSD-3-Clause.txt).
