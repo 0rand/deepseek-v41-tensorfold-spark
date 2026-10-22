@@ -167,6 +167,7 @@ def main(argv: list[str] | None = None) -> int:
     for where, kind, masked in found:
         print(f"{where}: {kind}: {masked}")
     if found:
+        sys.stdout.flush()  # the findings before the summary when both streams go to one place
         print(
             f"check_secrets: {len(found)} credential finding(s); values masked above",
             file=sys.stderr,
