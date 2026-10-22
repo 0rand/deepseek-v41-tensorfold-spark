@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # Scan this repo for private infrastructure details and credentials before publishing.
+# Credentials (API keys, tokens, private keys, credential assignments) are scripts/check_secrets.py's patterns, run
+# from here over the same files; its value-masked findings fail this check too.
 #
 #   scripts/check-public.sh           precise patterns; exit 1 on any finding
 #   scripts/check-public.sh --broad   also list every secret / password / api-key / bearer / authorization mention
@@ -32,9 +34,6 @@ FLASHNEXT_ROLE_EMAILS+='|qa_expert_down_y@(mtp\.)?moe\.down|qa_expert_gateup@(mt
 # Homebrew's version substitution marker inside the fixed archive name is not an address.
 TEMPLATE_EMAILS='^engine/zig/packaging/homebrew/tensorfold\.rb\.in:[0-9]+:VERSION@-macos-arm64\.tar\.gz$'
 
-# Fixed upstream auth-test values; other values in these files still go through both credential patterns.
-AUTH_FIXTURE_PATHS='^engine/zig/zig/(src/server/auth\.zig|tests/server/(freeze_cases\.py|freeze_golden\.py|parity\.py|golden/cases\.json))$'
-
 # name|regex (grep -E, case-insensitive)|path globs excluded for this pattern (space-separated, may be empty)
 PATTERNS=(
     "private IPv4 192.168/16|\\b192\\.168\\.[0-9]{1,3}\\.[0-9]{1,3}\\b|$SSRF_FIXTURES"
@@ -47,14 +46,6 @@ PATTERNS=(
     'MAC address|\b([0-9a-f]{2}:){5}[0-9a-f]{2}\b|'
     'serial number|serial[ _-]?(number|no\.?)[ :=]|'
     'SSH public key|ssh-(ed25519|rsa|dss) AAAA|'
-    'private key block|BEGIN [A-Z ]*PRIVATE KEY|'
-    'Hugging Face token|\bhf_[A-Za-z0-9]{30,}|'
-    'OpenAI-style key|\bsk-[A-Za-z0-9_-]{20,}|'
-    'GitHub token|\b(ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{20,}|'
-    'Slack token|\bxox[abprs]-[A-Za-z0-9-]{10,}|'
-    'AWS key id|\bAKIA[0-9A-Z]{16}\b|'
-    'literal bearer token|bearer [A-Za-z0-9._~+/-]{6,}|'
-    "literal secret assignment|(password|passwd|secret|api[_-]?key|access[_-]?token)[\"']?[[:space:]]*[:=][[:space:]]*[\"'][^\"'<\$ {]{6,}[\"']|"
     'home directories|/home/[a-z0-9_-]+/|'
     'root home paths|(^|[^a-z0-9_.-])/root/|'
     'machine hostnames (dgx-01 style)|\bdgx-?[0-9]{1,2}\b|'
@@ -92,14 +83,7 @@ for entry in "${PATTERNS[@]}"; do
                read -ra globs <<< "$skip"
                for g in "${globs[@]}"; do [[ "$f" == $g ]] && { skipped=1; break; }; done
                [[ $skipped -eq 1 ]] && continue
-               if [[ ( "$name" == "literal bearer token" || "$name" == "literal secret assignment" ) &&
-                     "$f" =~ $AUTH_FIXTURE_PATHS ]]; then
-                   # Mask only complete fixture literals before matching; an unrelated key on the same line remains visible.
-                   sed -E 's/"sk-(cli|env|file|next)"/"<fixture>"/g; s/Bearer sk-(one|cli|nope)"/Bearer <fixture>"/g' "$f" |
-                       grep -HnIiE --label="$f" -- "$re" 2>/dev/null
-               else
-                   grep -HnIiE -- "$re" "$f" 2>/dev/null
-               fi
+               grep -HnIiE -- "$re" "$f" 2>/dev/null
            done)
     [[ "$name" == "home directories" && -n "$hits" ]] && hits=$(grep -viE "$HOME_OK" <<< "$hits")
     if [[ -n "$hits" ]]; then
@@ -108,6 +92,10 @@ for entry in "${PATTERNS[@]}"; do
         cut -c1-220 <<< "$hits"
     fi
 done
+
+# credentials: one pattern set, shared with scripts/redact.py; allowlist in scripts/check-secrets-allow.txt
+secrets=$(python3 scripts/check_secrets.py "${FILES[@]}" 2>&1)
+if [[ $? -ne 0 ]]; then fail=1; echo "== credentials (scripts/check_secrets.py)"; echo "$secrets"; fi
 
 # e-mail addresses other than placeholder / example domains (model outputs in results/ invent a few)
 emails=$(for f in "${FILES[@]}"; do grep -HnoIiE '[a-z0-9][a-z0-9._%+-]*@[a-z0-9-]+(\.[a-z0-9-]+)*\.[a-z]{2,}' "$f" 2>/dev/null; done |
@@ -126,6 +114,8 @@ if [[ "${1:-}" == --history ]]; then
     echo "== history: $(wc -w <<< "$commits") commit(s)"
     bad_auth=$(git log --all --format='%h %ae %ce' | awk -v ok="$ALLOWED_AUTHOR" '$2 != ok || $3 != ok')
     if [[ -n "$bad_auth" ]]; then fail=1; echo "== commits not authored / committed as $ALLOWED_AUTHOR"; echo "$bad_auth"; fi
+    hsecrets=$(python3 scripts/check_secrets.py --history 2>&1)
+    if [[ $? -ne 0 ]]; then fail=1; echo "== history: credentials (scripts/check_secrets.py)"; echo "$hsecrets"; fi
     msgs=$(git log --all --format='%h %B')
     for entry in "${PATTERNS[@]}"; do
         name="${entry%%|*}"; rest="${entry#*|}"; skip="${rest##*|}"; re="${rest%|*}"
