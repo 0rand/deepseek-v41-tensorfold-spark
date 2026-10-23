@@ -30,7 +30,7 @@ launcher work; there is no arithmetic, quantization or kernel rewrite in this fo
 
 ## Deployment profile
 
-The example profile is the one exercised on the reference pair:
+The example profile matches the serving settings exercised on the reference pair:
 
 | Setting | Value |
 | --- | --- |
