@@ -28,6 +28,21 @@ here are functional checks unless a table says otherwise.
 The engine source is still the PR65 tree. The changes are serving, telemetry, session persistence and
 launcher work; there is no arithmetic, quantization or kernel rewrite in this fork.
 
+### What PR65 fixes
+
+Before PR65, the two tensor-parallel ranks accounted for NVMe session usage using their own physical
+file sizes. Split-KV files can differ in size between ranks, so at the budget limit the ranks could
+evict different entries and reuse entry IDs for different conversations; a later restore could then
+fail or restore mismatched histories and wedge the pair.
+
+PR65 uses a rank-independent logical charge for live session-file registration and eviction, sends
+the leader's expected entry position and key with a restore, and turns a mismatched restore into a
+coordinated cache miss instead of accepting another entry. It is a session correctness and liveness
+fix, not a speed patch. It does not fix the separate mid-prefill `PoolExhausted` trigger (issue #55)
+and does not add a universal timeout for independent CUDA/transport deadlocks. Restart persistence is
+not established by PR65 alone; the write-through and startup recovery work described below is
+separate.
+
 ## Deployment profile
 
 The example profile matches the serving settings exercised on the reference pair:
@@ -139,6 +154,10 @@ An already-fixed adapter does not need the patch. Run the dashboard against the 
 python3 engine_metrics.py --host 127.0.0.1 --port 8100 --engine tensorfold
 ```
 
+The curses dashboard ran against port 8100, auto-detected TensorFold, displayed the 32 GiB tier,
+loaded tokens, restore latency, cache hit rate and latency/TTFT averages, and exited normally with
+`q`.
+
 ## Immediate SSD sessions
 
 The native tier previously wrote only on eviction and did not rebuild its prefix index at startup.
@@ -180,6 +199,8 @@ The example enables `TF_DSV41_PF_4K=1`, `TF_DSV41_PF_4K_MEMORY_OK=1`,
 
 On the reference pair both ranks allocated and released their 2,268 MiB 4K workspace, the scheduler
 logged prompt pieces of 4,096 rows, and no workspace-fallback warning appeared in the saved runs.
+During a 7,376-token request the adapter observed prefilling/running states and ratios corresponding
+to 4,096 and 7,360 completed positions, not the entire submitted prompt.
 When either rank cannot keep the explicit 1 GiB workspace reserve, the engine falls back to 2K
 segments with the same bits. For a conservative 2K profile, set `PF_4K=0`, drop
 `PF_4K_MEMORY_OK` and `PF_WS_FLOOR_GIB`, and use 2,048 for chunk and rows.
@@ -192,6 +213,11 @@ The first full-profile boot reached the end of model initialization and then exi
 serving dip, and rejected the predicted 2.80 GiB remainder against a 4 GiB hard floor. That was a
 predictive guard decision, not an observed OOM kill. The example profile now uses 1 GiB floors and
 disables measured boot rejection; live admission and workspace checks remain.
+
+At one point the pair recorded `MemFree` 3.03 GiB (head) / 2.21 GiB (worker) and `MemAvailable`
+4.18 / 6.42 GiB. The boot guard uses Linux `MemAvailable`, not total RAM minus a display's used
+figure; these observations use different accounting and were not simultaneous. Neither is evidence
+of an actual OOM.
 
 ## Validation performed
 
@@ -235,6 +261,13 @@ not throughput or quality benchmarks.
 - The completed download passed a 47-file presence check, 42 indexed shard size checks, F32 `[128]`
   MTP router biases, a BF16 `[1, 5376]` confidence head, and five metadata SHA-256 checks. Weight
   payloads were not reread for full checksums.
+- The earlier full-profile asset preparation enumerated 343,978 logical programs, reduced them to 144
+  distinct Triton variants, and compiled the 81 missing variants in 23 seconds while reusing 63.
+  Shape enumeration took 12 min 3 s; head and worker coverage checks took 11 min 13 s and 11 min 29 s.
+  The whole preparation, including setup and transfer, took 26 min 45 s. CPU-side enumeration
+  dominated; compilation did not.
+- The model transfer to the worker took 555.47 seconds (9 min 15 s) with `rsync --partial`; no
+  `--delete`, conversion or source modification was involved.
 - The first boot loaded 95.1 GiB and built/wrote 44 pack-specific prepared files; the weight-load
   stage took 401.6 seconds. A later restart reused the prepared files and became ready in about
   173.5 seconds, including 14.6 seconds of draft-cost calibration.
