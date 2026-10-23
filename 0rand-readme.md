@@ -187,6 +187,7 @@ Observed on the reference pair, as functional canaries rather than benchmarks:
 | RAM reuse | Repeating the request reported 7,360 cached tokens. |
 | Full restart | Both ranks stopped and restarted; each logged recovery of one common NVMe entry. Initial RAM-kept count was zero. |
 | SSD restore | The request again reported 7,360 cached tokens; one load, 7,360 loaded tokens, 57.5 ms tier restore, 0.5015 s whole request. |
+| Managed restart | The later `zig-stack.sh restart` migration recovered 304 common entries on both ranks (327 rank-0 files, 337 rank-1 files). The one-sided seed entry was excluded from recovery and its replay correctly reported zero cached tokens. |
 
 The disk budget can overshoot physically with many small entries; upstream reported roughly 30%.
 Reserve headroom and measure actual usage separately from the logical charge.
@@ -328,8 +329,9 @@ Not exercised or not qualified by this fork:
 - No 1M-context request, sustained eviction stress, crash injection or full 32 GiB tier fill.
 - No parser transplantation or tool-policy equivalence proof; the Python hardening overlay was not
   ported mechanically.
-- No host reboot or Docker-daemon restart; managed stop/start after cutover was deferred on the
-  reference pair.
+- No host reboot or Docker-daemon restart. The managed `restart` migration itself ran: the foreground
+  pair drained with exit 0, both ranks came back `unless-stopped`, and startup recovered the common
+  NVMe entries.
 - PR65 does not fix the separate mid-prefill `PoolExhausted` trigger (issue #55) and does not add a
   universal timeout for independent CUDA/transport deadlocks.
 - The disk budget is logical, not a hard physical ceiling.
