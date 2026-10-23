@@ -46,6 +46,8 @@ git apply /path/to/this-repo/tools/enginemetrics-gauges.patch
 
 An already-fixed adapter does not need the patch. Local settings, model data, caches and run logs are excluded
 from the repository. The results below are inherited upstream measurements, not new benchmarks of this fork.
+The full fork record — lifecycle semantics, telemetry fields, SSD recovery, validation and limits — is in
+[0rand-readme.md](0rand-readme.md).
 
 ## Upstream results
 
