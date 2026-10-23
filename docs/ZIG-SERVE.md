@@ -33,9 +33,10 @@ Required on both nodes:
   (`scripts/run-zig.sh` copies it there when it is missing). Draft costs come from the engine's own
   boot measurement (`CALIB=zig`): the first boot times its windows on both ranks and stores the table under
   `/state/calib-zig`; later boots read it.
-- Writable prepared and session directories on local NVMe. Plan roughly 100 GB weights, 95 GB Engram shards,
-  another rank's weight-sized prepared cache and up to 128 GiB session files per node, plus image/build space.
-  Keep other workloads off the GPUs and preserve the 5 GiB target / 4 GiB hard MemAvailable floor on both ranks.
+- Writable prepared and session directories on local NVMe. Plan roughly 204 GB for the full weights pack on each
+  node, 95 GiB packed Engram shards, 95 GiB rank-specific prepared weights, and the template's 32 GiB session cache,
+  plus image/build space. The engine's default target/hard MemAvailable floors are 5/4 GiB; this template explicitly
+  opts into 1/1 GiB and disables the measured boot guard. Check actual memory headroom on both ranks.
 
 The source kit's `tools/zig/dsv41_m2c2/build-kit.sh` builds the ARM64 binaries and checks the sm_121 fatbins.
 It generates a `knob-names.txt` from the names actually read by Zig. Asset generation uses
@@ -47,24 +48,30 @@ The AOT set depends on the serving settings: see [Changing serving settings](#ch
 
 ## Quick start
 
-The source, build recipe and launcher are included. Generate the assets below before serving. Hardware execution
-was not repeated for this publication; the exported host build and host tests are reported in the source guide.
+The source, build recipe and launcher are included. Generate the assets below before serving. This fork's native
+flash17 path has been exercised on two DGX Sparks, including 4K prefill and SSD session recovery; the upstream
+performance tables are not new benchmark results for this fork.
 
 1. Clone this public recipe and download the pack on both nodes:
 
    ```bash
-   git clone --recurse-submodules https://github.com/jayleaton/deepseek-v41-tensorfold-spark.git
+   git clone --recurse-submodules https://github.com/0rand/deepseek-v41-tensorfold-spark.git
    cd deepseek-v41-tensorfold-spark
-   hf download jayleaton/DeepSeek-V4.1-Flash-1017-EXL3-2.8bpw --local-dir /srv/models/flash17
+   hf download jayleaton/DeepSeek-V4.1-Flash-1017-EXL3-2.8bpw --local-dir /srv/tensorfold/models/flash17
    cp config/prod-zig-flash17.env.example config/prod-zig.env
    $EDITOR config/prod-zig.env
    ```
 
-   Set the image, rank 0's link address, NIC/HCA settings and each node's own absolute directories. The engine
-   settings must match on both ranks. Copy the dense-prefill tuning table into each node's `CACHE_DIR`
-   (`cp config/pfdense-table.json "$CACHE_DIR/"`; the launcher does it when the file is missing).
-   `config/prod-zig.env` is ignored by git. The template is the recommended flash17
-   serving profile, with 4K prefill (it falls back to 2K per piece when memory is short). For q28-v2 copy
+   The generic flash17 template uses `/srv/tensorfold`, head link address `192.0.2.11`, worker link address
+   `192.0.2.12`, and SSH user `operator`; replace these with the deployment's values. Configure the same serving
+   settings on both nodes, with each node's local model, rank-specific Engram/assets, prepared, state and cache data.
+   On the head, `WORKER_SSH`, `WORKER_REPO`, and `WORKER_CONFIG` must name the worker's reachable SSH target, matching
+   checkout, and its config file. That local trusted config is the only place `scripts/zig-stack.sh` gets remote
+   location data. Copy the worker's config to precisely `WORKER_CONFIG` before using the stack script.
+
+   Copy the dense-prefill tuning table into each node's `CACHE_DIR` (`cp config/pfdense-table.json "$CACHE_DIR/"`;
+   the launcher does it when missing). `config/prod-zig.env` is ignored by git. The template is the recommended
+   flash17 serving profile, with 4K prefill (it falls back to 2K per piece when memory is short). For q28-v2 copy
    `config/prod-zig.env.example` instead.
 
 2. Build the included source on an ARM64 build host:
@@ -94,48 +101,59 @@ was not repeated for this publication; the exported host build and host tests ar
    with them (build args `CUDA_DEVEL` / `CUDA_RUNTIME`). Use `ZIG_URL` for the exact Zig compiler tarball if the
    default download URL is unavailable. The first start builds prepared files; do not reuse Python's cache.
 
-3. Check the commands and the AOT set, then run rank 1 on its node followed promptly by rank 0 on its node:
+3. Check the commands and AOT set on their respective nodes, then manage both ranks from the head:
 
    ```bash
-   scripts/run-zig.sh 1 --dry-run    # on rank 1
-   scripts/run-zig.sh 0 --dry-run    # on rank 0
-   scripts/run-zig.sh 1 --check-aot  # on rank 1: aot/ holds every variant this env launches
-   scripts/run-zig.sh 0 --check-aot  # on rank 0
-   scripts/run-zig.sh 1             # rank 1: keep running in this terminal
-   scripts/run-zig.sh 0             # rank 0: another terminal on its node
+   # run on the worker
+   CONFIG=/srv/tensorfold/deepseek-v41-tensorfold-spark/config/prod-zig.env scripts/run-zig.sh 1 --dry-run
+   CONFIG=/srv/tensorfold/deepseek-v41-tensorfold-spark/config/prod-zig.env scripts/run-zig.sh 1 --check-aot
+
+   # run on the head
+   scripts/run-zig.sh 0 --dry-run
+   scripts/run-zig.sh 0 --check-aot
+   scripts/zig-stack.sh start
+   scripts/zig-stack.sh status
    ```
 
-   `--check-aot` runs `tf-dsv41-m1 aot-needs` in the image with this env against the rank's `aot/` (host work only;
-   it enumerates every program, about 11 minutes on an x86 desktop CPU) and needs the fill's `sigs.json` in
-   `ASSETS_DIR`. The launcher passes the serving settings to both processes, sets TP world/rank/device explicitly,
-   and uses Docker `--init` because the follower exits when orphaned. It validates local directories and basic
-   assets (including `rope.bin`'s rows against `TF_DSV41_CONTEXT`); it does not replace the engine's memory checks,
-   fill validation, or a production watchdog. Keep the same env
-   across restarts. A failure on either rank should end both via fail-fast (exit 70).
+   `zig-stack.sh start` is idempotent when both containers are already running. Otherwise it creates rank 1 over
+   BatchMode SSH first and rank 0 locally, using `docker run --restart unless-stopped` without `--rm`; Docker starts
+   these containers after a daemon/host reboot unless they were manually stopped. A successful `start` only means both
+   containers were created, **not** that the model is usable: model loading and the first preparation continue in the
+   background. Wait for `zig-stack.sh status` to return a successful `/v1/models` response before sending traffic;
+   it reports an unavailable endpoint separately from container state.
 
-   To stop, signal rank 0 only and let it drain: on SIGTERM it answers new requests with 503 (`/health` reports
-   `draining`), gives requests in progress `TF_DSV41_DRAIN_S` seconds to finish, then halts both ranks at a round
-   boundary. Give Docker more time than the drain before it kills, then wait for rank 1 to exit on its node:
+   `run-zig.sh` still defaults to the original foreground `--rm` mode for direct debugging; use
+   `scripts/run-zig.sh N --detach` only when deliberately creating one managed local rank. `--check-aot` runs
+   `tf-dsv41-m1 aot-needs` in the image with this env against the rank's `aot/` (host work only; it enumerates every
+   program, about 11 minutes on an x86 desktop CPU) and needs the fill's `sigs.json` in `ASSETS_DIR`. The launcher
+   passes the serving settings to both processes, sets TP world/rank/device explicitly, and uses Docker `--init`
+   because the follower exits when orphaned. It validates local directories and basic assets (including `rope.bin`'s
+   rows against `TF_DSV41_CONTEXT`); it does not replace the engine's memory checks, fill validation, or a production
+   watchdog. Keep the same env across restarts. A failure on either rank should end both via fail-fast (exit 70).
+
+   To apply config or image changes, recreate the pair rather than Docker-restarting one rank:
 
    ```bash
-   docker stop -t $((DRAIN_S + 60)) tensorfold-zig-r0   # rank 0 node; DRAIN_S = TF_DSV41_DRAIN_S (20)
-   docker wait tensorfold-zig-r1                        # rank 1 node
+   scripts/zig-stack.sh restart   # drain rank 0, stop rank 1, then recreate worker first and head second
+   scripts/zig-stack.sh logs      # both ranks; use logs 0 or logs 1 for one rank
+   scripts/zig-stack.sh stop      # intentional stop: both remain stopped across Docker daemon restarts
    ```
 
-   The launcher's `--rm` removes both containers once they exit (otherwise `docker rm` them). A second signal
-   cuts the drain short.
-
-   Streams that have not sent their first token yet get a keepalive every `TF_DSV41_SSE_KEEPALIVE_S` seconds
-   (`: keepalive` comments on OpenAI streams, `ping` events on Anthropic streams), so client or proxy idle
-   timeouts do not end long prefills.
+   `stop` disables both restart policies, lets rank 0 receive SIGTERM and drain for
+   `TF_DSV41_DRAIN_S`, then stops any remaining follower. It deliberately leaves restart disabled: a follower that
+   exits naturally during the head's drain is not recorded as manually stopped by Docker. The next `start` recreates
+   both containers with `unless-stopped`. `ZIG_STOP_TIMEOUT` defaults to, and may not be lower than, drain plus
+   60 seconds. Do not use `docker restart` on one rank; use `zig-stack.sh restart` for a synchronized recreate.
+   The same `restart` migrates prior foreground `--rm` ranks: it drains/removes them, then creates managed containers.
+   No systemd unit or watchdog is required for boot autostart; the Docker daemon must be enabled on both nodes.
 
 4. Wait for the model to load and inspect the boot log: four slots, CED replay, row graphs, successful device-draft
    self-check and RoCE probe. First preparation can take several minutes. Then query rank 0:
 
    ```bash
-   curl -fsS localhost:8000/v1/models
-   curl -fsS localhost:8000/v1/chat/completions -H 'Content-Type: application/json' \
-     -d '{"model":"DeepSeek-V4.1-Flash-TF","messages":[{"role":"user","content":"What is 17 * 23?"}],"temperature":0,"reasoning_effort":"low"}'
+   curl -fsS localhost:8100/v1/models
+   curl -fsS localhost:8100/v1/chat/completions -H 'Content-Type: application/json' \
+     -d '{"model":"deepseek-v41-flash","messages":[{"role":"user","content":"What is 17 * 23?"}],"temperature":0,"reasoning_effort":"low"}'
    ```
 
    Check that the answer is 391; do not infer readiness from a live container alone.
@@ -290,16 +308,18 @@ upstream TensorFold settings.
 | `TF_DSV41_PREPARED` | unset | `/prepared` | Zig prepared layer images (different from Python prepared folders) |
 | `TF_DSV41_PREPARED_WRITE` | 0 | `1` | Write missing prepared files |
 | `TF_DSV41_PLAN_TIMEOUT` | 300 | `1800` | Seconds allowed for TP rendezvous connection |
+| `TF_DSV41_BOOT_MEASURED` | auto | `0` | Do not apply the measured-boot memory gate in this explicit profile |
 | `TF_DSV41_PLAN_LINK` | blocking socket | `rdma` | Spin on the plan socket before blocking; 5000 μs when rdma |
 | `TF_DSV41_PLAN_PIN` | off | `auto` | Pin plan threads to the best available CPU |
 | `TF_DSV41_DEPTH_JOINT` | 1 | `0` | Disable joint draft depth policy, matching the Python reference |
 | `TF_DSV41_SESSIONS` | 0 | `1` | Session reuse; SESSION_SLOTS additionally required at four slots |
 | `TF_DSV41_SESSION_RAM_MIB` | 256 | `256` | Bounded session state RAM tier |
 | `TF_DSV41_SESSION_DISK` | unset: RAM only | `/sessions` | NVMe session tier |
-| `TF_DSV41_SESSION_DISK_GIB` | 64 | `128` | NVMe tier file budget |
-| `TF_DSV41_SESSION_DISK_MIN` | 1024 | `1024` | Minimum token count for parking a session |
-| `TF_DSV41_FLOOR_GIB` | max(5, hard floor) | `5` | Target MemAvailable in GiB per rank |
-| `TF_DSV41_FLOOR_HARD_GIB` | 4 | `4` | Hard admission floor in GiB |
+| `TF_DSV41_SESSION_DISK_GIB` | 64 | `32` | NVMe tier file budget |
+| `TF_DSV41_SESSION_DISK_MIN` | 1024 | `0` | No disk-tier length threshold; CED's intrinsic 64-token, grid-16 snapshot rule still applies |
+| `TF_DSV41_SESSION_DISK_WRITE_THROUGH` | 0 | `1` | Commit every eligible snapshot to the persistent tier before its store save returns |
+| `TF_DSV41_FLOOR_GIB` | max(5, hard floor) | `1` | Explicit less-conservative target MemAvailable reserve in GiB per rank |
+| `TF_DSV41_FLOOR_HARD_GIB` | 4 | `1` | Explicit less-conservative hard admission reserve in GiB |
 | `TF_DSV41_REQUEST_LOG` | unset: off | `/state/requests.jsonl` | Request metadata log |
 | `TF_DSV41_DISCONNECT` | 1 | `1` | Cancel generation when client disconnects |
 | `TF_DSV41_DRAIN_S` | 20 | `20` | Seconds requests in progress may finish after SIGTERM before both ranks halt |
@@ -327,8 +347,10 @@ upstream TensorFold settings.
 | `NCCL_IB_HCA` | library auto-selection | your cabled RDMA devices | NCCL/RoCE HCA selection |
 
 `IMAGE`, `MODEL_DIR`, `ENGRAM_DIR`, `ASSETS_DIR`, `PREPARED_DIR`, `STATE_DIR`, and `CACHE_DIR` are required
-launcher inputs, not engine knobs. `HOST=localhost` and `PORT=8000` are launcher defaults for the HTTP listener.
-The maximum reply is 32768 tokens and the served model ID is `DeepSeek-V4.1-Flash-TF` in this small launcher.
+launcher inputs, not engine knobs. `HOST=localhost` and `PORT=8000` remain the unset launcher defaults; the flash17
+template explicitly uses `127.0.0.1:8100`. `MODEL_NAME` controls the served model ID and defaults to
+`deepseek-v41-flash`. `WORKER_SSH`, `WORKER_REPO`, `WORKER_CONFIG`, and `ZIG_STOP_TIMEOUT` belong to
+`zig-stack.sh`'s trusted head-side lifecycle configuration, not to the engine.
 
 ### 4K prefill and its fallback
 
@@ -338,28 +360,34 @@ the same env. The 4K workspace is transient and released after the CED finish. E
 across both ranks; if either cannot leave `TF_DSV41_PF_WS_FLOOR_GIB` free, both use 2K segments with the same bits.
 The boot budget can also refuse a profile that cannot fit.
 
-`TF_DSV41_PF_WS_FLOOR_GIB` defaults to the hard floor (4 GiB); the profile uses 3.5 GiB so the more constrained rank
-does not fall back persistently. That trades workspace margin for speed. Under `PF_4K=1`, `aot-needs` also lists the
+`TF_DSV41_PF_WS_FLOOR_GIB` defaults to the hard floor (4 GiB). The flash17 profile explicitly chooses `1.0` GiB,
+alongside its 1 GiB admission floors, to keep the tested 4K path available. This is less conservative: the workspace
+still checks both ranks and falls back to 2K segments under pressure. Under `PF_4K=1`, `aot-needs` also lists the
 2,048-row segment programs this fallback runs; a fill made from a 4K env with an older `aot-needs` lacks them and
 should be completed as in [Changing serving settings](#changing-serving-settings). For a conservative 2K profile set
 `PF_4K=0`, drop `PF_4K_MEMORY_OK` and `PF_WS_FLOOR_GIB`, and use 2048 for `PREFILL_CHUNK` / `PREFILL_ROWS`. Do not
 enable two-batch prefill overlap (PF_TBO) alongside 4K without a separate memory gate: the tested combination
 exhausted memory.
 
+The workspace floor is separate from `TF_DSV41_FLOOR_GIB` and the measured boot-budget policy. Changing only
+`TF_DSV41_PF_WS_FLOOR_GIB` does not change AOT shapes. Confirm actual workspace allocation in both rank logs, not
+just the configured `PREFILL_ROWS`.
+
 ### Split KV and the pool
 
 Without split KV every rank holds every compressed KV row, so the pool is bounded by one node's free memory. With
 `TF_DSV41_KV_SPLIT=1` each rank holds its share of the rows and the ranks exchange the selected rows each round, about
 1,060 bytes a token on each rank. That is what lets q28-v2's `TF_DSV41_POOL_TOKENS=3000000` boot where the replicated
-layout fits about 1.4M (flash17's profile uses 2,100,000 to keep the 4 GiB floor under 4K prefills;
+layout fits about 1.4M (flash17's profile uses 2,100,000 with its explicit 1 GiB reserves and 4K prefills;
 [FLASH-1017](FLASH-1017.md#memory-the-21m-pool)): one slot can fill its whole `TF_DSV41_CONTEXT` (1M), two slots 1M
 each, four live slots about 750K each. The pool is shared, so these are totals across live slots, not per-slot
 reservations. `TF_DSV41_FORMS_INPLACE=1` frees the dense forms' separate copy for the pool, and
 `TF_DSV41_KV_SPLIT_COMPACT=1` sends each rank's packed rows instead of the dense table where the transport allows it.
 
-The boot check prices the pool against each rank's measured memory at the end of boot and refuses a pool that would
-leave the worst predicted dip (`TF_DSV41_SERVE_DIP_GIB`, default 3.0 GiB) under the hard floor, so an oversized
-`POOL_TOKENS` fails at boot, not under load. When live slots need the pool, admission parks idle sessions from RAM to
+With `TF_DSV41_BOOT_MEASURED=auto`, the boot check prices the pool against each rank's measured memory and refuses a
+pool that would leave the worst predicted dip (`TF_DSV41_SERVE_DIP_GIB`, default 3.0 GiB) under the hard floor. The
+flash17 profile explicitly sets `TF_DSV41_BOOT_MEASURED=0`, so it does not add that measured-boot gate; its configured
+pool must still fit the actual deployment. When live slots need the pool, admission parks idle sessions from RAM to
 the NVMe tier (`TF_DSV41_SESSION_DISK`); a parked chat's next prompt resumes it from disk, and a restore that fails on
 any rank is a cache miss: the prompt is prefilled from 0 and serving continues. Split KV costs some decode speed for the
 exchange (see [ZIG-RESULTS](ZIG-RESULTS.md#split-kv-and-the-30m-pool)). For a speed-first profile without long contexts,
@@ -369,3 +397,35 @@ drop `KV_SPLIT` and `KV_SPLIT_COMPACT` and set `POOL_TOKENS=1400000`.
 `PREFILL_PIECES=1`, replay mode and the multi-segment AOT programs `aot-needs` lists under them.
 Do not equate the serving profile with enabling every experimental knob: the engine has more default-off paths
 than the profile uses.
+
+### Persistent SSD sessions
+
+For a 32 GiB per-rank tier that writes eligible snapshots immediately rather than waiting for RAM eviction:
+
+```bash
+TF_DSV41_SESSIONS=1
+TF_DSV41_SESSION_DISK=/sessions
+TF_DSV41_SESSION_DISK_GIB=32
+TF_DSV41_SESSION_DISK_MIN=0
+TF_DSV41_SESSION_DISK_WRITE_THROUGH=1
+TF_DSV41_SESSION_RAM_MIB=256
+```
+
+Mount `/sessions` on persistent local NVMe on each rank. Write-through waits for the snapshot file's commit
+before the store save returns and retains the RAM copy subject to the existing RAM/residency policy.
+It does not require pool pressure or a high-water trigger. Turning write-through off restores eviction-driven writes.
+
+`SESSION_DISK_MIN=0` removes the disk tier's minimum length, not the native snapshot eligibility rule:
+CED saves prompt prefixes on a 16-token grid from position 64 onward. It does not persist arbitrary tiny
+turns or checkpoint every generated token.
+
+Startup indexes compatible files, intersects recovered keys across ranks and assigns stable entry IDs
+independently of filesystem timestamps. A later matching prompt restores its saved prefix on demand;
+the entire SSD tier is not preloaded at boot. Model weights must still load before serving.
+Keep session directories private to the exact weight pack and serving mode; layout/rank checks are not
+a substitute for checkpoint isolation.
+
+`/health.spill` and `tensorfold:spill_*` report the budget, file bytes, writes, restores, token counts,
+restore latency and failures. Byte counts are per rank. Validate with a real prompt, RAM reuse,
+then a full restart and an NVMe prefix hit; a live `/health` alone does not prove cache recovery.
+

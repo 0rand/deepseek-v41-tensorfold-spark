@@ -91,6 +91,8 @@ pub const LaneHost = struct {
     cache: ?*pc.Store = null, // kept prompt states (engine thread only); the backend restores and saves them
     memory: ?api.MemorySource = null, // the backend's memory counts; null: Engine.memory reports none
     graphs: ?api.GraphsSource = null, // the backend's graph caches for /health; null: none
+    cache_source: ?api.CacheSource = null, // CPU-only paged-cache source, read only by the engine thread
+    cache_status: ?api.CacheStatus = null, // source copy plus live stream states, published under mutex
     explain: ?api.Explain = null, // the backend's words for a request it refuses; null: the error's name
     /// Runs first on the engine thread: a backend whose API state is per thread (a CUDA context) binds it there.
     on_thread: ?ThreadInit = null,
@@ -119,6 +121,7 @@ pub const LaneHost = struct {
         submitted: i96 = 0,
         began: i96 = 0,
         prefilled: ?i96 = null,
+        prefill_completed: u64 = 0, // committed prompt rows, not the submitted prompt's length
         entry: ?*pc.Entry = null, // the kept state the backend restores, until its prompt pass reports
         marks: []const u32 = &.{}, // where the pass keeps states (gpa-owned)
         kept0: u64 = 0, // the store's kept count when the job looked it up
@@ -247,8 +250,46 @@ pub const LaneHost = struct {
             .generation_tokens = h.live_generated,
             .oldest_queued_s = if (h.queued.items.len > 0) seconds(now - oldestQueued(h)) else 0,
             .pace = paceStatus(&h.pace, now),
+            .cache = h.cache_status,
         };
         if (h.graphs) |g| out.graph_caches = @intCast(g.read(g.ctx, &out.graphs));
+    }
+
+    /// Captures the family's CPU-only page/session book on the engine thread, then publishes it with live stream
+    /// progress under the same lock as status. HTTP callers only ever read `cache_status`.
+    fn publishCache(h: *LaneHost) void {
+        const source = h.cache_source orelse return;
+        var cache = source.read(source.ctx) orelse {
+            h.mutex.lockUncancelable(h.io);
+            h.cache_status = null;
+            h.mutex.unlock(h.io);
+            return;
+        };
+        h.mutex.lockUncancelable(h.io);
+        defer h.mutex.unlock(h.io);
+        var max_context: u64 = 0;
+        cache.streams = .{ .max = h.info_.lanes };
+        for (h.admitted.items) |job| {
+            if (!job.started) {
+                cache.streams.filling += 1;
+                continue;
+            }
+            if (job.stream.finished) continue;
+            if (job.prefilled == null) {
+                cache.streams.prefilling += 1;
+            } else if (job.stream.paused) {
+                cache.streams.paused += 1;
+            } else {
+                cache.streams.decoding += 1;
+            }
+            const completed = if (job.prefilled == null) job.prefill_completed else job.stream.cache_len;
+            max_context = @max(max_context, completed);
+        }
+        cache.stream_kv_usage_ratio = if (h.info_.context_window > 0)
+            @min(1.0, @as(f64, @floatFromInt(max_context)) / @as(f64, @floatFromInt(h.info_.context_window)))
+        else
+            0;
+        h.cache_status = cache;
     }
 
     fn oldestQueued(h: *const LaneHost) i96 {
@@ -504,6 +545,7 @@ pub const LaneHost = struct {
                 _ = h.drop(job, h.words(e));
                 continue;
             };
+            job.prefill_completed = job.stream.cached;
             rd.vtable.began(rd.ctx, @intFromPtr(job), b.damaged);
         }
         // this round's pieces, a decode round of the streams decoding, then the prompts whose rows are in
@@ -530,9 +572,13 @@ pub const LaneHost = struct {
                 jobs[n] = job;
                 n += 1;
             }
-            if (n > 0) h.core.pieces(list[0..n]) catch |e| {
-                for (jobs[0..n]) |job| h.dropPiece(job, h.words(e));
-            };
+            if (n > 0) {
+                if (h.core.pieces(list[0..n])) |_| {
+                    for (jobs[0..n], list[0..n]) |job, piece| job.prefill_completed = piece.end;
+                } else |e| {
+                    for (jobs[0..n]) |job| h.dropPiece(job, h.words(e));
+                }
+            }
         } else for (h.pieces.items) |piece| {
             if (!piece.run) continue;
             did = true;
@@ -540,7 +586,9 @@ pub const LaneHost = struct {
             if (job.stream.finished) continue;
             h.core.piece(&job.stream, piece.start, piece.end, piece.save) catch |e| {
                 h.dropPiece(job, h.words(e));
+                continue;
             };
+            job.prefill_completed = piece.end;
         }
         const t1 = std.Io.Clock.awake.now(h.io).toNanoseconds();
         // a joined prompt's last token decodes in this round's window (Config.join_tail; Python's batcher: `finals`
@@ -772,11 +820,13 @@ pub const LaneHost = struct {
 
     fn run(h: *LaneHost) void {
         if (h.on_thread) |t| t.run(t.ctx) catch |e| std.log.err("lane host: the engine thread's init failed ({t})", .{e});
+        h.publishCache();
         if (h.rounds) |rd| return h.runRounds(rd);
         while (true) {
             h.takeCancels();
             while (h.admitOne()) {}
             h.noteLive();
+            h.publishCache();
             h.lock();
             if (h.closing) {
                 const left = h.queued.items.len + h.admitted.items.len;
@@ -810,6 +860,7 @@ pub const LaneHost = struct {
                     h.unlock();
                 } else i += 1;
             }
+            h.publishCache();
         }
     }
 
@@ -835,6 +886,7 @@ pub const LaneHost = struct {
             h.unlock();
             const did = h.round(rd);
             h.noteLive();
+            h.publishCache();
             if (!did) {
                 h.lock();
                 if (h.cancels.items.len == 0) h.wake.waitTimeout(h.io, &h.mutex, .{ .duration = .{ .raw = .fromMilliseconds(20), .clock = .awake } }) catch {};

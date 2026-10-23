@@ -1,0 +1,45 @@
+diff --git a/README.md b/README.md
+index 3bdebaf..9376db1 100644
+--- a/README.md
++++ b/README.md
+@@ -108,6 +108,8 @@ delta-samples between polls:
+ - **TG (engine)** = Δ`generation_tokens_total` / Δ`decode_seconds_total`.
+ - **Live cache** = (`pool_tokens` − `pool_free_tokens`) / `pool_tokens` — shared
+   cache-pool occupancy — plus per-stream `kv_cache_usage_ratio` and `kept_prompts`.
++  The sampler retains the stream-KV and running/waiting gauges used by the display,
++  separately from the shared-pool occupancy calculated from `/health`.
+ - **MTP acceptance** = `accepted_total` / `drafted_total` — TensorFold counts
+   drafted *tokens* (not rounds), so no vLLM-style ×k multiplier.
+ - **SSD spill tier** (patch 0088's disk cache, `/health` → `spill`; engines
+diff --git a/engines/tensorfold.py b/engines/tensorfold.py
+index 33e2f91..ecc61bf 100644
+--- a/engines/tensorfold.py
++++ b/engines/tensorfold.py
+@@ -14,7 +14,7 @@ from .common import (
+     prune_rate_hist, rate, sparkline, wall_rate, wall_rate_safe,
+ )
+ 
+-TF_COUNTERS = [
++TF_METRICS = [
+     "tensorfold:prompt_tokens_total",
+     "tensorfold:generation_tokens_total",
+     "tensorfold:mtp_drafted_total",
+@@ -23,6 +23,9 @@ TF_COUNTERS = [
+     "tensorfold:request_latency_seconds_count",
+     "tensorfold:time_to_first_token_seconds_sum",
+     "tensorfold:time_to_first_token_seconds_count",
++    "tensorfold:kv_cache_usage_ratio",
++    "tensorfold:requests_running",
++    "tensorfold:requests_waiting",
+ ]
+ 
+ HEALTH_COUNTERS = [
+@@ -47,7 +50,7 @@ def sample(host, port):
+     metrics, _ = fetch_metrics(host, port)
+     health = fetch_json(host, port, "/health") or {}
+     s = {"t": time.time(), "_error": metrics.get("_error")}
+-    for k in TF_COUNTERS:
++    for k in TF_METRICS:
+         s[k] = get_value(metrics, k)
+     for k in HEALTH_COUNTERS:
+         s[k] = float(health.get(k, 0) or 0)

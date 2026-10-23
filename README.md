@@ -1,6 +1,6 @@
-Follow me on X for more updates: https://x.com/jayleaton
+Upstream updates: https://x.com/jayleaton
 
-Support me here: https://buymeacoffee.com/jayleaton
+Support the upstream maintainer: https://buymeacoffee.com/jayleaton
 
 # DeepSeek-V4.1-Flash-1017 on TensorFold, 2x NVIDIA DGX Spark
 
@@ -17,12 +17,37 @@ our EXL3 pack (**flash17**) and the TensorFold Zig engine that serves it, with t
 | Engine | TensorFold Zig, CUDA port `9131e10a` (source in [`engine/zig`](engine/zig)) |
 | Serving | 1M context, four slots, vision (native image input), tool calling, structured output |
 
-flash17 is serving as the production default on our two Sparks (model ID `DeepSeek-V4.1-Flash-TF`).
+This fork defaults to the model alias `deepseek-v41-flash` on `127.0.0.1:8100`.
 
 > **Work in progress.** Measured on one pair of Sparks. Read [what is not solved](docs/KNOWN-ISSUES.md) before
 > relying on it.
 
-## Results
+## Fork additions
+
+This fork starts from [upstream PR65](https://github.com/jayleaton/deepseek-v41-tensorfold-spark/pull/65),
+commit `207273b261196ee491b06e5818031ff54f91fcee`, and adds:
+
+- A two-node lifecycle script, [`scripts/zig-stack.sh`](scripts/zig-stack.sh), with Docker
+  `unless-stopped` restart policies and a configurable model alias.
+- Native `/health` and `/metrics` compatibility with EngineMetrics: actual stream progress, shared-pool
+  occupancy, retained snapshots and per-rank SSD-session statistics.
+- Immediate SSD persistence without dropping the RAM copy, and common-prefix recovery after restart.
+- A complete [flash17 example](config/prod-zig-flash17.env.example): four slots, 1M context,
+  a 2.1M shared pool, 4K prefill and 32 GiB SSD cache per node. Its explicit 1 GiB memory floors are
+  less conservative than the upstream defaults; they are an operator choice, not a universal safety guarantee.
+
+For an EngineMetrics checkout that discards the gauges its display uses, apply
+[`tools/enginemetrics-gauges.patch`](tools/enginemetrics-gauges.patch) from that checkout:
+
+```bash
+git apply --check /path/to/this-repo/tools/enginemetrics-gauges.patch
+git apply /path/to/this-repo/tools/enginemetrics-gauges.patch
+```
+
+An already-fixed adapter does not need the patch. Local settings, model data, caches and run logs are excluded
+from the repository. The results below are inherited upstream measurements, not new benchmarks of this fork.
+
+## Upstream results
 
 **Tasks.** 356 matched items (pass@1, greedy, thinking on, effort high), against Mia-AiLab's 2.9 bpw pack and
 our previous q28-v2 pack:
@@ -59,17 +84,19 @@ session passed (7 valid tool calls, normal stop).
 The full guide is [ZIG-SERVE](docs/ZIG-SERVE.md). Build the image and the per-rank assets as it describes, then:
 
 ```bash
-git clone --recurse-submodules https://github.com/jayleaton/deepseek-v41-tensorfold-spark.git
+git clone --recurse-submodules https://github.com/0rand/deepseek-v41-tensorfold-spark.git
 cd deepseek-v41-tensorfold-spark
 hf download jayleaton/DeepSeek-V4.1-Flash-1017-EXL3-2.8bpw --local-dir /srv/models/flash17   # both nodes
 cp config/prod-zig-flash17.env.example config/prod-zig.env && $EDITOR config/prod-zig.env    # both nodes
-scripts/run-zig.sh 1 --check-aot && scripts/run-zig.sh 1   # rank 1 node; then the same with 0 on rank 0
+scripts/zig-stack.sh start
+scripts/zig-stack.sh status
+# scripts/zig-stack.sh stop
 ```
 
-- Fill in the node paths and link settings from
-  [`config/prod-zig-flash17.env.example`](config/prod-zig-flash17.env.example) and keep its engine settings. It needs
-  the **2.1M-token pool** (`TF_DSV41_POOL_TOKENS=2100000`). With q28-v2's 3.0M pool this pack goes under the 4 GiB
-  memory floor during 4K prefills ([why](docs/FLASH-1017.md#memory-the-21m-pool)).
+- Replace the documentation IPs, SSH user, node paths and NIC/HCA names in
+  [`config/prod-zig-flash17.env.example`](config/prod-zig-flash17.env.example) with your own values.
+  Configure both ranks before starting. Initial image and AOT preparation are separate from routine starts;
+  do the coverage check in [ZIG-SERVE](docs/ZIG-SERVE.md) when generating assets or changing kernel shapes.
 - Pack the **1017 Engram shards** with `scripts/pack_engram.py` ([INSTALL step 3](docs/INSTALL.md), with
   `deepseek-ai/DeepSeek-V4.1-Flash-1017` as the source); the September shards do not match this pack.
 - We suggest a 2100-2200 MHz GPU clock cap (`nvidia-smi -lgc 300,2100`) to help with temperature control.

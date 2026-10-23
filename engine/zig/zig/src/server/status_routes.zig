@@ -40,6 +40,50 @@ fn queueFields(a: Allocator, o: *json.Object, st: api.Status) Allocator.Error!vo
     try o.put(a, "rounds", .{ .object = x });
 }
 
+fn cacheFields(a: Allocator, o: *json.Object, cache: api.CacheStatus) Allocator.Error!void {
+    try o.put(a, "pool_tokens", try json.intValue(a, cache.pool_tokens));
+    try o.put(a, "pool_free_tokens", try json.intValue(a, cache.pool_free_tokens));
+    try o.put(a, "pool_used_tokens", try json.intValue(a, cache.pool_tokens -| cache.pool_free_tokens));
+    try o.put(a, "pool_kept_tokens", try json.intValue(a, cache.pool_kept_tokens));
+    try o.put(a, "kept_prompts", try json.intValue(a, cache.kept_prompts));
+    try o.put(a, "kept_bytes", try json.intValue(a, cache.kept_bytes));
+    try o.put(a, "kv_cache_payload_bytes", try json.intValue(a, cache.kv_cache_payload_bytes));
+    try o.put(a, "kv_cache_capacity_bytes", try json.intValue(a, cache.kv_cache_capacity_bytes));
+    try o.put(a, "kv_cache_comp_bytes", try json.intValue(a, cache.kv_cache_comp_bytes));
+    try o.put(a, "kv_cache_index_bytes", try json.intValue(a, cache.kv_cache_index_bytes));
+    try o.put(a, "kv_cache_ordinary_bytes", try json.intValue(a, cache.kv_cache_ordinary_bytes));
+    try o.put(a, "kv_cache_display_bytes", try json.intValue(a, cache.kv_cache_display_bytes));
+    try o.put(a, "kv_cache_backing", .{ .string = "cuda" });
+    try o.put(a, "kv_cache_bytes_scope", .{ .string = "compressed_kv_and_indexer_per_rank" });
+    try o.put(a, "stream_kv_usage_ratio", .{ .float = cache.stream_kv_usage_ratio });
+    const streams = try json.newObject(a);
+    try streams.put(a, "decoding", try json.intValue(a, cache.streams.decoding));
+    try streams.put(a, "prefilling", try json.intValue(a, cache.streams.prefilling));
+    try streams.put(a, "filling", try json.intValue(a, cache.streams.filling));
+    try streams.put(a, "paused", try json.intValue(a, cache.streams.paused));
+    try streams.put(a, "max", try json.intValue(a, cache.streams.max));
+    try o.put(a, "streams", .{ .object = streams });
+    if (cache.spill) |spill| {
+        const s = try json.newObject(a);
+        try s.put(a, "gib", .{ .float = spill.gib });
+        try s.put(a, "entries", try json.intValue(a, spill.entries));
+        try s.put(a, "stored_bytes", try json.intValue(a, spill.stored_bytes));
+        try s.put(a, "written", try json.intValue(a, spill.written));
+        try s.put(a, "written_bytes", try json.intValue(a, spill.written_bytes));
+        try s.put(a, "loaded", try json.intValue(a, spill.loaded));
+        try s.put(a, "loaded_bytes", try json.intValue(a, spill.loaded_bytes));
+        try s.put(a, "loaded_tokens", try json.intValue(a, spill.loaded_tokens));
+        try s.put(a, "write_failed", try json.intValue(a, spill.write_failed));
+        try s.put(a, "crc_failed", try json.intValue(a, spill.crc_failed));
+        try s.put(a, "load_failed", try json.intValue(a, spill.load_failed));
+        try s.put(a, "load_unfit", try json.intValue(a, spill.load_unfit));
+        try s.put(a, "disk_free_bytes", try json.intValue(a, spill.disk_free_bytes));
+        try s.put(a, "restore_ms_p50", .{ .float = spill.restore_ms_p50 });
+        try s.put(a, "restore_ms_p95", .{ .float = spill.restore_ms_p95 });
+        try o.put(a, "spill", .{ .object = s });
+    }
+}
+
 /// With keys on, health names nothing about the model.
 pub fn health(srv: *Server, conn: *Conn, a: Allocator) !void {
     // draining: the engine is not asked, it may be stopping
@@ -50,12 +94,20 @@ pub fn health(srv: *Server, conn: *Conn, a: Allocator) !void {
         var st: api.Status = .{};
         if (!drain) {
             srv.engine.status(&st, &.{});
-            const lanes = srv.info.lanes;
-            if (lanes > 1) streams = .{ .decoding = st.running -| st.waiting, .prefilling = st.waiting, .max = lanes };
+            if (st.cache) |cache| {
+                streams = .{
+                    .decoding = cache.streams.decoding,
+                    .prefilling = cache.streams.prefilling,
+                    .filling = cache.streams.filling,
+                    .paused = cache.streams.paused,
+                    .max = cache.streams.max,
+                };
+            } else if (srv.info.lanes > 1) streams = .{ .decoding = st.running -| st.waiting, .prefilling = st.waiting, .max = srv.info.lanes };
         }
         const r = try h.status(a, streams, srv.info.context_window);
         if (!drain) {
             try queueFields(a, r.body.object, st);
+            if (st.cache) |cache| try cacheFields(a, r.body.object, cache);
             const inflight = if (r.body.object.get("inflight")) |v| @as(usize, @intCast(v.int64() orelse 0)) else 0;
             if (try h.stuck(a, st, inflight)) |why| {
                 // the watchdog's restart signal: the engine is stuck, not merely busy
@@ -83,6 +135,7 @@ pub fn health(srv: *Server, conn: *Conn, a: Allocator) !void {
     var status: api.Status = .{};
     srv.engine.status(&status, &.{});
     try o.put(a, "warming", .{ .bool = status.warming });
+    if (status.cache) |cache| try cacheFields(a, o, cache);
     const memory = try json.newObject(a);
     if (srv.engine.memory(std.mem.indexOf(u8, conn.path, "reset_peak=1") != null)) |mem| {
         try memory.put(a, "active", try json.intValue(a, mem.active));
@@ -115,7 +168,10 @@ pub fn models(srv: *Server, conn: *Conn, a: Allocator) !void {
 /// Prometheus text, version 0.0.4.
 pub fn metrics(srv: *Server, conn: *Conn, a: Allocator) void {
     var out: std.Io.Writer.Allocating = .init(a);
-    if (srv.health) |h| h.metrics(&out.writer, srv.config.served_name) catch return else srv.metrics.render(srv.io, &out.writer, srv.engine, srv.info.context_window) catch return;
+    if (srv.health) |h| {
+        srv.metrics.render(srv.io, &out.writer, srv.engine, srv.info.context_window) catch return;
+        h.metrics(&out.writer, srv.config.served_name) catch return;
+    } else srv.metrics.render(srv.io, &out.writer, srv.engine, srv.info.context_window) catch return;
     const body = out.written();
     conn.startResponse(200, null) catch return;
     conn.addHeader("Content-Type", if (srv.health != null) "text/plain; version=0.0.4" else "text/plain; version=0.0.4; charset=utf-8") catch return;

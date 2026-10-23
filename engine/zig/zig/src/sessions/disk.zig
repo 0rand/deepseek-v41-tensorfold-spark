@@ -22,6 +22,24 @@ const pool_mod = @import("pool.zig");
 const Family = pool_mod.Family;
 const Digest = @import("prefix.zig").Digest;
 
+/// Linux `struct statfs`, used only for the tier's mounted-filesystem free-space snapshot.
+const Statfs = extern struct {
+    f_type: c_long,
+    f_bsize: c_long,
+    f_blocks: u64,
+    f_bfree: u64,
+    f_bavail: u64,
+    f_files: u64,
+    f_ffree: u64,
+    f_fsid: [2]i32,
+    f_namelen: c_long,
+    f_frsize: c_long,
+    f_flags: c_long,
+    f_spare: [4]c_long,
+};
+
+extern "c" fn fstatfs(fd: linux.fd_t, buf: *Statfs) c_int;
+
 pub const none = std.math.maxInt(u32);
 
 pub const Options = struct {
@@ -178,6 +196,14 @@ pub const Disk = struct {
 
     pub fn accepts(d: *const Disk, pos: u64) bool {
         return pos >= d.opts.min_tokens;
+    }
+
+    /// Available bytes on the filesystem carrying this rank's tier directory. A failed stat deliberately has no value:
+    /// callers omit the optional spill snapshot rather than report a made-up zero.
+    pub fn freeBytes(d: *const Disk) ?u64 {
+        var fs: Statfs = undefined;
+        if (fstatfs(d.dir.handle, &fs) != 0 or fs.f_bsize <= 0) return null;
+        return fs.f_bavail * @as(u64, @intCast(fs.f_bsize));
     }
 
     pub fn get(d: *Disk, key: Digest) ?*Rec {

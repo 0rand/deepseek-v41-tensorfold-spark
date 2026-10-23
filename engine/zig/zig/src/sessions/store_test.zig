@@ -168,7 +168,7 @@ fn restart(gpa: std.mem.Allocator, root: []const u8, world: u32, rank: u32) !voi
     var r: Rank = undefined;
     try r.init(gpa, root, world, rank, .{ .chats = 1 });
     defer r.deinit();
-    try testing.expectEqual(@as(u32, 4), try r.store.reconcile());
+    try testing.expectEqual(@as(u32, 4), try r.store.reconcile(null));
     const s = try r.pool.newSlot(64 * page);
     const a = try chatIds(gpa, 1, 20 * page);
     defer gpa.free(a);
@@ -197,6 +197,38 @@ test "chats over turns: residency to NVMe, bit-identical resumes, deltas, older 
     defer gpa.free(r1);
     try scenario(gpa, r1, 1, 0, true, &t1);
     try testing.expectEqualSlices(u64, t0.items, t1.items); // the tier thread changes when bytes move, not what is decided
+}
+
+test "retained positions count shared live pages once and preserve partial-page bounds" {
+    const gpa = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmpRoot(gpa, &tmp, "retained");
+    defer gpa.free(root);
+    var r: Rank = undefined;
+    try r.init(gpa, root, 1, 0, .{});
+    defer r.deinit();
+    const slot = try r.pool.newSlot(8 * page);
+    const ids = try chatIds(gpa, 7, 2 * page + 5);
+    defer gpa.free(ids);
+
+    const first = ids[0 .. page + 10];
+    try slot.ensure(first.len);
+    r.write(slot, 7, 0);
+    const first_id = (try r.store.save(slot, try HostBounded.make(gpa, 7, first.len), first, 1, 0)).?;
+    try testing.expectEqual(@as(u64, page + 10), r.store.kept_tokens);
+    _ = try slot.releaseAll();
+
+    _ = try r.store.restoreRam(first_id, slot);
+    try slot.ensure(ids.len);
+    r.write(slot, 7, 0);
+    const second_id = (try r.store.save(slot, try HostBounded.make(gpa, 7, ids.len), ids, 1, 0)).?;
+    _ = second_id;
+    // The first full page is shared; the old and copied partial pages remain distinct physical retained ranges.
+    try testing.expectEqual(@as(u64, page + 10 + page + 5), r.store.kept_tokens);
+    _ = try slot.releaseAll();
+    try r.store.drop(first_id);
+    try testing.expectEqual(@as(u64, 2 * page + 5), r.store.kept_tokens);
 }
 
 test "two split ranks make the same decisions on the same calls and each restores its own rows" {
@@ -283,4 +315,105 @@ test "holds: an entry by its id, position and key" {
     const key = e.key;
     try r.store.drop(id); // out of RAM with no file: out of the index
     try testing.expect(!r.store.index.holds(id, pos, key));
+}
+
+test "write-through persists short states without evicting RAM and reopens for byte-exact reuse" {
+    const gpa = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_]bool{ false, true }) |async_io| {
+        const root = try tmpRoot(gpa, &tmp, if (async_io) "write-through-async" else "write-through-sync");
+        defer gpa.free(root);
+        const ids = try chatIds(gpa, 3, 3 * page + 5);
+        defer gpa.free(ids);
+        {
+            var r: Rank = undefined;
+            try r.init(gpa, root, 1, 0, .{ .write_through = true, .async_io = async_io, .delta = false, .ram_bytes = 1 << 20 });
+            defer r.deinit();
+            const slot = try r.pool.newSlot(8 * page);
+            try testing.expectEqualStrings("fresh", try turn(gpa, &r, slot, 3, ids[0 .. page + 10]));
+            const hit = (try r.store.find(1, ids)).?;
+            try testing.expect(hit.ram);
+            try testing.expect(r.store.entry(hit.id).extra.file);
+            try testing.expect(r.disk.get(r.store.entry(hit.id).key) != null);
+            try testing.expectEqual(@as(u64, 1), r.disk.stats.writes);
+            try testing.expectEqualStrings("ram", try turn(gpa, &r, slot, 3, ids[0 .. 2 * page + 5]));
+            try testing.expectEqual(@as(u64, 2), r.disk.stats.writes);
+        }
+        {
+            var r: Rank = undefined;
+            try r.init(gpa, root, 1, 0, .{ .write_through = true, .delta = false });
+            defer r.deinit();
+            _ = try r.store.reconcile(null);
+            const slot = try r.pool.newSlot(8 * page);
+            const hit = (try r.store.find(1, ids)).?;
+            try testing.expect(!hit.ram);
+            try testing.expectEqual(@as(u64, 2 * page + 5), hit.pos);
+            try testing.expectEqualStrings("disk", try turn(gpa, &r, slot, 3, ids));
+            try testing.expectEqual(@as(u64, hit.pos), r.store.stats.loaded_tokens);
+            const latency = r.store.restoreLatency();
+            try testing.expectEqual(latency.p50_ms, latency.p95_ms);
+            try testing.expectEqual(@as(u64, 0), r.store.stats.restore_failed);
+        }
+    }
+}
+
+test "restart recovery intersects files and assigns stable IDs despite opposite write orders" {
+    const gpa = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmpRoot(gpa, &tmp, "common-recovery");
+    defer gpa.free(root);
+    const Digest = @import("prefix.zig").Digest;
+    var common: [2]Digest = undefined;
+    for (0..2) |rank| {
+        var r: Rank = undefined;
+        try r.init(gpa, root, 2, @intCast(rank), .{ .write_through = true, .delta = false });
+        defer r.deinit();
+        const slot = try r.pool.newSlot(8 * page);
+        const order: [3]u32 = if (rank == 0) .{ 1, 2, 3 } else .{ 2, 1, 4 };
+        for (order) |chat| {
+            const ids = try chatIds(gpa, chat, 2 * page);
+            defer gpa.free(ids);
+            _ = try turn(gpa, &r, slot, chat, ids[0 .. page + 10]);
+            if (rank == 0 and chat <= 2) {
+                const hit = (try r.store.find(1, ids)).?;
+                common[chat - 1] = r.store.entry(hit.id).key;
+            }
+        }
+    }
+    const Filter = struct {
+        fn keep(ctx: *anyopaque, keys: []const Digest, mask: []bool) anyerror!void {
+            const allowed: *const [2]Digest = @ptrCast(@alignCast(ctx));
+            for (keys, mask) |key, *yes| {
+                yes.* = std.mem.eql(u8, &key, &allowed[0]) or std.mem.eql(u8, &key, &allowed[1]);
+            }
+        }
+    };
+    var imported: [2][2]u32 = undefined;
+    for (0..2) |rank| {
+        var r: Rank = undefined;
+        try r.init(gpa, root, 2, @intCast(rank), .{ .write_through = true, .delta = false });
+        defer r.deinit();
+        try testing.expectEqual(@as(u32, 2), try r.store.reconcile(.{ .ctx = &common, .keep = Filter.keep }));
+        const slot = try r.pool.newSlot(8 * page);
+        for ([_]u32{ 1, 2 }) |chat| {
+            const ids = try chatIds(gpa, chat, 2 * page);
+            defer gpa.free(ids);
+            const hit = (try r.store.find(1, ids)).?;
+            imported[rank][chat - 1] = hit.id;
+            const job = try r.store.beginRestore(hit.id, slot);
+            var restored = (try r.store.settle(job)).?;
+            defer restored.deinit(gpa);
+            try r.check(slot, chat, hit.pos);
+            try testing.expectEqual(@as(u8, @truncate(chat *% 17 +% hit.pos)), restored.blobs[0].bytes[0]);
+            _ = try slot.releaseAll();
+        }
+        for ([_]u32{ 3, 4 }) |chat| {
+            const ids = try chatIds(gpa, chat, 2 * page);
+            defer gpa.free(ids);
+            try testing.expect((try r.store.find(1, ids)) == null);
+        }
+    }
+    try testing.expectEqualSlices(u32, &imported[0], &imported[1]);
 }

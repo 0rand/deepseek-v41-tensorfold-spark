@@ -48,6 +48,8 @@ pub const Policy = struct {
     delta: bool = true,
     /// parks and restores on the tier thread (settled by the plan)
     async_io: bool = false,
+    /// Persist each eligible saved entry before `save` returns, without evicting its RAM copy.
+    write_through: bool = false,
 };
 
 pub const Extra = struct {
@@ -76,13 +78,24 @@ pub const Stats = struct {
     dups: u64 = 0,
     hits_ram: u64 = 0,
     hits_disk: u64 = 0,
+    loaded_tokens: u64 = 0,
     parks: u64 = 0,
+    park_failed: u64 = 0,
+    restore_failed: u64 = 0,
+    restore_crc_failed: u64 = 0,
+    restore_unfit: u64 = 0,
     delta_parks: u64 = 0,
     drops: u64 = 0,
     covered_drops: u64 = 0,
     chat_evictions: u64 = 0,
     park_ns: u64 = 0,
     restore_ns: u64 = 0,
+};
+
+/// A family's boot-time agreement on which recovered keys every rank holds.
+pub const RecoveryFilter = struct {
+    ctx: *anyopaque,
+    keep: *const fn (ctx: *anyopaque, keys: []const Digest, mask: []bool) anyerror!void,
 };
 
 pub const Store = struct {
@@ -104,9 +117,20 @@ pub const Store = struct {
     pending: std.ArrayList(*Job) = .empty,
     scratch: std.ArrayList(Digest) = .empty,
     stats: Stats = .{},
+    /// Per physical page, the retained entry's maximum valid rows (0: no RAM entry holds it). This makes
+    /// `kept_tokens` exact for partial pages while pages shared with live slots or other entries count once.
+    kept_ends: []u32 = &.{},
+    kept_tokens: u64 = 0,
+    /// Python's spill tier retains the latest 4,096 completed restore latencies and drops the oldest half thereafter.
+    restore_latency_ns: [4096]u64 = @splat(0),
+    restore_latency_len: u16 = 0,
+    restore_latency: RestoreLatency = .{},
 
     pub fn init(gpa: std.mem.Allocator, io: Io, pool: *Pool, pages: PageStore, d: ?*Disk, policy: Policy) !Store {
         var s: Store = .{ .gpa = gpa, .io = io, .pool = pool, .pages = pages, .index = Index.init(gpa, pool.page), .disk = d, .policy = policy };
+        s.kept_ends = try gpa.alloc(u32, pool.npages);
+        errdefer gpa.free(s.kept_ends);
+        @memset(s.kept_ends, 0);
         if (d) |dd| {
             const r = try gpa.create(jobs.Runner);
             r.* = jobs.Runner.init(gpa, io, dd);
@@ -134,6 +158,7 @@ pub const Store = struct {
         };
         s.index.deinit();
         s.scratch.deinit(s.gpa);
+        s.gpa.free(s.kept_ends);
         s.* = undefined;
     }
 
@@ -146,6 +171,41 @@ pub const Store = struct {
 
     pub fn entry(s: *Store, id: u32) *Index.Entry {
         return s.index.get(id);
+    }
+
+    fn entryPageTokens(s: *const Store, pos: u64, page_index: usize) u32 {
+        const start = @as(u64, @intCast(page_index)) * @as(u64, s.pool.page);
+        return @intCast(@min(@as(u64, s.pool.page), pos - start));
+    }
+
+    fn addKept(s: *Store, pages: []const u32, pos: u64) void {
+        for (pages, 0..) |pg, i| {
+            const rows = s.entryPageTokens(pos, i);
+            if (rows > s.kept_ends[pg]) {
+                s.kept_tokens += @as(u64, rows) - s.kept_ends[pg];
+                s.kept_ends[pg] = rows;
+            }
+        }
+    }
+
+    fn recomputeKeptPage(s: *Store, page: u32, skip: u32) void {
+        var rows: u32 = 0;
+        for (s.index.entries.items, 0..) |e, id| {
+            if (@as(u32, @intCast(id)) == skip or !e.live or !e.ram) continue;
+            for (e.extra.pages, 0..) |pg, i| if (pg == page) {
+                rows = @max(rows, s.entryPageTokens(e.pos, i));
+                break;
+            };
+        }
+        s.kept_tokens -= @as(u64, s.kept_ends[page]) - rows;
+        s.kept_ends[page] = rows;
+    }
+
+    fn removeKept(s: *Store, id: u32) void {
+        const e = s.index.get(id);
+        for (e.extra.pages, 0..) |pg, i| {
+            if (s.kept_ends[pg] == s.entryPageTokens(e.pos, i)) s.recomputeKeptPage(pg, id);
+        }
     }
 
     /// The longest stored entry (RAM or NVMe) whose ids strictly prefix prompt, with the same tag.
@@ -190,6 +250,7 @@ pub const Store = struct {
         errdefer if (ins.new) s.index.remove(ins.id);
         const e = s.index.get(ins.id);
         if (e.ram) {
+            try s.persist(ins.id);
             bounded.vtable.release(bounded.ptr);
             s.touch(ins.id);
             s.stats.dups += 1;
@@ -204,11 +265,13 @@ pub const Store = struct {
         x.bounded = bounded;
         x.kind = kind;
         if (slot.origin) |o| x.origin = .{ .key = o.key, .pages = @min(o.pages, @as(u32, @intCast(ids.len / s.pool.page))) };
+        s.addKept(pages, s.index.get(ins.id).pos);
         s.bounded_total += bounded.vtable.nbytes(bounded.ptr);
         s.ram_count += 1;
         s.link(ins.id);
         s.touch(ins.id);
         s.stats.saves += 1;
+        try s.persist(ins.id);
         try s.trimRam();
         _ = try s.enforce();
         return ins.id;
@@ -306,13 +369,24 @@ pub const Store = struct {
         return out;
     }
 
+    fn persist(s: *Store, id: u32) !void {
+        if (!s.policy.write_through) return;
+        const d = s.disk orelse return;
+        if (!d.accepts(s.index.get(id).pos)) return;
+        if (try s.beginWrite(id, true)) |job| _ = try s.settle(job);
+    }
+
     /// Starts a park of a RAM entry (null: nothing to write, the entry is already settled out of RAM).
     pub fn beginPark(s: *Store, id: u32) !?*Job {
+        return s.beginWrite(id, false);
+    }
+
+    fn beginWrite(s: *Store, id: u32, keep_ram: bool) !?*Job {
         const d = s.disk orelse return error.NoDisk;
         const e = s.index.get(id);
         if (!e.ram or e.extra.job != null) return error.NotParkable;
         if (e.extra.file and d.get(e.key) != null) {
-            try s.leaveRam(id);
+            if (!keep_ram) try s.leaveRam(id);
             return null;
         }
         const page = s.pool.page;
@@ -330,7 +404,7 @@ pub const Store = struct {
             };
         };
         const j = try s.gpa.create(Job);
-        j.* = .{ .kind = .park, .entry = id };
+        j.* = .{ .kind = .park, .entry = id, .keep_ram = keep_ram };
         errdefer j.deinit(s.gpa);
         j.ids = try s.gpa.alloc(i32, e.pos);
         try s.index.idsOf(id, j.ids);
@@ -360,7 +434,10 @@ pub const Store = struct {
                 if (j.src.base) |b| d.get(b).?.refs -= 1;
                 const e = s.index.get(j.entry);
                 e.extra.job = null;
-                if (j.err) |err| return err; // the entry stays in RAM; the .tmp is gone
+                if (j.err) |err| {
+                    s.stats.park_failed += 1;
+                    return err; // the entry stays in RAM; the .tmp is gone
+                }
                 _ = try d.register(&j.src, j.size);
                 e.extra.file = true;
                 s.stats.parks += 1;
@@ -372,7 +449,7 @@ pub const Store = struct {
                     _ = try s.index.members(j.entry, &m, usedOf);
                     for (m.items) |o| s.index.get(o).extra.covered_by = true;
                 }
-                try s.leaveRam(j.entry);
+                if (!j.keep_ram) try s.leaveRam(j.entry);
                 try s.trimDisk();
                 return null;
             },
@@ -380,6 +457,8 @@ pub const Store = struct {
                 if (j.err) |err| {
                     // the slot as before the restore (empty, its reservation kept: prod's `sl.truncate(0)`)
                     _ = try s.pool.slots.items[j.slot].truncate(0);
+                    s.stats.restore_failed += 1;
+                    if (err == error.ChecksumMismatch) s.stats.restore_crc_failed += 1;
                     return err;
                 }
                 const e = s.index.get(j.entry);
@@ -387,12 +466,52 @@ pub const Store = struct {
                 s.touch(j.entry);
                 s.pool.slots.items[j.slot].origin = .{ .key = e.key, .pages = @intCast(e.pos / s.pool.page) };
                 s.stats.hits_disk += 1;
+                s.stats.loaded_tokens += e.pos;
                 s.stats.restore_ns += j.elapsed_ns;
+                s.recordRestoreLatency(j.elapsed_ns);
                 const r = j.restored;
                 j.restored = null;
                 return r;
             },
         }
+    }
+
+    fn recordRestoreLatency(s: *Store, elapsed: u64) void {
+        if (@as(usize, s.restore_latency_len) == s.restore_latency_ns.len) {
+            std.mem.copyForwards(u64, s.restore_latency_ns[0..2048], s.restore_latency_ns[2048..]);
+            s.restore_latency_len = 2048;
+        }
+        const at: usize = s.restore_latency_len;
+        s.restore_latency_ns[at] = elapsed;
+        s.restore_latency_len += 1;
+        s.restore_latency = s.calculateRestoreLatency();
+    }
+
+    /// Records a readable file whose bounded state did not match this engine's session shape.
+    pub fn restoreUnfit(s: *Store) void {
+        s.stats.restore_unfit += 1;
+    }
+
+    pub const RestoreLatency = struct { p50_ms: f64 = 0, p95_ms: f64 = 0 };
+
+    /// The p50/p95 convention matches the Python tier: sorted[int(q * n)], retaining the newest 4,096 restores.
+    pub fn restoreLatency(s: *const Store) RestoreLatency {
+        return s.restore_latency;
+    }
+
+    fn calculateRestoreLatency(s: *const Store) RestoreLatency {
+        const n: usize = s.restore_latency_len;
+        if (n == 0) return .{};
+        var times: [4096]u64 = undefined;
+        @memcpy(times[0..n], s.restore_latency_ns[0..n]);
+        std.mem.sort(u64, times[0..n], {}, std.sort.asc(u64));
+        const at = struct {
+            fn get(xs: []const u64, q: f64) f64 {
+                const i = @min(xs.len - 1, @as(usize, @intFromFloat(q * @as(f64, @floatFromInt(xs.len)))));
+                return @as(f64, @floatFromInt(xs[i])) / 1e6;
+            }
+        }.get;
+        return .{ .p50_ms = at(times[0..n], 0.5), .p95_ms = at(times[0..n], 0.95) };
     }
 
     /// Settles every pending job in submission order (one rank, or the plan's "settle all").
@@ -413,6 +532,7 @@ pub const Store = struct {
     fn leaveRam(s: *Store, id: u32) !void {
         const e = s.index.get(id);
         if (!e.ram) return;
+        s.removeKept(id);
         try s.pool.drop(e.extra.pages);
         s.gpa.free(e.extra.pages);
         e.extra.pages = &.{};
@@ -563,8 +683,8 @@ pub const Store = struct {
     }
 
     /// Rebuilds the NVMe entries after a restart (an empty store): every valid file indexed, deltas on their bases' paths; returns how many.
-    /// Two ranks then intersect what they hold (the engine's plan link) and drop the rest, so a plan never names an entry one rank lacks.
-    pub fn reconcile(s: *Store) !u32 {
+    /// A boot filter drops one-sided files; logical ordering gives every rank the same entry IDs.
+    pub fn reconcile(s: *Store, filter: ?RecoveryFilter) !u32 {
         const d = s.disk orelse return 0;
         var found: std.ArrayList(Disk.Found) = .empty;
         defer {
@@ -572,6 +692,34 @@ pub const Store = struct {
             found.deinit(s.gpa);
         }
         try d.scan(&found);
+        if (filter) |f| {
+            const keys = try s.gpa.alloc(Digest, found.items.len);
+            defer s.gpa.free(keys);
+            const keep = try s.gpa.alloc(bool, found.items.len);
+            defer s.gpa.free(keep);
+            for (found.items, keys) |entry_, *key| key.* = entry_.head.key;
+            @memset(keep, true);
+            try f.keep(f.ctx, keys, keep);
+            var i = found.items.len;
+            while (i > 0) {
+                i -= 1;
+                if (!keep[i]) try d.remove(found.items[i].head.key);
+            }
+            var n: usize = 0;
+            for (found.items, keep) |entry_, yes| {
+                if (yes) {
+                    found.items[n] = entry_;
+                    n += 1;
+                } else s.gpa.free(entry_.ids);
+            }
+            found.items.len = n;
+        }
+        std.mem.sort(Disk.Found, found.items, {}, struct {
+            fn less(_: void, a: Disk.Found, b: Disk.Found) bool {
+                return a.head.pos < b.head.pos or
+                    (a.head.pos == b.head.pos and std.mem.order(u8, &a.head.key, &b.head.key) == .lt);
+            }
+        }.less);
         for (found.items) |f| {
             var anchor: u32 = none;
             if (f.head.hasBase()) {

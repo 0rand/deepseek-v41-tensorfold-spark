@@ -1,14 +1,29 @@
 #!/usr/bin/env bash
-# Run one local rank. Invoke separately on each node with the same serving env.
+# Run one local rank. Default mode is foreground/ephemeral; --detach creates the managed, restartable rank.
+#
+# usage: run-zig.sh 0|1 [--dry-run|--check-aot|--detach]
+#
+# --detach is intentionally local-only: scripts/zig-stack.sh orders the two ranks and performs a draining stop.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
-rank=${1:?usage: run-zig.sh 0|1 [--dry-run|--check-aot]}
+rank=${1:?usage: run-zig.sh 0|1 [--dry-run|--check-aot|--detach]}
+mode=${2:-}
+[[ $# -le 2 ]] || { echo 'usage: run-zig.sh 0|1 [--dry-run|--check-aot|--detach]' >&2; exit 2; }
+case "$mode" in ''|--dry-run|--check-aot|--detach) ;; *) echo "unknown mode: $mode" >&2; exit 2 ;; esac
 [[ "$rank" == 0 || "$rank" == 1 ]] || { echo 'rank must be 0 or 1' >&2; exit 2; }
 config=${CONFIG:-config/prod-zig.env}
 [[ -f "$config" ]] || { echo "missing $config; copy config/prod-zig.env.example first" >&2; exit 2; }
 set -a
 source "$config"
 set +a
+MODEL_NAME=${MODEL_NAME:-deepseek-v41-flash}
+[[ -n "$MODEL_NAME" ]] || { echo "set MODEL_NAME in $config" >&2; exit 2; }
+drain_s=${TF_DSV41_DRAIN_S:-20}
+[[ "$drain_s" =~ ^[0-9]+$ ]] || { echo "TF_DSV41_DRAIN_S must be an integer" >&2; exit 2; }
+min_stop_timeout=$(( drain_s + 60 ))
+stop_timeout=${ZIG_STOP_TIMEOUT:-$min_stop_timeout}
+[[ "$stop_timeout" =~ ^[0-9]+$ && "$stop_timeout" -ge "$min_stop_timeout" ]] || {
+    echo "ZIG_STOP_TIMEOUT must be an integer of at least $min_stop_timeout (TF_DSV41_DRAIN_S + 60)" >&2; exit 2; }
 for key in IMAGE TF_TP_MASTER NCCL_SOCKET_IFNAME NCCL_IB_HCA MODEL_DIR ENGRAM_DIR ASSETS_DIR PREPARED_DIR STATE_DIR CACHE_DIR; do
     [[ -n "${!key:-}" && "${!key}" != *'<'* ]] || { echo "set $key in $config" >&2; exit 2; }
 done
@@ -19,7 +34,7 @@ while IFS='=' read -r key value; do
 done < <(env)
 # --check-aot: every Triton variant this env launches, checked against this rank's aot/ (host only, no GPU work).
 # Run it before the first start and after any serving-setting change; it needs the fill's sigs.json in ASSETS_DIR.
-if [[ "${2:-}" == --check-aot ]]; then
+if [[ "$mode" == --check-aot ]]; then
     [[ -f "$ASSETS_DIR/sigs.json" && -f "$ASSETS_DIR/aot/aot.json" ]] || {
         echo "--check-aot needs $ASSETS_DIR/sigs.json (triton_fill.py sigs) and $ASSETS_DIR/aot/aot.json" >&2; exit 2; }
     mkdir -p "$STATE_DIR"
@@ -30,11 +45,16 @@ if [[ "${2:-}" == --check-aot ]]; then
         exit 1; }
     exit
 fi
-args=(docker run --rm --init --name "tensorfold-zig-r$rank" --gpus all --ipc=host --network host
+args=(docker run --init --name "tensorfold-zig-r$rank" --gpus all --ipc=host --network host
       --device /dev/infiniband --ulimit memlock=-1 --cap-add IPC_LOCK
       -v "$MODEL_DIR:/model:ro" -v "$ENGRAM_DIR:/engram:ro" -v "$ASSETS_DIR:/assets:ro"
       -v "$PREPARED_DIR:/prepared" -v "$STATE_DIR:/state" -v "$STATE_DIR/sessions:/sessions"
       -v "$CACHE_DIR:/cache" "${envs[@]}")
+if [[ "$mode" == --detach ]]; then
+    args+=(-d --restart unless-stopped --stop-timeout "$stop_timeout")
+else
+    args+=(--rm)
+fi
 args+=(-e TF_TP_WORLD=2 -e "TF_TP_RANK=$rank" -e TF_TP_DEVICE=0
        -e "TF_TP_MASTER=$TF_TP_MASTER" -e "TF_TP_PORT=${TF_TP_PORT:-29571}"
        -e "TF_COMM_BACKEND=${TF_COMM_BACKEND:-roce}"
@@ -42,12 +62,13 @@ args+=(-e TF_TP_WORLD=2 -e "TF_TP_RANK=$rank" -e TF_TP_DEVICE=0
 if [[ "$rank" == 0 ]]; then
     args+=(tensorfold-dsv41 serve /model --host "${HOST:-localhost}" --port "${PORT:-8000}"
            --parallel "$TF_DSV41_SLOTS" --context "$TF_DSV41_CONTEXT"
-           --name DeepSeek-V4.1-Flash-TF --max-tokens 32768)
+           --name "$MODEL_NAME" --max-tokens 32768)
     if [[ "${TF_DSV41_THINKING:-1}" == 0 ]]; then args+=(--no-thinking); fi  # the default; requests still override
+    if [[ "${TF_DSV41_DRAFTS:-0}" == 0 ]]; then args+=(--no-drafts); fi
 else
     args+=(tf-dsv41-m1 follow /model /assets)
 fi
-if [[ "${2:-}" == --dry-run ]]; then printf '%q ' "${args[@]}"; printf '\n'; exit; fi
+if [[ "$mode" == --dry-run ]]; then printf '%q ' "${args[@]}"; printf '\n'; exit; fi
 for dir in "$MODEL_DIR" "$ENGRAM_DIR" "$ASSETS_DIR" "$CACHE_DIR"; do
     [[ -d "$dir" ]] || { echo "missing directory $dir" >&2; exit 2; }
 done
@@ -79,4 +100,11 @@ if [[ "$table" == /cache/* && ! -e "$CACHE_DIR/${table#/cache/}" ]]; then
     echo "copied config/pfdense-table.json to $CACHE_DIR/${table#/cache/} (TF_DSV41_PF_DENSE_TABLE=$table)" >&2
 fi
 mkdir -p "$PREPARED_DIR" "$STATE_DIR/sessions"
+if [[ "$mode" == --detach ]] && docker inspect "tensorfold-zig-r$rank" >/dev/null 2>&1; then
+    if [[ "$(docker inspect -f '{{.State.Running}}' "tensorfold-zig-r$rank")" == true ]]; then
+        echo "tensorfold-zig-r$rank is already running; use scripts/zig-stack.sh restart to replace the pair" >&2
+        exit 1
+    fi
+    docker rm "tensorfold-zig-r$rank" >/dev/null
+fi
 exec "${args[@]}"

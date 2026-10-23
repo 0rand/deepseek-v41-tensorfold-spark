@@ -54,3 +54,28 @@ reply budget looping inside `reasoning_content` and return an empty `content` wi
 shared server, prefer a non-greedy default and let clients that want greedy ask for it.
 
 Images: see [Images](IMAGES.md).
+
+## Health and metrics
+
+The Spark serving mode exposes both the existing `tensorfold_*` health counters and native
+`tensorfold:*` Prometheus counters, histograms and live gauges on `/metrics`. EngineMetrics uses the latter
+alongside `/health` JSON for throughput, TTFT, latency, drafting, pool occupancy and SSD-session statistics.
+
+DeepSeek's `/health` includes `pool_tokens`, `pool_free_tokens`, `pool_used_tokens`, `pool_kept_tokens`,
+`kept_prompts`, `kept_bytes`, `streams`, `context_length` and optional `spill` data. Paged-pool occupancy counts
+allocated page positions; retained valid positions are deduplicated across entries sharing pages. The live
+`tensorfold:kv_cache_usage_ratio{pool="0"}` is one maximum completed-position/context ratio, not a pool ratio.
+It is zero when idle even if retained pages still occupy the pool.
+
+KV byte counters cover this rank's compressed KV and indexer buffers only, not weights, SWA rings, RoPE or
+workspaces. `kept_bytes` counts RAM snapshot buffers outside that pool. Spill bytes are local file sizes;
+the configured disk budget uses the tier's accounting charge. Unsupported cache/tier fields are omitted.
+Snapshots are published at engine-thread boundaries; HTTP scrapes do not run CUDA operations.
+
+EngineMetrics' TensorFold adapter must retain the live-KV and running/waiting gauges it displays. From its checkout:
+
+```bash
+python3 engine_metrics.py --host 127.0.0.1 --port 8100 --engine tensorfold
+```
+
+Use the port configured for the serving deployment. Authentication and loopback binding are unchanged.

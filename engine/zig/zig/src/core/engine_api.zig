@@ -193,6 +193,63 @@ pub const GraphsSource = struct {
     read: *const fn (ctx: ?*anyopaque, out: []GraphStatus) usize,
 };
 
+/// The active stream counts in a paged KV cache snapshot.
+pub const CacheStreams = struct {
+    decoding: u32 = 0,
+    prefilling: u32 = 0,
+    filling: u32 = 0,
+    paused: u32 = 0,
+    max: u32 = 0,
+};
+
+/// The local rank's streamed NVMe session-tier counters.
+pub const SpillStatus = struct {
+    /// The configured disk-tier budget, in GiB.
+    gib: f64 = 0,
+    entries: u64 = 0,
+    stored_bytes: u64 = 0,
+    written: u64 = 0,
+    written_bytes: u64 = 0,
+    loaded: u64 = 0,
+    loaded_bytes: u64 = 0,
+    loaded_tokens: u64 = 0,
+    restore_ms_p50: f64 = 0,
+    restore_ms_p95: f64 = 0,
+    write_failed: u64 = 0,
+    crc_failed: u64 = 0,
+    load_failed: u64 = 0,
+    load_unfit: u64 = 0,
+    disk_free_bytes: u64 = 0,
+};
+
+/// A local-rank paged-KV and retained-session snapshot. Its bytes are physical CUDA allocations on this rank, with no
+/// tensor reads or CUDA synchronization. Retained pages shared by a live slot are counted once.
+pub const CacheStatus = struct {
+    pool_tokens: u64 = 0,
+    pool_free_tokens: u64 = 0,
+    pool_kept_tokens: u64 = 0,
+    kept_prompts: u64 = 0,
+    /// RAM session snapshots outside the paged KV pool.
+    kept_bytes: u64 = 0,
+    kv_cache_payload_bytes: u64 = 0,
+    kv_cache_capacity_bytes: u64 = 0,
+    kv_cache_comp_bytes: u64 = 0,
+    kv_cache_index_bytes: u64 = 0,
+    kv_cache_ordinary_bytes: u64 = 0,
+    kv_cache_display_bytes: u64 = 0,
+    /// Maximum completed context position among live streams divided by the context window (idle: 0).
+    stream_kv_usage_ratio: f64 = 0,
+    streams: CacheStreams = .{},
+    spill: ?SpillStatus = null,
+};
+
+/// A family's CPU-only paged-cache snapshot, called only from LaneHost's engine thread. LaneHost publishes its copy
+/// under its scheduler lock, so HTTP status calls never inspect the family's mutable cache or session store.
+pub const CacheSource = struct {
+    ctx: ?*anyopaque = null,
+    read: *const fn (ctx: ?*anyopaque) ?CacheStatus,
+};
+
 pub const Status = struct {
     /// Requests in prefill or decode, and those waiting for a lane.
     running: u32 = 0,
@@ -210,6 +267,8 @@ pub const Status = struct {
     oldest_queued_s: f64 = 0,
     /// The round pace against its own baseline (core/pace.zig); null: the engine keeps none.
     pace: ?PaceStatus = null,
+    /// The latest CPU-only paged-cache snapshot; null when the engine has no supported paged cache.
+    cache: ?CacheStatus = null,
     /// The backend's graph caches, the first `graph_caches` of them (0: it keeps none).
     graphs: [4]GraphStatus = @splat(.{}),
     graph_caches: u8 = 0,

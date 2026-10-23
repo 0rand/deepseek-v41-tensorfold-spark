@@ -121,7 +121,10 @@ pub const Metrics = struct {
         try gauge(w, "generation_tokens_total", "counter", "Generated tokens of finished requests.", snap.generation);
         const live = streams[0..@min(status.streams, streams.len)];
         try family(w, "kv_cache_usage_ratio", "gauge", "Tokens in a stream cache divided by that stream's context window.");
-        try pools(w, "kv_cache_usage_ratio", "pool", live, window);
+        if (status.cache) |cache| {
+            try labeledFloatGauge(w, "kv_cache_usage_ratio", "pool", "0", cache.stream_kv_usage_ratio);
+            try cacheMetrics(w, cache);
+        } else try pools(w, "kv_cache_usage_ratio", "pool", live, window);
         try gauge(w, "mtp_drafted_total", "counter", "Draft tokens verified on finished requests.", snap.drafted);
         try gauge(w, "mtp_accepted_total", "counter", "Draft tokens kept on finished requests.", snap.accepted);
         try histogram(w, "request_latency_seconds", "Seconds from arrival to the reply leaving.", snap.latency);
@@ -164,6 +167,54 @@ fn pools(w: *std.Io.Writer, name: []const u8, label: []const u8, lengths: []cons
         const ratio: f64 = if (window == 0) 0 else @min(1.0, @as(f64, @floatFromInt(n)) / @as(f64, @floatFromInt(window)));
         var buf: [40]u8 = undefined;
         try w.print("{s}{s}{{{s}=\"{d}\"}} {s}\n", .{ prefix, name, label, i, num(&buf, ratio) });
+    }
+}
+
+fn floatGauge(w: *std.Io.Writer, name: []const u8, kind: []const u8, help: []const u8, value: f64) !void {
+    try family(w, name, kind, help);
+    var buf: [40]u8 = undefined;
+    try w.print("{s}{s} {s}\n", .{ prefix, name, num(&buf, value) });
+}
+
+fn labeledFloatGauge(w: *std.Io.Writer, name: []const u8, label: []const u8, value_label: []const u8, value: f64) !void {
+    var buf: [40]u8 = undefined;
+    try w.print("{s}{s}{{{s}=\"{s}\"}} {s}\n", .{ prefix, name, label, value_label, num(&buf, value) });
+}
+
+fn cacheMetrics(w: *std.Io.Writer, cache: api.CacheStatus) !void {
+    try gauge(w, "pool_tokens", "gauge", "Positions in the shared KV pool on this rank.", cache.pool_tokens);
+    try gauge(w, "pool_free_tokens", "gauge", "Unallocated positions in the paged KV pool.", cache.pool_free_tokens);
+    try gauge(w, "pool_kept_tokens", "gauge", "Pool positions reserved for retained prompts.", cache.pool_kept_tokens);
+    try gauge(w, "kept_prompts", "gauge", "Retained prompts in memory.", cache.kept_prompts);
+    try gauge(w, "kept_bytes", "gauge", "Unique retained snapshot tensor bytes outside the shared pool.", cache.kept_bytes);
+    try gauge(w, "kv_cache_payload_bytes", "gauge", "Compressed KV and indexer tensor bytes on this rank.", cache.kv_cache_payload_bytes);
+    try gauge(w, "kv_cache_capacity_bytes", "gauge", "Backing capacity for compressed KV and indexer tensors on this rank.", cache.kv_cache_capacity_bytes);
+    try gauge(w, "kv_cache_comp_bytes", "gauge", "Compressed KV tensor bytes on this rank.", cache.kv_cache_comp_bytes);
+    try gauge(w, "kv_cache_index_bytes", "gauge", "KV indexer tensor bytes on this rank.", cache.kv_cache_index_bytes);
+    try gauge(w, "kv_cache_ordinary_bytes", "gauge", "Ordinary CUDA backing for compressed KV and indexer tensors on this rank.", cache.kv_cache_ordinary_bytes);
+    try gauge(w, "kv_cache_display_bytes", "gauge", "Display reservation mapped for KV on this rank.", cache.kv_cache_display_bytes);
+    const used = cache.pool_tokens -| cache.pool_free_tokens;
+    try gauge(w, "pool_used_tokens", "gauge", "Allocated paged KV positions held by streams and retained prompts.", used);
+    const ratio: f64 = if (cache.pool_tokens == 0) 0 else @as(f64, @floatFromInt(used)) / @as(f64, @floatFromInt(cache.pool_tokens));
+    try floatGauge(w, "kv_pool_usage_ratio", "gauge", "Allocated paged KV positions divided by total positions.", ratio);
+    try family(w, "kv_cache_backing_info", "gauge", "Backing for this rank's compressed KV and indexer tensors.");
+    try w.print("{s}kv_cache_backing_info{{backing=\"cuda\"}} 1\n", .{prefix});
+    if (cache.spill) |spill| {
+        try floatGauge(w, "spill_gib", "gauge", "Spill tier capacity in GiB.", spill.gib);
+        try gauge(w, "spill_entries", "gauge", "Spill tier entries.", spill.entries);
+        try gauge(w, "spill_stored_bytes", "gauge", "Spill tier bytes stored.", spill.stored_bytes);
+        try gauge(w, "spill_disk_free_bytes", "gauge", "Free bytes on the spill filesystem.", spill.disk_free_bytes);
+        try gauge(w, "spill_written_total", "counter", "Spill writes.", spill.written);
+        try gauge(w, "spill_written_bytes_total", "counter", "Bytes written to spill.", spill.written_bytes);
+        try gauge(w, "spill_loaded_total", "counter", "Spill loads.", spill.loaded);
+        try gauge(w, "spill_loaded_bytes_total", "counter", "Bytes loaded from spill.", spill.loaded_bytes);
+        try gauge(w, "spill_loaded_tokens_total", "counter", "Tokens restored from spill.", spill.loaded_tokens);
+        try gauge(w, "spill_write_failed_total", "counter", "Failed spill writes.", spill.write_failed);
+        try gauge(w, "spill_crc_failed_total", "counter", "Spill checksum failures.", spill.crc_failed);
+        try gauge(w, "spill_load_failed_total", "counter", "Failed spill loads.", spill.load_failed);
+        try gauge(w, "spill_load_unfit_total", "counter", "Spill loads that no longer fit.", spill.load_unfit);
+        try floatGauge(w, "spill_restore_seconds_p50", "gauge", "Spill restore p50 seconds.", spill.restore_ms_p50 / 1000);
+        try floatGauge(w, "spill_restore_seconds_p95", "gauge", "Spill restore p95 seconds.", spill.restore_ms_p95 / 1000);
     }
 }
 
@@ -234,9 +285,11 @@ const RenderStub = struct {
         unreachable;
     }
     pub fn cancel(_: *anyopaque, _: api.Id) void {}
-    pub fn status(ctx: *anyopaque, out: *api.Status, _: []u32) void {
+    pub fn status(ctx: *anyopaque, out: *api.Status, stream_tokens: []u32) void {
         const s: *@This() = @ptrCast(@alignCast(ctx));
         out.* = s.status_value;
+        const n = @min(stream_tokens.len, s.tokens.len);
+        @memcpy(stream_tokens[0..n], s.tokens[0..n]);
     }
     pub fn memory(ctx: *anyopaque, _: bool) ?api.Memory {
         const s: *@This() = @ptrCast(@alignCast(ctx));
@@ -244,6 +297,7 @@ const RenderStub = struct {
     }
     status_value: api.Status = .{ .running = 1, .waiting = 2, .generation_tokens = 3 },
     memory_value: ?api.Memory = null,
+    tokens: []const u32 = &.{},
 
     pub fn engine(s: *@This()) api.Engine {
         return .{ .ctx = s, .vtable = &.{ .info = info, .submit = submit, .cancel = cancel, .status = status, .memory = memory } };
@@ -271,6 +325,38 @@ test "render exposes live counters, rounds, prefill and TPOT without cache famil
     try m.render(std.testing.io, &known.writer, stub.engine(), 4096);
     try std.testing.expect(std.mem.indexOf(u8, known.written(), "tensorfold:device_memory_bytes 7516192768\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, known.written(), "tensorfold:device_memory_peak_bytes 8589934592\n") != null);
+}
+
+test "stream cache occupancy remains distinct from shared-pool reservations" {
+    const gpa = std.testing.allocator;
+    var m: Metrics = .{ .gpa = gpa };
+    var stub: RenderStub = .{ .status_value = .{
+        .streams = 2,
+        .cache = .{
+            .pool_tokens = 100,
+            .pool_free_tokens = 25,
+            .pool_kept_tokens = 20,
+            .stream_kv_usage_ratio = 0.5,
+            .streams = .{ .decoding = 2, .max = 4 },
+            .spill = .{ .restore_ms_p95 = 9 },
+        },
+    }, .tokens = &.{ 2048, 1024 } };
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try m.render(std.testing.io, &out.writer, stub.engine(), 4096);
+    const body = out.written();
+    try std.testing.expect(std.mem.indexOf(u8, body, "tensorfold:kv_cache_usage_ratio{pool=\"0\"} 0.5\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "kv_cache_usage_ratio{pool=\"1\"}") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "tensorfold:kv_pool_usage_ratio 0.75\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "tensorfold:spill_restore_seconds_p95 0.009\n") != null);
+    stub.status_value.cache.?.stream_kv_usage_ratio = 0;
+    stub.status_value.cache.?.streams.decoding = 0;
+    stub.status_value.streams = 0;
+    var idle: std.Io.Writer.Allocating = .init(gpa);
+    defer idle.deinit();
+    try m.render(std.testing.io, &idle.writer, stub.engine(), 4096);
+    try std.testing.expect(std.mem.indexOf(u8, idle.written(), "tensorfold:kv_cache_usage_ratio{pool=\"0\"} 0\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, idle.written(), "tensorfold:kv_pool_usage_ratio 0.75\n") != null);
 }
 
 test "metrics snapshot allocation failure releases the mutex" {

@@ -9,8 +9,8 @@
 //!   the context limit in OpenAI's and vLLM's words, which clients parse to compact.
 //! - **/health** (``Health``): ok / fatal / stalled / inflight and upstream's live totals (``drafted_total``,
 //!   ``accepted_total``, ...); strict mode answers 503 after a fatal engine error and refuses new completions.
-//! - **/metrics**: the ``tensorfold_*`` rows. **/v1/models**: ``max_model_len`` / ``context_length``, aliases.
-//! - **Request log** (``RequestLog``): one JSON line a request, token counts, timings and hashes only.
+//! - **/metrics**: Spark's ``tensorfold_*`` health rows plus native ``tensorfold:*`` serving metrics.
+//!   **/v1/models**: ``max_model_len`` / ``context_length``, aliases.
 //!
 //! Knobs are the Python names: ``GLM53_TF_X`` wins, else ``TF_DSV41_X`` (``app.alias_knobs``): REQUEST_LOG (with
 //! GLM53_TF_REQUEST_LOG_MB / _KEEP / _PROMPTS / _SALT), DISCONNECT (1), HEALTH (basic | strict), STALL_S (0), and
@@ -23,7 +23,13 @@ const Allocator = std.mem.Allocator;
 
 pub const Wire = enum { tensorfold, spark };
 /// /health's ``streams``: a batch engine's slots decoding, prefilling, and in all.
-pub const Streams = struct { decoding: u32, prefilling: u32, max: u32 };
+pub const Streams = struct {
+    decoding: u32,
+    prefilling: u32,
+    filling: ?u32 = null,
+    paused: ?u32 = null,
+    max: u32,
+};
 pub const Mode = enum { basic, strict };
 
 /// The reply id's random hex digits (``uuid4().hex[:24]``).
@@ -336,6 +342,8 @@ pub const Health = struct {
             const x = try json.newObject(a);
             try x.put(a, "decoding", try json.intValue(a, s.decoding));
             try x.put(a, "prefilling", try json.intValue(a, s.prefilling));
+            if (s.filling) |n| try x.put(a, "filling", try json.intValue(a, n));
+            if (s.paused) |n| try x.put(a, "paused", try json.intValue(a, n));
             try x.put(a, "max", try json.intValue(a, s.max));
             try o.put(a, "streams", .{ .object = x });
         }

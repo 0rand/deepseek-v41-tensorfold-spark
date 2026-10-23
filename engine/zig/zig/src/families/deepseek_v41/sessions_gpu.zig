@@ -32,6 +32,7 @@
 //! has neither. TF_DSV41_SESSION_SLOTS=1 opens the store with several live slots (default off: model.zig says so at
 //! boot and serves without sessions, as before).
 
+const api = @import("engine_api");
 const std = @import("std");
 const cuda = @import("cuda");
 const kv = @import("kv");
@@ -58,6 +59,8 @@ pub const Options = struct {
     disk: ?[]const u8 = null,
     disk_budget: u64 = 64 << 30,
     disk_min_tokens: u64 = 1024,
+    /// TF_DSV41_SESSION_DISK_WRITE_THROUGH=1: each eligible save is durable before returning.
+    write_through: bool = false,
     resident: u32 = 0,
     resident_bytes: u64 = 0,
     /// TF_DSV41_SESSION_RAM_MIB (stack.py's default 256)
@@ -87,6 +90,7 @@ pub fn optionsFromEnv() !Options {
     if (std.c.getenv("TF_DSV41_SESSION_DISK_MIN")) |v| if (std.mem.span(v).len > 0) {
         o.disk_min_tokens = try std.fmt.parseInt(u64, std.mem.span(v), 10);
     };
+    o.write_through = flag("TF_DSV41_SESSION_DISK_WRITE_THROUGH");
     if (std.c.getenv("TF_DSV41_SESSION_RESIDENT")) |v| o.resident = try std.fmt.parseInt(u32, std.mem.span(v), 10);
     if (std.c.getenv("TF_DSV41_SESSION_RESIDENT_GIB")) |v| o.resident_bytes = @intFromFloat(try std.fmt.parseFloat(f64, std.mem.span(v)) * (1 << 30));
     if (std.c.getenv("TF_DSV41_SESSION_RAM_MIB")) |v| if (std.mem.span(v).len > 0) {
@@ -217,7 +221,15 @@ pub const Sessions = struct {
             s.disk = try sessions.Disk.open(gpa, io, .{ .root = root, .compat = full[0..16].*, .rank = kx.rank, .world = kx.world, .budget = o.disk_budget, .min_tokens = o.disk_min_tokens, .staging = @max(2, o.staging_mib / 8), .chunk = 8 << 20 });
         }
         errdefer if (s.disk) |dd| dd.close();
-        s.store = try Store.init(gpa, io, &kx.pool, kx.dev.store(), s.disk, .{ .ram_bytes = o.ram_bytes, .chats = o.resident, .resident_bytes = o.resident_bytes, .skip_covered = o.skip_covered, .delta = o.delta });
+        s.store = try Store.init(gpa, io, &kx.pool, kx.dev.store(), s.disk, .{ .ram_bytes = o.ram_bytes, .chats = o.resident, .resident_bytes = o.resident_bytes, .skip_covered = o.skip_covered, .delta = o.delta, .write_through = o.write_through });
+        errdefer s.store.deinit();
+        if (s.disk != null) {
+            const recovered = try s.store.reconcile(if (f.comm.world() > 1)
+                .{ .ctx = f, .keep = @import("session_recovery.zig").keepCommon }
+            else
+                null);
+            std.log.scoped(.dsv41).info("sessions: recovered {d} common NVMe entries; write-through {s}, disk budget {d} GiB, minimum {d} tokens", .{ recovered, if (o.write_through) "on" else "off", o.disk_budget >> 30, o.disk_min_tokens });
+        }
         if (f.comm.world() > 1) s.agreement = try graphs.Agreement.init(f.runner.d, f.comm, f.runner.stream);
         f.sess = .{ .ptr = s, .commit = commitFn, .save = saveFn, .restore = restoreFn, .reset = resetFn, .prompt = promptFn, .admit = admitFn };
         return s;
@@ -615,9 +627,20 @@ pub const Sessions = struct {
 
     fn restoreDisk(s: *Sessions, id: u32) !void {
         const j = try s.store.beginRestore(id, s.kx.slot);
-        var restored = (try s.store.settle(j)) orelse return error.BadBlob;
+        const result = try s.store.settle(j);
+        var restored = result orelse {
+            s.store.restoreUnfit();
+            return error.BadBlob;
+        };
         defer restored.deinit(s.gpa);
-        try s.uploadBlobs(restored.blobs);
+        s.uploadBlobs(restored.blobs) catch |e| {
+            s.store.restoreUnfit();
+            return e;
+        };
+        if (s.f.slot.pos != s.store.entry(id).pos) {
+            s.store.restoreUnfit();
+            return error.RestoredPosition;
+        }
     }
 
     /// Every RAM entry parked to the NVMe tier now (the gate's interruption; a server parks through the budget).
@@ -634,3 +657,60 @@ pub const Sessions = struct {
         return n;
     }
 };
+
+/// CPU-only cache telemetry for the paged DeepSeek pool on this rank. The caller runs it on LaneHost's engine thread;
+/// it inspects pool/session bookkeeping and allocation metadata only, never CUDA state or tensor contents.
+pub fn cacheStatus(kx: *const kvs.Kv, ss: ?*const Sessions) api.CacheStatus {
+    var comp_bytes: u64 = 0;
+    var index_bytes: u64 = 0;
+    for (kx.pool.layout.families, kx.dev.tensors) |family, tensor| {
+        if (std.mem.startsWith(u8, family.name, "comp.")) {
+            comp_bytes += @as(u64, @intCast(tensor.len));
+        } else if (std.mem.startsWith(u8, family.name, "index_k.")) {
+            index_bytes += @as(u64, @intCast(tensor.len));
+        }
+    }
+    const payload = comp_bytes + index_bytes;
+    var out: api.CacheStatus = .{
+        .pool_tokens = @as(u64, kx.pool.npages) * @as(u64, kx.pool.page),
+        .pool_free_tokens = @as(u64, kx.pool.freePages()) * @as(u64, kx.pool.page),
+        .kv_cache_payload_bytes = payload,
+        .kv_cache_capacity_bytes = payload,
+        .kv_cache_comp_bytes = comp_bytes,
+        .kv_cache_index_bytes = index_bytes,
+        .kv_cache_ordinary_bytes = payload,
+    };
+    const s = ss orelse return out;
+    out.pool_kept_tokens = s.store.kept_tokens;
+    out.kept_prompts = s.store.ram_count;
+    out.kept_bytes = @as(u64, s.store.ram_count) * s.bounded_bytes;
+    const d = s.disk orelse return out;
+    const free = d.freeBytes() orelse return out;
+    var entries: u64 = 0;
+    var stored_bytes: u64 = 0;
+    for (d.recs.items) |entry| {
+        if (entry.live) {
+            entries += 1;
+            stored_bytes += entry.size;
+        }
+    }
+    const latency = s.store.restoreLatency();
+    out.spill = .{
+        .gib = @as(f64, @floatFromInt(d.opts.budget)) / @as(f64, 1 << 30),
+        .entries = entries,
+        .stored_bytes = stored_bytes,
+        .written = d.stats.writes,
+        .written_bytes = d.stats.bytes_written,
+        .loaded = s.store.stats.hits_disk,
+        .loaded_bytes = d.stats.bytes_read,
+        .loaded_tokens = s.store.stats.loaded_tokens,
+        .restore_ms_p50 = latency.p50_ms,
+        .restore_ms_p95 = latency.p95_ms,
+        .write_failed = s.store.stats.park_failed,
+        .crc_failed = s.store.stats.restore_crc_failed,
+        .load_failed = s.store.stats.restore_failed,
+        .load_unfit = s.store.stats.restore_unfit,
+        .disk_free_bytes = free,
+    };
+    return out;
+}

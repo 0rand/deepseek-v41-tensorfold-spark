@@ -3,8 +3,16 @@
 The production engine went `767ad9f` (G13) -> `356a188` (G14) -> `7954c1d` (G15a) -> `da5ae43` (G16) -> `cd4245a`
 (G18) -> **`7bd2d67`** (G19). Each window's write-up is in [`docs/campaign/`](campaign/README.md).
 
+## Fork deployment additions
+
+- **Two-rank native lifecycle.** `scripts/zig-stack.sh` starts, stops, recreates, inspects and reads logs for both ranks over BatchMode SSH. Running managed containers use Docker `unless-stopped`; an intentional stop disables restart on both ranks until the next start. The launcher defaults to model alias `deepseek-v41-flash`; the generic flash17 example uses port 8100, 4K prefill and a 32 GiB immediate SSD tier.
+- **Portable EngineMetrics consumer fix.** `tools/enginemetrics-gauges.patch` preserves KV usage and running/waiting gauges in the separate EngineMetrics adapter. The patch was applied to a pristine checkout and sampled against the real native endpoint.
+
 ## Bugs fixed
 
+- **EngineMetrics on native Spark serving** (local PR65 rig, 2026-10-23). `/metrics` now includes the already-recorded native colon-prefixed counters and histograms alongside Spark health signals. `/health` and `/metrics` expose CPU-published paged KV, retained snapshots, actual stream progress and NVMe session statistics without CUDA work on scrape.
+- **Immediate, restart-safe SSD sessions** (local PR65 rig, 2026-10-23). `TF_DSV41_SESSION_DISK_WRITE_THROUGH=1` commits eligible saved states without discarding their RAM copies. Startup recovers common files across ranks with deterministic entry IDs. Real TP=2 validation restored 7,360 cached tokens after restart; focused host tests cover byte-exact reopen and asymmetric recovery.
+- **Zig plain decoding** (local PR65 rig, 2026-10-23). `scripts/run-zig.sh` now passes `--no-drafts` when `TF_DSV41_DRAFTS` is off, matching the family setting. Before this change a real TP=2 canary returned HTTP 500 `NoDrafter`; the same request returned `391` after the change and restart.
 - **A duplicate image in one request killed both ranks** (G16). The vision row store counted a reference per
   occurrence of an image, so an agent history that resends the same screenshot released it early; the next request
   with that image raised `KeyError` inside rank 0's prefill forward, rank 1 waited in the exchange, and both ranks

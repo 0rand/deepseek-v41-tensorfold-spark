@@ -26,6 +26,7 @@ const grammar_gpu = @import("grammar_gpu.zig");
 const Allocator = std.mem.Allocator;
 const vision_rows = @import("vision_rows.zig");
 const sched_host = @import("sched_host.zig");
+const sessions_gpu = @import("sessions_gpu.zig");
 
 pub const backends: []const []const u8 = &.{"cuda"};
 pub const families: []const api.Family = &.{.{ .model_type = "deepseek_v41", .formats = &.{"exl3"} }};
@@ -153,6 +154,8 @@ pub const Served = struct {
         s.host.memory = .{ .read = readMemory };
         // /health's "graphs": each graph cache's held graphs, captures, replays, eager steps and floor state
         s.host.graphs = .{ .read = readGraphs };
+        // /health's paged-KV/session snapshot: copied on the engine thread, then served by LaneHost without touching CUDA.
+        s.host.cache_source = .{ .ctx = m, .read = readCache };
         // TF_DSV41_PREFILL_PIECES=1: prod's batcher plans the rounds (queued admissions, prompts in pieces between
         // decode rounds); the served shape only (own prefill, the verify tail), every rank with the same setting
         s.sched = null;
@@ -194,6 +197,13 @@ pub const Served = struct {
     fn readMemory(_: ?*anyopaque, reset_peak: bool) ?api.Memory {
         const u = @import("cuda").usage(reset_peak);
         return .{ .active = u.device, .cache = 0, .peak = u.peak };
+    }
+
+    fn readCache(ctx: ?*anyopaque) ?api.CacheStatus {
+        const raw = ctx orelse return null;
+        const m: *model.Model = @ptrCast(@alignCast(raw));
+        const kx = m.f.kv orelse return null;
+        return sessions_gpu.cacheStatus(kx, m.sessions);
     }
 
     fn readGraphs(_: ?*anyopaque, out: []api.GraphStatus) usize {
