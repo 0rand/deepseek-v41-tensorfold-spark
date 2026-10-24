@@ -25,8 +25,8 @@ here are functional checks unless a table says otherwise.
 | Profile | flash17 example with four slots, 1M context, 4K prefill and a 32 GiB SSD tier | `config/prod-zig-flash17.env.example` |
 | Documentation | Lifecycle, health/metrics semantics and the generic example | `docs/ZIG-SERVE.md`, `docs/API.md`, `docs/CHANGELOG.md` |
 
-The engine source is still the PR65 tree. The changes are serving, telemetry, session persistence and
-launcher work; there is no arithmetic, quantization or kernel rewrite in this fork.
+The engine starts from the PR65 tree. Local changes cover serving, telemetry, session persistence and
+restart-safe NVMe budget accounting; there is no arithmetic, quantization or kernel rewrite in this fork.
 
 ### What PR65 fixes
 
@@ -37,11 +37,10 @@ fail or restore mismatched histories and wedge the pair.
 
 PR65 uses a rank-independent logical charge for live session-file registration and eviction, sends
 the leader's expected entry position and key with a restore, and turns a mismatched restore into a
-coordinated cache miss instead of accepting another entry. It is a session correctness and liveness
-fix, not a speed patch. It does not fix the separate mid-prefill `PoolExhausted` trigger (issue #55)
-and does not add a universal timeout for independent CUDA/transport deadlocks. Restart persistence is
-not established by PR65 alone; the write-through and startup recovery work described below is
-separate.
+coordinated cache miss instead of accepting another entry. This fork also reconstructs that same
+logical charge at restart instead of using each rank's physical file size. These are session correctness
+and liveness fixes, not speed patches. They do not fix the separate mid-prefill `PoolExhausted` trigger
+(issue #55) or add a universal timeout for independent CUDA/transport deadlocks.
 
 ## Deployment profile
 
@@ -54,14 +53,26 @@ The example profile matches the serving settings exercised on the reference pair
 | Context / slots | 1,048,576 tokens / four slots |
 | Shared KV pool | 2,100,000 configured positions (2,100,224 rounded) |
 | Prefill | 4,096-row pieces, 4K workspace, 2K fallback |
-| Memory floors | 1 GiB target / 1 GiB hard, measured boot rejection off |
+| Memory floors | 1 GiB target / 1 GiB hard admission and 1 GiB 4K-workspace reserve; measured boot rejection off |
 | Sessions | 256 MiB RAM tier, 32 GiB logical SSD tier per node, write-through |
 | Transport | TP=2 over RoCE on the CX7 link |
 
-The 1 GiB floors are deliberately less conservative than the upstream 5/4 GiB defaults. They are an
-operator choice for this pair, not a universal safety guarantee. Live admission, graph and workspace
-checks remain enabled. The pool is shared: four slots do not promise four simultaneous 1M-token
-requests.
+After the 2026-10-24 prefill crash investigation, the local (ignored) `config/prod-zig.env`
+uses `TF_DSV41_PF_4K=0` and 2,048 for both `TF_DSV41_PREFILL_CHUNK` and
+`TF_DSV41_PREFILL_ROWS`; its admission target/hard floors are 0.5/0.25 GiB. The published
+example above retains the previously exercised 4K profile. Synchronize the config and recreate
+both ranks before expecting a local setting change to take effect.
+
+The example's 1 GiB floors are deliberately less conservative than the upstream 5/4 GiB defaults;
+the local 0.5/0.25 GiB pair is less conservative still. Neither is a universal safety guarantee.
+A held 4K workspace previously bypassed the later memory checks; the guard now rechecks between
+prompt pieces and falls back to 2K on a measured dip.
+The pool is shared: four slots do not promise four simultaneous 1M-token requests.
+
+On the reference hosts, `earlyoom` previously sent SIGTERM below 1 GiB available even with nearly all swap
+free (`-s 100,100`); it killed the head while a long prefill was progressing. The host daemons now use
+256 MiB SIGTERM / 128 MiB SIGKILL thresholds. These are host settings, not limits in this profile:
+the kernel or GPU allocator can still fail before the daemon intervenes.
 
 The generic example uses documentation addresses (`192.0.2.11` / `192.0.2.12`), SSH user `operator`
 and `/srv/tensorfold` paths. Replace every one of those with your own values on both nodes. The
@@ -73,18 +84,22 @@ Run these from the head checkout. The trusted local config supplies `WORKER_SSH`
 `WORKER_CONFIG`; the stack script never guesses a remote path.
 
 ```bash
-scripts/zig-stack.sh start      # worker first, then head; detached
-scripts/zig-stack.sh status     # container state, restart policy, /v1/models
-scripts/zig-stack.sh logs       # both ranks; logs 0 or logs 1 for one
-scripts/zig-stack.sh restart    # coordinated stop, then recreate both
-scripts/zig-stack.sh stop       # intentional stop; stays stopped
+scripts/zig-stack.sh sync-config  # copy head config to worker atomically; does not restart containers
+scripts/zig-stack.sh start        # worker first, then head; detached
+scripts/zig-stack.sh status       # container state, restart policy, /v1/models
+scripts/zig-stack.sh logs         # both ranks; logs 0 or logs 1 for one
+scripts/zig-stack.sh restart      # sync config, coordinated stop, then recreate both
+scripts/zig-stack.sh stop         # intentional stop; stays stopped
 ```
 
-`start` is idempotent when both containers are already running. Otherwise it creates rank 1 over
-BatchMode SSH first and rank 0 locally, using `docker run --restart unless-stopped` without `--rm`.
-A successful `start` means both containers were created, **not** that the model is usable. Model
-loading and first preparation continue in the background; wait for `status` to return a successful
-`/v1/models` response before sending traffic.
+`start` is idempotent when both containers are already running. Before a new launch, the manager copies the
+head's config atomically to `WORKER_REPO/WORKER_CONFIG` on the worker; `restart` checks that copy succeeds before
+stopping either rank. `sync-config` does the same copy without restarting. An already-running container keeps its
+original environment, so use a coordinated `restart` after checking AOT on both nodes to apply edited settings.
+The manager does not copy images, code, models, or AOT assets. A new start creates rank 1 over BatchMode SSH
+first and rank 0 locally, using `docker run --restart unless-stopped` without `--rm`. A successful `start` means
+both containers were created, **not** that the model is usable. Model loading and first preparation continue in
+the background; wait for `status` to return a successful `/v1/models` response before sending traffic.
 
 `stop` disables both restart policies, sends SIGTERM to rank 0 and lets it drain for
 `TF_DSV41_DRAIN_S` (default 20 seconds), then stops any remaining follower. It deliberately leaves
@@ -349,9 +364,10 @@ Treat the functional checks above as evidence that the paths work, not as a prod
 2. Pack the 1017 Engram shards with `scripts/pack_engram.py`; the September shards do not match this
    pack.
 3. Generate `rope.bin`, `engram-host.bin` and the complete Triton AOT set for the serving settings.
-4. Copy `config/prod-zig-flash17.env.example` to `config/prod-zig.env` on both nodes and replace the
-   documentation addresses, SSH user, paths and NIC/HCA names.
-5. Run `--check-aot` on both ranks, then `scripts/zig-stack.sh start`.
+4. Copy `config/prod-zig-flash17.env.example` to `config/prod-zig.env` on the head and create the
+   worker's `WORKER_CONFIG` file at the same relative path. Configure the head's documentation addresses,
+   SSH user, paths and NIC/HCA names; the worker file must be writable. Both nodes' assets remain distinct.
+5. Run `scripts/zig-stack.sh sync-config`, then `--check-aot` on both ranks and `scripts/zig-stack.sh start`.
 6. Wait for `scripts/zig-stack.sh status` to return `/v1/models`, then check that `17 * 23` returns
    `391` before sending traffic.
 7. Use `scripts/zig-stack.sh restart` for configuration or image changes; never restart one rank

@@ -6,12 +6,37 @@ The production engine went `767ad9f` (G13) -> `356a188` (G14) -> `7954c1d` (G15a
 ## Fork deployment additions
 
 - **Two-rank native lifecycle.** `scripts/zig-stack.sh` starts, stops, recreates, inspects and reads logs for both ranks over BatchMode SSH. Running managed containers use Docker `unless-stopped`; an intentional stop disables restart on both ranks until the next start. The launcher defaults to model alias `deepseek-v41-flash`; the generic flash17 example uses port 8100, 4K prefill and a 32 GiB immediate SSD tier.
+- **Head-to-worker config synchronization** (local flash17 rig, 2026-10-24). `zig-stack.sh` previously launched
+  rank 1 using its own, unsynchronized `WORKER_CONFIG`; live ranks differed in default effort and memory floors.
+  `sync-config` now atomically copies the head config to that file without restarting, and start/restart sync it
+  before launching the worker (restart preflights the copy before draining). Staged files matched byte-for-byte;
+  running containers retain their original environment until a coordinated recreate.
+- **Local 2K prefill rollout** (local flash17 rig, 2026-10-24). Both ranks now use
+  `TF_DSV41_PF_4K=0`, `TF_DSV41_PREFILL_CHUNK=2048`, `TF_DSV41_PREFILL_ROWS=2048` and the
+  head's existing 0.5/0.25 GiB admission floors, without raising a guard. The rebuilt ARM64 image
+  has the same image ID on both nodes; `--check-aot` found all 138 required variants on each.
+  A 5,609-token uncached chat and a 510,009-token request (5,600 cached prefix tokens,
+  504,409 newly processed) both returned HTTP 200; neither rank restarted and `earlyoom`
+  logged no action during the long request. A fresh run does not establish soak stability.
 - **Portable EngineMetrics consumer fix.** `tools/enginemetrics-gauges.patch` preserves KV usage and running/waiting gauges in the separate EngineMetrics adapter. The patch was applied to a pristine checkout and sampled against the real native endpoint.
+- **Host earlyoom near-zero backstop** (local flash17 rig, 2026-10-24). Both nodes' `earlyoom` services now run
+  `-M 262144,131072` (256 MiB SIGTERM / 128 MiB SIGKILL) instead of 1 GiB / 512 MiB. Their `-s 100,100` swap
+  gate was satisfied even with about 99.75% free swap, so the former head threshold ended a long prefill.
+  This is host configuration, not an engine limit: kernel OOM or GPU allocation failure can precede the lower trigger.
 
 ## Bugs fixed
 
+- **Held 4K workspace bypassed its memory guard** (local flash17 rig, 2026-10-24). The guard checked both ranks
+  before allocating but returned true without checking MemAvailable for every subsequent prompt piece while the
+  workspace was held. It now checks on every piece and, if either rank falls below the configured floor, releases
+  the workspace and switches both to the existing 2K path. A focused host regression covers the held-workspace dip.
+
 - **EngineMetrics on native Spark serving** (local PR65 rig, 2026-10-23). `/metrics` now includes the already-recorded native colon-prefixed counters and histograms alongside Spark health signals. `/health` and `/metrics` expose CPU-published paged KV, retained snapshots, actual stream progress and NVMe session statistics without CUDA work on scrape.
 - **Immediate, restart-safe SSD sessions** (local PR65 rig, 2026-10-23). `TF_DSV41_SESSION_DISK_WRITE_THROUGH=1` commits eligible saved states without discarding their RAM copies. Startup recovers common files across ranks with deterministic entry IDs. Real TP=2 validation restored 7,360 cached tokens after restart; focused host tests cover byte-exact reopen and asymmetric recovery.
+- **Consistent NVMe budget after restart** (local PR65 rig, 2026-10-24). PR65 charged newly written files equally
+  across split ranks, but recovered files were charged by their different physical sizes. Recovery now reconstructs
+  the same charge from each file's token and blob lengths and the average split-page bytes. Live writes use that
+  same calculation. A split-rank reopen-and-trim regression checks equal charges and identical evictions.
 - **Zig plain decoding** (local PR65 rig, 2026-10-23). `scripts/run-zig.sh` now passes `--no-drafts` when `TF_DSV41_DRAFTS` is off, matching the family setting. Before this change a real TP=2 canary returned HTTP 500 `NoDrafter`; the same request returned `391` after the change and restart.
 - **A duplicate image in one request killed both ranks** (G16). The vision row store counted a reference per
   occurrence of an image, so an agent history that resends the same screenshot released it early; the next request

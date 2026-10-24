@@ -86,8 +86,6 @@ pub const WriteSrc = struct {
     /// per family: family-tensor pages of this rank's logical pages [first_page, npages), in logical order
     pages: []const []const u32,
     blobs: []const Blob = &.{},
-    /// the entry's bounded state as the store measures it (Bounded `nbytes`): alike on every rank, unlike blob bytes
-    measure: u64 = 0,
 };
 
 /// One file of a restore: read logical pages [lo, hi) of it into the slot.
@@ -132,7 +130,7 @@ pub const Rec = struct {
     first_page: u32,
     npages: u32,
     size: u64,
-    /// what the file counts against the budget, alike on every rank (`register`; a file `scan` finds counts its size)
+    /// rank-independent logical bytes, reconstructed from the file's segments at boot
     charge: u64,
     /// files stacked on this one
     refs: u32 = 0,
@@ -427,11 +425,19 @@ pub const Disk = struct {
         }
     }
 
+    /// Logical file bytes: split pages at each rank's average, tokens, and bounded blobs. A compatible build
+    /// produces the same blob lengths on both ranks; unlike Bounded.nbytes, their actual lengths survive a restart.
+    fn chargeOf(page: u32, first_page: u32, npages: u32, ids_bytes: u64, blob_bytes: u64, families: []const Family, world: u32) u64 {
+        var charge = ids_bytes + blob_bytes;
+        for (families) |f| charge += @as(u64, npages - first_page) * f.pageBytes(page) / (if (f.split and world > 1) world else 1);
+        return charge;
+    }
+
     /// Records a written file in the index (round thread, at the plan's point); its base gains a dependent.
     pub fn register(d: *Disk, src: *const WriteSrc, size: u64) !u32 {
-        // pages at a rank's average (a split family's at 1 / W), ids and the entry's measure: alike on every rank
-        var charge: u64 = @as(u64, src.ids.len) * 4 + src.measure;
-        for (src.families) |f| charge += @as(u64, src.npages - src.first_page) * f.pageBytes(src.page) / (if (f.split and d.opts.world > 1) d.opts.world else 1);
+        var blobs: u64 = 0;
+        for (src.blobs) |b| blobs += b.bytes.len;
+        const charge = chargeOf(src.page, src.first_page, src.npages, src.ids.len * 4, blobs, src.families, d.opts.world);
         const id = try d.add(src.key, src.base, src.tag, src.kind, src.pos, src.first_page, src.npages, size, charge);
         d.stats.writes += 1;
         d.stats.bytes_written += size;
@@ -461,6 +467,7 @@ pub const Disk = struct {
     pub const Found = struct {
         head: Head,
         size: u64,
+        charge: u64,
         mtime: i64,
         ids: []i32,
 
@@ -471,7 +478,7 @@ pub const Disk = struct {
 
     /// Indexes the directory on restart: .tmp files and unreadable, foreign or truncated files are deleted, every valid file's
     /// ids are checked chunk by chunk; registered oldest first with bases before their deltas (a delta whose base is gone is deleted).
-    pub fn scan(d: *Disk, out: *std.ArrayList(Found)) !void {
+    pub fn scan(d: *Disk, out: *std.ArrayList(Found), families: []const Family) !void {
         var it = d.dir.iterate();
         var nb: [48]u8 = undefined;
         while (try it.next(d.io)) |ent| {
@@ -484,7 +491,7 @@ pub const Disk = struct {
                 continue;
             }
             if (!std.mem.endsWith(u8, name, ".tfs")) continue;
-            const f = d.found(name) catch {
+            const f = d.found(name, families) catch {
                 d.stats.bad += 1;
                 _ = linux.unlinkat(d.dir.handle, name, 0);
                 continue;
@@ -504,12 +511,12 @@ pub const Disk = struct {
                 _ = out.orderedRemove(i);
                 continue;
             }
-            _ = try d.add(f.head.key, base, f.head.tag, f.head.kind, f.head.pos, f.head.first_page, f.head.npages, f.size, f.size);
+            _ = try d.add(f.head.key, base, f.head.tag, f.head.kind, f.head.pos, f.head.first_page, f.head.npages, f.size, f.charge);
             i += 1;
         }
     }
 
-    fn found(d: *Disk, name: [:0]const u8) !Found {
+    fn found(d: *Disk, name: [:0]const u8, families: []const Family) !Found {
         const f = try d.openFile(name, false);
         defer _ = linux.close(f.fd);
         var lay = try d.readHead(f.fd);
@@ -522,6 +529,12 @@ pub const Disk = struct {
         if (linux.errno(linux.statx(f.fd, "", linux.AT.EMPTY_PATH, .{ .SIZE = true, .MTIME = true }, &st)) != .SUCCESS or st.size < h.total) return error.Truncated;
         const seg = lay.find(.ids, "ids") orelse return error.BadHeader;
         if (seg.nbytes % 4 != 0 or seg.nbytes / 4 != h.pos - @as(u64, h.first_page) * h.page) return error.BadHeader;
+        if (h.npages < h.first_page) return error.BadHeader;
+        var blobs: u64 = 0;
+        for (lay.segs) |s| if (s.kind == .blob) {
+            blobs += s.nbytes;
+        };
+        const charge = chargeOf(h.page, h.first_page, h.npages, seg.nbytes, blobs, families, d.opts.world);
         const ids = try d.gpa.alloc(i32, seg.nbytes / 4);
         errdefer d.gpa.free(ids);
         const sb = try d.staging.get();
@@ -535,7 +548,7 @@ pub const Disk = struct {
             if (!std.mem.eql(u8, &dg, &lay.digests[seg.first_digest + ci])) return error.ChecksumMismatch;
             @memcpy(std.mem.sliceAsBytes(ids)[@as(usize, ci) * seg.chunk ..][0..c.data], buf[0..c.data]);
         }
-        return .{ .head = h, .size = st.size, .mtime = st.mtime.sec * std.time.ns_per_s + st.mtime.nsec, .ids = ids };
+        return .{ .head = h, .size = st.size, .charge = charge, .mtime = st.mtime.sec * std.time.ns_per_s + st.mtime.nsec, .ids = ids };
     }
 
     fn link(d: *Disk, id: u32) void {

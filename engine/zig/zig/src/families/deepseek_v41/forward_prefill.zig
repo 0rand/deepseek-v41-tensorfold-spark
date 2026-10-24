@@ -65,9 +65,9 @@ pub const State = struct {
     /// options, buffer plan and arena stay the 2,048-row ones, so decode windows and the drafter are untouched
     k4: bool = false,
     k4ws: K4 = .{},
-    /// the current prompt call may use the workspace (4K segments, TBO pairs): every rank's MemAvailable leaves the
-    /// workspace above the hard floor (wsAgreed, one collective a call); false: this call runs 2,048-row segments, the
-    /// same bits (segmentation-invariant), never a failure. True until a call decides (the planner reads it at boot)
+    /// the current prompt piece may use the workspace (4K segments, TBO pairs): every rank's MemAvailable clears
+    /// the floor after a new allocation or with an already-held workspace (wsAgreed, one collective per piece).
+    /// False: release a held workspace and use 2,048-row segments, with the same bits (segmentation-invariant).
     ws_ok: bool = true,
     ws_fallbacks: u64 = 0,
     agreement: ?graphs.Agreement = null,
@@ -334,26 +334,32 @@ pub fn segmentRows(f: *const Forward) usize {
     return if (st.k4 and st.ws_ok) K4.rows else @intCast(f.opts.prefill_rows);
 }
 
-/// Whether this prompt call may use the workspace, on every rank alike: held already (a later piece of the prompt),
-/// or every rank's MemAvailable less the workspace clears the hard floor (one all-gathered flag, graphs.Agreement).
-/// No: the call runs 2,048-row segments (4K and 2K give the same bits), logged; nothing fails.
+/// Whether this prompt piece may use the workspace on every rank alike. Check available memory minus its cost
+/// before the first allocation, and actual available memory while it is held. If either rank falls below the
+/// floor during a long prefill, release the held workspace at this piece boundary and switch both ranks to 2K.
 fn wsAgreed(f: *Forward) !bool {
     const st = &f.prefill_state;
     const ws = &st.k4ws;
-    if (ws.buf != null) return true;
     const pl = ws.plan orelse return false;
     const bytes = planBytes(&pl);
     const hard = wsFloorGiB();
     const avail = graphs.memAvailableGiB();
-    const left = if (avail) |v| v - @as(f64, @floatFromInt(bytes)) / (1 << 30) else hard;
+    const held = ws.buf != null;
+    const left = workspaceRemaining(avail, bytes, hard, held);
     if (st.agreement == null) st.agreement = try graphs.Agreement.init(f.runner.d, f.comm, f.runner.stream);
     const ok = try st.agreement.?.agree().all(st.agreement.?.agree().ctx, left >= hard);
     if (!ok) {
+        if (held) try k4Release(f);
         st.ws_fallbacks += 1;
-        if (st.ws_fallbacks <= 4 or st.ws_fallbacks % 64 == 0)
+        if (held or st.ws_fallbacks <= 4 or st.ws_fallbacks % 64 == 0)
             log.warn("prefill workspace: {d} MiB does not fit on every rank (rank {d}: {d:.2} GiB MemAvailable leaves {d:.2}, floor {d:.1} GiB, TF_DSV41_PF_WS_FLOOR_GIB): this prompt piece runs 2,048-row segments (fallback {d})", .{ bytes >> 20, f.comm.rank(), avail orelse -1, left, hard, st.ws_fallbacks });
     }
     return ok;
+}
+
+fn workspaceRemaining(avail: ?f64, bytes: u64, floor: f64, held: bool) f64 {
+    const free = avail orelse return floor;
+    return if (held) free else free - @as(f64, @floatFromInt(bytes)) / (1 << 30);
 }
 
 /// The options a 4,096-row segment emits with: the forward's at 4,096 rows with x3gm one block a segment.
@@ -402,7 +408,7 @@ fn k4Acquire(f: *Forward) !void {
     if (ws.buf != null) return;
     const pl = ws.plan orelse return error.Unbound;
     const total = planBytes(&pl);
-    // the room was agreed first (wsAgreed): every rank fits the workspace above the hard floor
+    // the room was agreed first (wsAgreed): every rank fits the workspace above the configured floor
     const t0 = nowMs();
     const b = cuda.DeviceBuffer.alloc(f.runner.d, @max(total, 256)) catch |e| {
         log.err("prefill workspace: allocating {d} MiB failed ({t})", .{ total >> 20, e });
@@ -491,7 +497,7 @@ pub fn prompt(f: *Forward, ids_in: []const u32) !void {
     const ids = st.ids.items;
     st.taps_rows = 0;
     try ready(f);
-    // TF_DSV41_PF_4K / _PF_TBO: the workspace for this call, decided on every rank alike (else 2,048-row segments)
+    // TF_DSV41_PF_4K / _PF_TBO: check the workspace on both ranks each piece (else 2,048-row segments).
     st.ws_ok = true;
     if (st.k4 or (st.mode == .replay and f.opts.pf_tbo)) st.ws_ok = try wsAgreed(f);
     const seg: usize = segmentRows(f);
@@ -1205,4 +1211,13 @@ fn glueOne(ctx: *anyopaque, r: *run.Runner, c: *const calls.Call) anyerror!void 
         return k.castBf16(try r.tensorAddr(routed), try r.tensorAddr(x[1].arg.t), numel(routed));
     }
     return Forward.glueFn(ctx, r, c);
+}
+
+test "a held prefill workspace rechecks available memory between prompt pieces" {
+    const bytes: u64 = 2268 << 20;
+    const floor = 1.0;
+    try std.testing.expect(workspaceRemaining(3.4, bytes, floor, false) >= floor);
+    try std.testing.expect(workspaceRemaining(1.0, bytes, floor, true) >= floor);
+    try std.testing.expect(workspaceRemaining(0.99, bytes, floor, true) < floor);
+    try std.testing.expect(workspaceRemaining(3.0, bytes, floor, false) < floor);
 }

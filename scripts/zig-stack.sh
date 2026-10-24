@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Manage the two detached Zig ranks from the head node.
 #
-# usage: zig-stack.sh start|stop|restart|status|logs [0|1|both]
+# usage: zig-stack.sh start|stop|restart|sync-config|status|logs [0|1|both]
 #
 # The trusted, local CONFIG file supplies WORKER_SSH, WORKER_REPO, and
-# WORKER_CONFIG. It is sourced here and by each local-rank launcher.
+# WORKER_CONFIG. Before launching either rank, its contents replace the worker config atomically.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
@@ -35,6 +35,22 @@ remote() {
     local arg command=""
     for arg in "$@"; do command+="$(shell_quote "$arg") "; done
     ssh -o BatchMode=yes -o ConnectTimeout=10 "$WORKER_SSH" "$command"
+}
+
+sync_worker_config() {
+    remote bash -c '
+        set -euo pipefail
+        cd -- "$1"
+        dest=$2
+        [[ -f "$dest" ]] || { echo "missing worker config: $dest" >&2; exit 2; }
+        tmp=$(mktemp "${dest}.sync.XXXXXX")
+        cleanup() { rm -f -- "$tmp"; }
+        trap cleanup EXIT
+        cat > "$tmp"
+        chmod --reference="$dest" "$tmp"
+        mv -- "$tmp" "$dest"
+        trap - EXIT
+    ' bash "$WORKER_REPO" "$WORKER_CONFIG" < "$CONFIG"
 }
 
 head_state() {
@@ -78,6 +94,7 @@ start_pair() {
         echo "ranks are inconsistent (head=$r0 worker=$r1); use scripts/zig-stack.sh restart" >&2
         return 1
     fi
+    sync_worker_config
     worker_launch
     if ! head_launch; then
         log 'rank 0 did not launch; rank 1 was started and remains inspectable with logs'
@@ -119,7 +136,8 @@ logs() {
 case "${1:-}" in
     start) start_pair ;;
     stop) stop_pair; log 'both ranks are stopped with restart disabled until the next start' ;;
-    restart) stop_pair; start_pair ;;
+    restart) sync_worker_config; stop_pair; start_pair ;;
+    sync-config) sync_worker_config; log 'worker config synced; running containers keep their existing environment' ;;
     status) status ;;
     logs) logs "${2:-both}" ;;
     *) sed -n '2,6p' "$0" >&2; exit 2 ;;

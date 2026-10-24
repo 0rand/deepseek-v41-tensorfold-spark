@@ -63,11 +63,11 @@ performance tables are not new benchmark results for this fork.
    ```
 
    The generic flash17 template uses `/srv/tensorfold`, head link address `192.0.2.11`, worker link address
-   `192.0.2.12`, and SSH user `operator`; replace these with the deployment's values. Configure the same serving
-   settings on both nodes, with each node's local model, rank-specific Engram/assets, prepared, state and cache data.
-   On the head, `WORKER_SSH`, `WORKER_REPO`, and `WORKER_CONFIG` must name the worker's reachable SSH target, matching
-   checkout, and its config file. That local trusted config is the only place `scripts/zig-stack.sh` gets remote
-   location data. Copy the worker's config to precisely `WORKER_CONFIG` before using the stack script.
+   `192.0.2.12`, and SSH user `operator`; replace these with the deployment's values. Use the same config paths
+   and serving settings on both nodes; each node keeps its own rank-specific model, Engram/assets, prepared,
+   state and cache contents. On the head, `WORKER_SSH`, `WORKER_REPO`, and `WORKER_CONFIG` name the reachable worker
+   and its existing writable config file. `zig-stack.sh sync-config` atomically replaces that worker file with the
+   head config; `start` and `restart` do the same before launching. Images, code, and assets are not synchronized.
 
    Copy the dense-prefill tuning table into each node's `CACHE_DIR` (`cp config/pfdense-table.json "$CACHE_DIR/"`;
    the launcher does it when missing). `config/prod-zig.env` is ignored by git. The template is the recommended
@@ -101,25 +101,32 @@ performance tables are not new benchmark results for this fork.
    with them (build args `CUDA_DEVEL` / `CUDA_RUNTIME`). Use `ZIG_URL` for the exact Zig compiler tarball if the
    default download URL is unavailable. The first start builds prepared files; do not reuse Python's cache.
 
-3. Check the commands and AOT set on their respective nodes, then manage both ranks from the head:
+3. Synchronize the config, check the commands and AOT set on their respective nodes, then manage both ranks from
+   the head:
 
    ```bash
+   # run on the head first; running containers are not restarted
+   scripts/zig-stack.sh sync-config
+   scripts/run-zig.sh 0 --dry-run
+   scripts/run-zig.sh 0 --check-aot
+
    # run on the worker
    CONFIG=/srv/tensorfold/deepseek-v41-tensorfold-spark/config/prod-zig.env scripts/run-zig.sh 1 --dry-run
    CONFIG=/srv/tensorfold/deepseek-v41-tensorfold-spark/config/prod-zig.env scripts/run-zig.sh 1 --check-aot
 
    # run on the head
-   scripts/run-zig.sh 0 --dry-run
-   scripts/run-zig.sh 0 --check-aot
    scripts/zig-stack.sh start
    scripts/zig-stack.sh status
    ```
 
-   `zig-stack.sh start` is idempotent when both containers are already running. Otherwise it creates rank 1 over
-   BatchMode SSH first and rank 0 locally, using `docker run --restart unless-stopped` without `--rm`; Docker starts
-   these containers after a daemon/host reboot unless they were manually stopped. A successful `start` only means both
-   containers were created, **not** that the model is usable: model loading and the first preparation continue in the
-   background. Wait for `zig-stack.sh status` to return a successful `/v1/models` response before sending traffic;
+   `zig-stack.sh start` is idempotent when both containers are already running. Before creating a new pair it
+   copies the head config to the worker's `WORKER_CONFIG` atomically; `restart` checks the copy before draining.
+   `sync-config` copies without restarting, and neither command changes a running container's environment.
+   Otherwise `start` creates rank 1 over BatchMode SSH first and rank 0 locally, using
+   `docker run --restart unless-stopped` without `--rm`; Docker starts these containers after a daemon/host reboot
+   unless they were manually stopped. A successful `start` only means both containers were created, **not** that
+   the model is usable: model loading and the first preparation continue in the background. Wait for
+   `zig-stack.sh status` to return a successful `/v1/models` response before sending traffic;
    it reports an unavailable endpoint separately from container state.
 
    `run-zig.sh` still defaults to the original foreground `--rm` mode for direct debugging; use
@@ -281,7 +288,7 @@ upstream TensorFold settings.
 | `TF_DSV41_LOOKUP_PLAN` | 0 | `1` | Cost-priced copy-draft lookup planning |
 | `TF_DSV41_PF_4K` | 0 | `1` | 4096-row prefill workspace; may fall back to 2K |
 | `TF_DSV41_PF_4K_MEMORY_OK` | unset | `1` | Required acknowledgment for 4K memory cost |
-| `TF_DSV41_PF_WS_FLOOR_GIB` | FLOOR_HARD_GIB (4) | `3.5` | Memory remaining after workspace allocation on every rank |
+| `TF_DSV41_PF_WS_FLOOR_GIB` | FLOOR_HARD_GIB (4) | `1.0` | Memory remaining after workspace allocation on every rank |
 | `TF_DSV41_PIECE_RUNS` | 0 | `1` | Combine several slots' prompt pieces in one run; needs PREFILL_PIECES and replay |
 | `TF_DSV41_REPLAY_RUNS` | 0 | `1` | Several slots' CED decoder replays in one run |
 | `TF_DSV41_JOIN_DRAFTS` | 0 | `1` | Prompts finishing in one round draft their first tokens in one pass |
@@ -356,22 +363,30 @@ template explicitly uses `127.0.0.1:8100`. `MODEL_NAME` controls the served mode
 
 The profile sets **all** of `TF_DSV41_PF_4K=1`, `TF_DSV41_PF_4K_MEMORY_OK=1`, `TF_DSV41_PREFILL_CHUNK=4096`, and
 `TF_DSV41_PREFILL_ROWS=4096`, with `PF_WS_SHARE=1`. It requires `GM_V2=1`, `PREFILL=replay`, and an AOT fill made from
-the same env. The 4K workspace is transient and released after the CED finish. Each prompt piece checks headroom
-across both ranks; if either cannot leave `TF_DSV41_PF_WS_FLOOR_GIB` free, both use 2K segments with the same bits.
-The boot budget can also refuse a profile that cannot fit.
+the same env. The 4K workspace is transient and released after the CED finish. Each prompt piece checks both ranks'
+MemAvailable: before allocation it must leave `TF_DSV41_PF_WS_FLOOR_GIB` free, and while held the actual available
+memory must still clear that floor. If either rank dips below it, both release the workspace at the piece boundary
+and use 2K segments with the same bits. The boot budget can also refuse a profile that cannot fit.
 
 `TF_DSV41_PF_WS_FLOOR_GIB` defaults to the hard floor (4 GiB). The flash17 profile explicitly chooses `1.0` GiB,
-alongside its 1 GiB admission floors, to keep the tested 4K path available. This is less conservative: the workspace
-still checks both ranks and falls back to 2K segments under pressure. Under `PF_4K=1`, `aot-needs` also lists the
+alongside its 1 GiB admission floors, to keep the tested 4K path available. A deployment using this reserve was
+killed by a host `earlyoom` at its 1 GiB threshold during a long prefill. Previously the guard skipped every
+check while the workspace was held; it now rechecks between pieces and releases the workspace on a dip. This
+does not guarantee protection if memory drops past the threshold between checks. Under `PF_4K=1`,
+`aot-needs` also lists the
 2,048-row segment programs this fallback runs; a fill made from a 4K env with an older `aot-needs` lacks them and
 should be completed as in [Changing serving settings](#changing-serving-settings). For a conservative 2K profile set
 `PF_4K=0`, drop `PF_4K_MEMORY_OK` and `PF_WS_FLOOR_GIB`, and use 2048 for `PREFILL_CHUNK` / `PREFILL_ROWS`. Do not
 enable two-batch prefill overlap (PF_TBO) alongside 4K without a separate memory gate: the tested combination
 exhausted memory.
 
+The reference pair's host `earlyoom` services subsequently moved from 1 GiB / 512 MiB to 256 MiB / 128 MiB
+SIGTERM / SIGKILL thresholds without changing any engine floor. That is a host-specific risk tradeoff, not part
+of the flash17 example or a guarantee that CUDA allocations can succeed near exhaustion.
+
 The workspace floor is separate from `TF_DSV41_FLOOR_GIB` and the measured boot-budget policy. Changing only
-`TF_DSV41_PF_WS_FLOOR_GIB` does not change AOT shapes. Confirm actual workspace allocation in both rank logs, not
-just the configured `PREFILL_ROWS`.
+`TF_DSV41_PF_WS_FLOOR_GIB` does not change AOT shapes, but requires restarting both ranks to update their
+environment. Confirm actual workspace allocation or fallback in both rank logs, not just the configured `PREFILL_ROWS`.
 
 ### Split KV and the pool
 
@@ -418,6 +433,13 @@ It does not require pool pressure or a high-water trigger. Turning write-through
 `SESSION_DISK_MIN=0` removes the disk tier's minimum length, not the native snapshot eligibility rule:
 CED saves prompt prefixes on a 16-token grid from position 64 onward. It does not persist arbitrary tiny
 turns or checkpoint every generated token.
+
+The NVMe budget uses the same rank-independent charge for new files and recovered files: token bytes,
+bounded-state blob bytes, and split KV pages averaged across ranks. It does not include file headers or
+alignment, so physical usage can slightly exceed `TF_DSV41_SESSION_DISK_GIB`; size the filesystem with
+headroom. On an existing full tier, the first save after upgrading can trim extra older files because
+blob bytes replace PR65's smaller RAM-tier measure. Both ranks must run the updated build before
+restarting with a populated tier.
 
 Startup indexes compatible files, intersects recovered keys across ranks and assigns stable entry IDs
 independently of filesystem timestamps. A later matching prompt restores its saved prefix on demand;

@@ -288,6 +288,65 @@ test "two split ranks trim the same NVMe files: the budget counts a file alike o
     try testing.expectEqualSlices(u64, t0.items, t1.items);
 }
 
+/// Fill both ranks with the same odd-page chats, reopen the tier at its budget, and force a trim after recovery.
+fn restartTrim(gpa: std.mem.Allocator, root: []const u8, rank: u32, trace: *std.ArrayList(u64)) !u64 {
+    const policy: store_mod.Policy = .{ .chats = 1, .skip_covered = false, .delta = false, .write_through = true };
+    var charged: u64 = 0;
+    var physical: u64 = 0;
+    {
+        var r: Rank = undefined;
+        try r.init(gpa, root, 2, rank, policy);
+        defer r.deinit();
+        const slot = try r.pool.newSlot(64 * page);
+        for (1..7) |i| {
+            const chat: u32 = @intCast(i);
+            const ids = try chatIds(gpa, chat, (3 + 2 * (chat % 3)) * page);
+            defer gpa.free(ids);
+            try testing.expectEqualStrings("fresh", try turn(gpa, &r, slot, chat, ids));
+        }
+        charged = r.disk.used;
+        for (r.disk.recs.items) |rec| if (rec.live) {
+            physical += rec.size;
+        };
+    }
+    {
+        var r: Rank = undefined;
+        try r.init(gpa, root, 2, rank, policy);
+        defer r.deinit();
+        try testing.expectEqual(@as(u32, 6), try r.store.reconcile(null));
+        try testing.expectEqual(charged, r.disk.used);
+        r.disk.opts.budget = charged - 1;
+        const slot = try r.pool.newSlot(64 * page);
+        const ids = try chatIds(gpa, 7, 3 * page);
+        defer gpa.free(ids);
+        try testing.expectEqualStrings("fresh", try turn(gpa, &r, slot, 7, ids));
+        try testing.expect(r.disk.stats.evicted > 0);
+        try testing.expect(r.disk.used <= r.disk.opts.budget);
+        try trace.appendSlice(gpa, &.{ r.disk.used, r.disk.stats.evicted });
+        var id = r.disk.oldest;
+        while (id != disk_mod.none) : (id = r.disk.recs.items[id].newer) {
+            try trace.append(gpa, std.mem.readInt(u64, r.disk.recs.items[id].key[0..8], .little));
+        }
+    }
+    return physical;
+}
+
+test "recovered split ranks use the same charge and trim the same files" {
+    const gpa = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmpRoot(gpa, &tmp, "restart-trim");
+    defer gpa.free(root);
+    var t0: std.ArrayList(u64) = .empty;
+    defer t0.deinit(gpa);
+    var t1: std.ArrayList(u64) = .empty;
+    defer t1.deinit(gpa);
+    const size0 = try restartTrim(gpa, root, 0, &t0);
+    const size1 = try restartTrim(gpa, root, 1, &t1);
+    try testing.expect(size0 != size1);
+    try testing.expectEqualSlices(u64, t0.items, t1.items);
+}
+
 test "holds: an entry by its id, position and key" {
     const gpa = testing.allocator;
     var tmp = testing.tmpDir(.{});
