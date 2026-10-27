@@ -31,3 +31,4 @@ data/
 runs/
 scripts/data/
 scripts/runs/
+config/*.backup
