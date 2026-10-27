@@ -57,7 +57,7 @@ over the file: `CONTEXT=196608 scripts/serve.sh restart`.
 | `TF_DSV41_GRAPH_MODE` | `rows` | `mix`: C2 / C4 slower |
 | `TF_DSV41_ROUTER` | `gemv` | `fused` / `split` |
 | `GLM53_TF_COMM_BACKEND` | `roce` | `nccl` (-11% / -17%). A RoCE failure at run time writes `/cache/roce-failed` in the cache volume and the next start of both ranks uses NCCL; delete it to retry RoCE |
-| `CONTEXT` | 300000 (4 x 300K) | 196608 keeps the worker further from its memory floor |
+| `CONTEXT` | 300000 (4 x 300K) | 196608 keeps both ranks further from their memory floor |
 | `TF_DSV41_THINKING` / `_DEFAULT_EFFORT` | 1 / `high` (75) | requests override |
 | `TF_DSV41_GRAMMAR` | 1 | 0: `response_format` and strict tools ignored |
 | `MIMALLOC_ALLOW_THP` | 0: no transparent huge pages in torch's CPU allocator (an embedded mimalloc), read at process start | unset: mimalloc's default (on); long prefills then stall in synchronous memory compaction (G12) |
@@ -110,8 +110,9 @@ Host memory and stalls (G12; defaults in brackets):
   prompt's prefill transient priced in.
 - **Measured (G19, 2,048-row adaptive prefill):** 299K stress minimum head 5.07 / worker 4.81 GiB; 1 h soak minimum
   head 4.63 / worker 3.99 GiB (at `_ADAPT_GIB=4.0`; production runs 4.5), RssAnon falling over the hour. The worker
-  binds: 2 GiB less MemTotal than the head, and 6.2-8.4 GiB at serving between identical boots. If it runs short,
-  raise `TF_DSV41_PREFILL_ADAPT_GIB` or go back to 1,024-row windows. [RESULTS.md](RESULTS.md) section 5.
+  bound in G19 with 2 GiB less MemTotal than the head (firmware, equal since 2026-10-24) and 6.2-8.4 GiB at serving
+  between identical boots. If either rank runs short, raise `TF_DSV41_PREFILL_ADAPT_GIB` or go back to 1,024-row
+  windows. [RESULTS.md](RESULTS.md) section 5.
 - **earlyoom:** if the nodes run earlyoom (`-m 2,1` here: SIGTERM below ~2.4 GiB), it is the last backstop under these
   floors and kills a rank; fail-fast then ends the pair in ~1 s and the watchdog restarts it. Never build CUDA
   extensions beside loaded weights (`scripts/serve.sh prebuild` exists for that: G16 lost both ranks to it once).

@@ -2,7 +2,14 @@
 
 OpenAI-compatible on `HOST:PORT` (`127.0.0.1:8000` by default: put your own proxy and authentication in front):
 `/v1/chat/completions` (streaming, tool calls, `response_format`), `/v1/completions` (text or token ids),
+`/v1/messages` (Anthropic's Messages format, streaming included, plus `/v1/messages/count_tokens`),
 `/tokenize`, `/v1/models` (`max_model_len`), `/health`, `/metrics`.
+
+`/v1/messages` streams follow the Anthropic streaming convention: `message_start` names the whole prompt
+(`input_tokens`, output 0) and `message_delta` splits that same prompt into `input_tokens`,
+`cache_read_input_tokens` and `cache_creation_input_tokens`. The head's number equals the delta's parts
+added together. A context-window refusal opens with 0, since no prompt stands behind that head. The counts
+need no request option: on this server a stream names its usage on its last chunk, asked for or not.
 
 A DeepSeek added token quoted inside a chat request (`</think>`, `<think>`, `<｜User｜>`, `<｜Assistant｜>`,
 `<｜end▁of▁sentence｜>`, `<｜DSML｜>`, the tool-call markers; 59 literals read from `tokenizer.json` at start) is

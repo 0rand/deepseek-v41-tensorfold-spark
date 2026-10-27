@@ -16,10 +16,12 @@
 - **The adaptive-row threshold.** Production runs `TF_DSV41_PREFILL_ADAPT_GIB=4.5`; the 1 h soak ran 4.0 (worker
   minimum 3.99 GiB, 9 MiB under our own 4.0 line, no errors). 4.5 has more margin but was not soaked, and not measured
   at 64K / 128K. The engine default (5) makes rows flap on GB10 (replay 32K 1,912 tok/s).
-- **The worker is the binding node.** Its MemTotal is 2 GiB below the head's (firmware), and its MemAvailable at
-  serving varies 6.2-8.4 GiB between identical boots, outside torch. earlyoom on the nodes (`-m 2,1` here) is the last
-  backstop under our 4-5 GiB floors: it kills a rank below ~2.4 GiB, and fail-fast then takes the pair down in ~1 s
-  for the watchdog to restart.
+- **Either rank can bind.** Both nodes have the same MemTotal (127.6 GB) since the worker's BIOS and firmware were
+  brought to the head's versions (2026-10-24); before that the worker's was 2 GiB lower, which made it the binding
+  node in G16-G19. The worker's MemAvailable at serving varied 6.2-8.4 GiB between identical boots, outside torch.
+  Every floor here is checked on both ranks, so nothing assumes which one is tighter. earlyoom on the nodes (`-m 2,1`
+  here) is the last backstop under our 4-5 GiB floors: it kills a rank below ~2.4 GiB on either node, and fail-fast
+  then takes the pair down in ~1 s for the watchdog to restart.
 - **Two G13 rewrites ship off.** The shortened decode MoE chain (`TF_DSV41_MOE_FUSED`) is exact but measured +0.7 ms
   on a 1-row window in the graph. (`TF_DSV41_BRANCHES`, off in G13, is on since G14 on dedicated priority streams.)
 - **Strict mode on the current engine** (every precision trade off, `full` prefill with the cone) has not been

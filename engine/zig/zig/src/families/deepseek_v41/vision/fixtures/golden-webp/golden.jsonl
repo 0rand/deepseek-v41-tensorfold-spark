@@ -1,0 +1,50 @@
+{"generator": {"pillow": "12.3.0", "libwebp": "1.6.0"}}
+{"name": "lossy.webp", "size": [37, 23], "rgb_sha256": "c34c1233c5f93e39b8f5c0d900778a7ed51d4d0980aee922c43a8898d1dbedf0"}
+{"name": "lossy-q1.webp", "size": [37, 23], "rgb_sha256": "e027b3c5747444ba5c46e5d470df89a89869f4d72e04362cfaf4e1cb8f7e281e"}
+{"name": "lossy-q50.webp", "size": [37, 23], "rgb_sha256": "ffefdd656bc81fd63365d44582be36ddbea979aca7ff8b82a51fda72b0e27e4c"}
+{"name": "lossy-q100.webp", "size": [37, 23], "rgb_sha256": "6d4e5f42ca48aa2a06c419a9c010551f5e695213d392859cad260392cb639326"}
+{"name": "lossy-m0.webp", "size": [37, 23], "rgb_sha256": "5b01a3aedc7fc8969e620fb0d74a66fcba8fdd33abf7d53ee12cf69207e2e66e"}
+{"name": "lossy-m6.webp", "size": [37, 23], "rgb_sha256": "937cb90acc144181f38b53386465e0b9785904c092412b95c5aa42b1464edd74"}
+{"name": "lossy-flat.webp", "size": [40, 24], "rgb_sha256": "6827c961f84a1795c5f582f2ceb0874520d42b6c2ca1d46346ab97bd5e1d21c8"}
+{"name": "lossy-1x1.webp", "size": [1, 1], "rgb_sha256": "092cba015de39ed18a569b2f905cf2747659202addbc7c2f2dbd1ebe306e6692"}
+{"name": "lossy-7x1.webp", "size": [7, 1], "rgb_sha256": "95fdff97f9a315be70be9e2333610d06afe1fa3bd4bb5e4be5c1c024e732ef45"}
+{"name": "lossy-1x7.webp", "size": [1, 7], "rgb_sha256": "621c610759aa970be352276d1ac07df79595cd03fd5afdfdf25f89c69ce56d92"}
+{"name": "lossy-83x61.webp", "size": [83, 61], "rgb_sha256": "a771437b7c1479d64232a3f3f60891c0ea129e46c79b023e072553df49e60f20"}
+{"name": "lossy-130x70.webp", "size": [130, 70], "rgb_sha256": "124bf80758896d77f5982d028174d682180c2fb231a03c0fad84208553761f78"}
+{"name": "lossy-alpha.webp", "size": [37, 23], "rgb_sha256": "a70e53faacce2d7571f3258bcdba646dfeae6fde510fc047bd68d554ec022793"}
+{"name": "lossy-alpha-q50.webp", "size": [37, 23], "rgb_sha256": "21315c6a2844921f76ca6c6fa30f337048500f7fa7fb175715eb3c7f8a13a4b5"}
+{"name": "lossy-icc.webp", "size": [37, 23], "rgb_sha256": "c34c1233c5f93e39b8f5c0d900778a7ed51d4d0980aee922c43a8898d1dbedf0"}
+{"name": "alph-raw-none.webp", "size": [37, 23], "rgb_sha256": "3c2dbd3cb959a0eaf11061708e58b23a203fd052c7ca4fbb11f414eb50cd94ca"}
+{"name": "alph-ll-none.webp", "size": [37, 23], "rgb_sha256": "3c2dbd3cb959a0eaf11061708e58b23a203fd052c7ca4fbb11f414eb50cd94ca"}
+{"name": "alph-raw-h.webp", "size": [37, 23], "rgb_sha256": "3c2dbd3cb959a0eaf11061708e58b23a203fd052c7ca4fbb11f414eb50cd94ca"}
+{"name": "alph-ll-h.webp", "size": [37, 23], "rgb_sha256": "3c2dbd3cb959a0eaf11061708e58b23a203fd052c7ca4fbb11f414eb50cd94ca"}
+{"name": "alph-raw-v.webp", "size": [37, 23], "rgb_sha256": "3c2dbd3cb959a0eaf11061708e58b23a203fd052c7ca4fbb11f414eb50cd94ca"}
+{"name": "alph-ll-v.webp", "size": [37, 23], "rgb_sha256": "3c2dbd3cb959a0eaf11061708e58b23a203fd052c7ca4fbb11f414eb50cd94ca"}
+{"name": "alph-raw-g.webp", "size": [37, 23], "rgb_sha256": "3c2dbd3cb959a0eaf11061708e58b23a203fd052c7ca4fbb11f414eb50cd94ca"}
+{"name": "alph-ll-g.webp", "size": [37, 23], "rgb_sha256": "3c2dbd3cb959a0eaf11061708e58b23a203fd052c7ca4fbb11f414eb50cd94ca"}
+{"name": "lossless.webp", "size": [37, 23], "rgb_sha256": "9de71a5267364351e2a96f3d9024d3150b38811873d05ae3629c96769b0d3e51"}
+{"name": "lossless-alpha.webp", "size": [37, 23], "rgb_sha256": "bc9ce24036af956eaed6a5832bdb097188e8512379159e340c3bbbfc34fa146d"}
+{"name": "lossless-exact.webp", "size": [37, 23], "rgb_sha256": "81701475586ee7a60befe3ea37b052bb0eb5517bac1e9b39801014f4ba912668"}
+{"name": "lossless-q0-m0.webp", "size": [37, 23], "rgb_sha256": "bc9ce24036af956eaed6a5832bdb097188e8512379159e340c3bbbfc34fa146d"}
+{"name": "lossless-q100-m6.webp", "size": [37, 23], "rgb_sha256": "bc9ce24036af956eaed6a5832bdb097188e8512379159e340c3bbbfc34fa146d"}
+{"name": "lossless-pal2.webp", "size": [37, 23], "rgb_sha256": "a73d7642b93b5566a8c1972a79799b856b947a257be90b8e105200afb9b31e1d"}
+{"name": "lossless-pal4.webp", "size": [37, 23], "rgb_sha256": "22e07ef3145b17fccd8234f92ba4ea3bda4378a111978f5110687ab503ee671b"}
+{"name": "lossless-pal16.webp", "size": [37, 23], "rgb_sha256": "09a393b5d052ce53f9dfb3455e34c269ef71fff51b54f4c9986d30a4cfa2114e"}
+{"name": "lossless-pal256.webp", "size": [37, 23], "rgb_sha256": "e25291340ee7394134bb395b265dbe92be488e9369d39a99cca988c3f4c68649"}
+{"name": "lossless-1x1.webp", "size": [1, 1], "rgb_sha256": "11b648825d5f16806f477e5bdb6ac5917014841229818e2fdda51690fb3279d6"}
+{"name": "anim-lossy.webp", "size": [37, 23], "rgb_sha256": "527d7e49142b9b27e94d4cc7a46fdfeacf7ce5e2ca137e889e2cf76757b6e530"}
+{"name": "anim-lossless.webp", "size": [37, 23], "rgb_sha256": "b9bb21089c58fa26652f874c0ea62ac3ce09469a859fb93f3b231e286d2e7021"}
+{"name": "anim-offset.webp", "size": [37, 23], "rgb_sha256": "5ee00dbee175d0d02c99a480b0732f6169a3cfcb3ffa53e3fb482a20758921b8"}
+{"name": "bad-tail-short.webp", "refused": true}
+{"name": "bad-tail-overflow.webp", "refused": true}
+{"name": "ok-tail-chunk.webp", "size": [37, 23], "rgb_sha256": "9de71a5267364351e2a96f3d9024d3150b38811873d05ae3629c96769b0d3e51"}
+{"name": "bad-two-images.webp", "refused": true}
+{"name": "bad-two-vp8x.webp", "refused": true}
+{"name": "bad-vp8x-flag-01.webp", "refused": true}
+{"name": "bad-vp8x-flag-40.webp", "refused": true}
+{"name": "bad-vp8x-flag-80.webp", "refused": true}
+{"name": "ok-alpha-flag-clear.webp", "size": [37, 23], "rgb_sha256": "e58e1fd64cb685bd32fcf9f047c09feab816c754e202ec06578d29bf2ff4af21"}
+{"name": "bad-alph-after-vp8.webp", "refused": true}
+{"name": "bad-empty-anim.webp", "refused": true}
+{"name": "bad-anmf-tail.webp", "refused": true}
+{"name": "bad-anmf-empty-last.webp", "refused": true}

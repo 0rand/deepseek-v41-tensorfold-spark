@@ -18,7 +18,8 @@
 #      TEB_ARGS / SB_ARGS (extra flags), TEB_TEMP (0.0, the bench default), SB_TEMP (0.3), SB_REPEATS (2),
 #      TEB_TIMEOUT (off: 300, thinking: 900 s between streamed chunks).
 # Each run writes <OUT>/<date>-<bench>-<mode>[-label]/ with the bench's own reports, the server's /health and
-# /v1/models before and after, and the exact command line.
+# /v1/models before and after, and the exact command line. API_KEY never reaches a saved file or the terminal: the
+# command lines and logs go through scripts/redact.py, which also scrubs the bench's own reports when the run ends.
 set -euo pipefail
 
 CACHE=${TOOLEVAL_CACHE:-$HOME/.cache/tooleval}
@@ -32,6 +33,12 @@ ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 OUT=${OUT:-$ROOT/results/tooleval}
 
 die() { echo "run.sh: $*" >&2; exit 1; }
+redact() { python3 -u "$ROOT/scripts/redact.py" "$@"; }
+
+# curl with the key as a header read from a file descriptor, never in argv (ps) or a saved command
+api() {
+    if [[ -n ${API_KEY:-} ]]; then curl -H @<(printf 'Authorization: Bearer %s\n' "$API_KEY") "$@"; else curl "$@"; fi
+}
 
 setup() {
     mkdir -p "$CACHE"
@@ -63,13 +70,13 @@ kwargs_for() {
 
 snapshot() {       # $1 = dir, $2 = tag: what the server was (patch knobs show in the log, not here)
     local host=${BASE_URL%/v1}
-    curl -fsS -m 10 "$host/health" -o "$1/health-$2.json" 2>/dev/null || echo '{"unreachable": true}' > "$1/health-$2.json"
-    curl -fsS -m 10 "$BASE_URL/models" -o "$1/models-$2.json" 2>/dev/null || true
+    api -fsS -m 10 "$host/health" -o "$1/health-$2.json" 2>/dev/null || echo '{"unreachable": true}' > "$1/health-$2.json"
+    api -fsS -m 10 "$BASE_URL/models" -o "$1/models-$2.json" 2>/dev/null || true
 }
 
 preflight() {
-    curl -fsS -m 10 "$BASE_URL/models" >/dev/null || die "no server at $BASE_URL (scripts/serve.sh start)"
-    curl -fsS -m 10 "$BASE_URL/models" | grep -q "\"$MODEL\"" || die "$BASE_URL/models does not list $MODEL"
+    api -fsS -m 10 "$BASE_URL/models" >/dev/null || die "no server at $BASE_URL (scripts/serve.sh start)"
+    api -fsS -m 10 "$BASE_URL/models" | grep -q "\"$MODEL\"" || die "$BASE_URL/models does not list $MODEL"
 }
 
 run_teb() {        # $1 = mode, $2 = dir, $3.. = extra args (scenario / category filters)
@@ -88,8 +95,8 @@ run_teb() {        # $1 = mode, $2 = dir, $3.. = extra args (scenario / category
     fi
     # shellcheck disable=SC2206
     args+=("$@" ${TEB_ARGS:-})
-    printf '%q ' "$bin" "${args[@]}" > "$dir/teb.cmd"; echo >> "$dir/teb.cmd"
-    "$bin" "${args[@]}" 2>&1 | tee "$dir/teb.log"
+    redact argv -- "$bin" "${args[@]}" > "$dir/teb.cmd"
+    "$bin" "${args[@]}" 2>&1 | redact text | tee "$dir/teb.log"
 }
 
 run_sb() {         # $1 = mode, $2 = dir, $3.. = extra args
@@ -111,9 +118,9 @@ run_sb() {         # $1 = mode, $2 = dir, $3.. = extra args
     fi
     # shellcheck disable=SC2206
     args+=("$@" ${SB_ARGS:-})
-    { [[ -n $extra ]] && printf 'SPARK_BENCH_EXTRA_BODY=%q ' "$extra"; printf '%q ' .venv/bin/python spark_bench.py "${args[@]}"; echo; } > "$dir/sb.cmd"
+    redact argv -- ${extra:+"SPARK_BENCH_EXTRA_BODY=$extra"} .venv/bin/python spark_bench.py "${args[@]}" > "$dir/sb.cmd"
     (cd "$CACHE/spark-bench" && SPARK_BENCH_EXTRA_BODY="$extra" SPARK_BENCH_API_KEY="${API_KEY:-}" \
-        SPARK_BENCH_DUMP_DIR="$dir/sb-dump" .venv/bin/python spark_bench.py "${args[@]}") 2>&1 | tee "$dir/sb.log"
+        SPARK_BENCH_DUMP_DIR="$dir/sb-dump" .venv/bin/python spark_bench.py "${args[@]}") 2>&1 | redact text | tee "$dir/sb.log"
 }
 
 cmd=${1:-}; mode=${2:-}; LABEL=${3:-}
@@ -125,6 +132,7 @@ esac
 preflight
 dir=$OUT/$(date +%Y%m%d-%H%M)-$cmd-$mode${LABEL:+-$LABEL}
 mkdir -p "$dir"
+trap 'redact scrub "$dir"' EXIT    # the benches' own reports and dumps (spark-bench's raw request dump, for one)
 snapshot "$dir" before
 case $cmd in
     teb)    run_teb "$mode" "$dir" ;;
@@ -133,7 +141,7 @@ case $cmd in
     chains) run_teb "$mode" "$dir" --categories C
             SB_REPEATS=${SB_REPEATS:-3} run_sb "$mode" "$dir" --domains agentic ;;
     own)    python3 "$ROOT/bench/tooleval/chains.py" --base "${BASE_URL%/v1}" --model "$MODEL" --mode "$mode" \
-                --out "$dir/chains.json" 2>&1 | tee "$dir/chains.log" ;;
+                --out "$dir/chains.json" 2>&1 | redact text | tee "$dir/chains.log" ;;
 esac
 snapshot "$dir" after
 echo "results: $dir"

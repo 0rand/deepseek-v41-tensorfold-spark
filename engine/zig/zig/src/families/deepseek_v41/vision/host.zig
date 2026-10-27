@@ -88,7 +88,8 @@ pub const Host = struct {
         var rgb = decode.rgb(h.gpa, raw, h.s.max_pixels, &which) catch |e| return switch (e) {
             error.OutOfMemory => error.OutOfMemory,
             error.TooManyPixels => refuse(problem, try std.fmt.allocPrint(a, "image of more than {d} pixels (TF_DSV41_VISION_MAX_PIXELS)", .{h.s.max_pixels})),
-            error.Unsupported => refuse(problem, try std.fmt.allocPrint(a, "could not decode the image: {s} images are not supported by this engine (PNG, JPEG, GIF and BMP are)", .{which})),
+            error.TooLarge => refuse(problem, try std.fmt.allocPrint(a, "could not decode the image ({s}): its Huffman tables need more than {d} MiB", .{ which, decode.max_table_bytes >> 20 })),
+            error.Unsupported => refuse(problem, try std.fmt.allocPrint(a, "could not decode the image: {s} images are not supported by this engine (PNG, JPEG, GIF, BMP and WebP are)", .{which})),
             error.Undecodable => refuse(problem, try std.fmt.allocPrint(a, "could not decode the image ({s})", .{if (which.len > 0) which else "unknown format"})),
         };
         defer rgb.deinit(h.gpa);

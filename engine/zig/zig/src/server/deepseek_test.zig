@@ -193,6 +193,20 @@ fn delta(ev: json.Value) json.Value {
     return ev.get("choices").?.array[0].get("delta").?;
 }
 
+/// The first event whose ``type`` is ``kind``, or null; skips the ``event:`` lines Messages and Responses streams add.
+fn eventOfType(a: Allocator, body: []const u8, kind: []const u8) !?json.Value {
+    var lines = std.mem.splitScalar(u8, body, '\n');
+    while (lines.next()) |line| {
+        const data = std.mem.trim(u8, line, "\r\n");
+        if (!std.mem.startsWith(u8, data, "data: ")) continue;
+        const parsed = try json.parseText(a, data[6..]);
+        if (parsed != .ok) continue;
+        const t = parsed.ok.get("type") orelse continue;
+        if (t == .string and std.mem.eql(u8, t.string, kind)) return parsed.ok;
+    }
+    return null;
+}
+
 fn check(h: *Harness, a: Allocator) !void {
     const tok = h.stub.tok;
     // 1. a whole reply: reasoning in both fields, content, usage with the engine's cached tokens
@@ -495,5 +509,64 @@ test "long tool history: 120 history calls with garbage arguments, both wires, a
         try h.start(tok, tok.tokenId("<｜end▁of▁sentence｜>").?, 1 << 22, .{});
         defer h.finish();
         try checkHistory(&h, a);
+    }
+}
+
+test "a streamed reply names its usage in its last chunk on both wires, asked for or not (mini tokenizer)" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    const tok = try serve_mod.tokenizer.Tokenizer.parse(gpa, serve_mod.fixtures.mini_tokenizer);
+    defer tok.deinit();
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_]@FieldType(server_mod.Config, "wire"){ .tensorfold, .spark }) |wire| {
+        errdefer std.debug.print("wire {s}\n", .{@tagName(wire)});
+        var h: Harness = .{ .gpa = gpa, .io = io, .stub = undefined, .ds = undefined, .srv = undefined, .wire = wire };
+        try h.start(tok, tok.tokenId("<｜end▁of▁sentence｜>").?, 2048, .{});
+        defer h.finish();
+        const plain = "{\"messages\":[{\"role\":\"user\",\"content\":\"hi @chat\"}],\"stream\":true,\"max_tokens\":8}";
+        const asked = "{\"messages\":[{\"role\":\"user\",\"content\":\"hi @chat\"}],\"stream\":true,\"max_tokens\":8,\"stream_options\":{\"include_usage\":true}}";
+        for ([_][]const u8{ plain, asked }) |body| {
+            const r = try h.post(a, "/v1/chat/completions", body);
+            try testing.expectEqual(@as(u16, 200), r.status);
+            const evs = try events(a, r.body);
+            if (evs.len < 2) return error.StreamHasNoLastChunk;
+            const last = evs[evs.len - 2] orelse return error.StreamHasNoLastChunk;
+            const usage = last.get("usage") orelse return error.LastChunkHasNoUsage;
+            try testing.expectEqual(@as(i64, @intCast(h.stub.last_prompt.items.len)), usage.get("prompt_tokens").?.int64().?);
+            try testing.expectEqual(@as(i64, 3), usage.get("prompt_tokens_details").?.get("cached_tokens").?.int64().?);
+        }
+
+        const messages = "{\"model\":\"deepseek-v41\",\"max_tokens\":8,\"stream\":true,\"messages\":[{\"role\":\"user\",\"content\":\"hi @chat\"}]}";
+        const mr = try h.post(a, "/v1/messages", messages);
+        try testing.expectEqual(@as(u16, 200), mr.status);
+        const start = (try eventOfType(a, mr.body, "message_start")) orelse return error.MessagesStreamHasNoHead;
+        const msg = start.get("message") orelse return error.MessagesHeadHasNoMessage;
+        const head = msg.get("usage") orelse return error.MessagesHeadHasNoUsage;
+        const dlt = (try eventOfType(a, mr.body, "message_delta")) orelse return error.MessagesStreamHasNoDelta;
+        const split = dlt.get("usage") orelse return error.MessagesDeltaHasNoUsage;
+        const billed: i64 = @intCast(h.stub.last_prompt.items.len);
+        try testing.expectEqual(billed, (head.get("input_tokens") orelse return error.MessagesHeadHasNoInputTokens).int64().?);
+        try testing.expectEqual(@as(i64, 0), (head.get("output_tokens") orelse return error.MessagesHeadHasNoOutputTokens).int64().?);
+        const parts = (split.get("input_tokens") orelse return error.MessagesDeltaHasNoInputTokens).int64().? +
+            (split.get("cache_read_input_tokens") orelse return error.MessagesDeltaHasNoCacheRead).int64().?;
+        try testing.expectEqual(billed, parts);
+
+        if (wire == .spark) {
+            const rr = try h.post(a, "/v1/responses", "{\"input\":\"hi @chat\",\"stream\":true}");
+            try testing.expectEqual(@as(u16, 200), rr.status);
+            const done = (try eventOfType(a, rr.body, "response.completed")) orelse return error.ResponsesStreamHasNoCompleted;
+            const resp = done.get("response") orelse return error.ResponsesCompletedHasNoResponse;
+            const use = resp.get("usage") orelse return error.ResponsesCompletedHasNoUsageField;
+            try testing.expect(use == .object);
+            const responses_prompt_len: i64 = @intCast(h.stub.last_prompt.items.len); // rendered on its own, not the Messages prompt billed above
+            try testing.expectEqual(responses_prompt_len, (use.object.get("input_tokens") orelse return error.ResponsesUsageHasNoInputTokens).int64().?);
+            try testing.expectEqual(
+                (use.object.get("input_tokens") orelse return error.ResponsesUsageHasNoInputTokens).int64().? +
+                    (use.object.get("output_tokens") orelse return error.ResponsesUsageHasNoOutputTokens).int64().?,
+                (use.object.get("total_tokens") orelse return error.ResponsesUsageHasNoTotalTokens).int64().?,
+            );
+        }
     }
 }

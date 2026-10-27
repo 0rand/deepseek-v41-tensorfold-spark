@@ -64,7 +64,8 @@ and the rank's RssAnon, `TF_DSV41_MEMPROBE=4` for torch's counters). `d1` = prod
 2. **Host:** +0.5-0.6 GiB RssAnon on each rank (the Engram bulk rows and buffers of a 2,048-row segment).
 3. **Device memory outside torch:** 0.5-1.4 GiB more leaves MemFree during the first long prefill and is in no
    meminfo category (not anon, cache, shmem, slab or page tables) and not in torch's reserved; it varies by boot.
-4. **The worker is the binding node.** the worker's MemTotal is 2.0 GiB below the head's (125.5 vs 127.6 GB; firmware),
+4. **The worker is the binding node.** the worker's MemTotal is 2.0 GiB below the head's (125.5 vs 127.6 GB; firmware;
+   equal since the worker's BIOS and firmware update on 2026-10-24),
    and its serving-start MemAvailable varies 6.2-8.4 GiB between identical boots (torch's counters equal: the
    variation is outside torch). The vision tower is rank 0 only, so the worker breaches with or without native.
 5. **The pool is not the problem:** 4 x 300K of FP8 rows is 4,692 pages = 1.2 GiB (1,074 B a token), so `CONTEXT`

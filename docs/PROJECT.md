@@ -33,7 +33,8 @@ TP=2 split.
 | `scripts/prebuild_ext.py` | builds every CUDA extension a rank loads (`scripts/serve.sh prebuild` runs it in the image on both nodes) |
 | `scripts/pack_engram.py` | the per-rank Engram shards from DeepSeek's checkpoint |
 | `scripts/canary.py`, `scripts/boot-start.sh`, `scripts/systemd/` | post-start canary, start at boot, watchdog units |
-| `scripts/check-public.sh` | the sanitizer this repository was checked with |
+| `scripts/check-public.sh`, `scripts/check_secrets.py` | the sanitizer this repository was checked with, and its credential scan (allowlist: `scripts/check-secrets-allow.txt`) |
+| `scripts/redact.py` | masks API keys and tokens in command lines, environments, logs and results before a tool saves or prints them |
 | `bench/` | HTTP clients: quality (MMLU, needles), structured output, soak, stress, tool calling |
 | `docs/` | results, benchmark method, architecture, decode roofline and lessons, operations, the engine |
 | `results/` | the raw files behind the tables ([`results/README.md`](../results/README.md)); `results/campaign/` the tracked results of the development windows G1-G19 |
