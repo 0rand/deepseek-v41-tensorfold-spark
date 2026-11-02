@@ -23,6 +23,7 @@ build/
 # editors / OS
 .vscode/
 .idea/
+.gitignore
 *.swp
 .DS_Store
 !results/campaign/**/*.log
@@ -32,3 +33,4 @@ runs/
 scripts/data/
 scripts/runs/
 config/*.backup
+private/

@@ -8,7 +8,7 @@
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-CONFIG=${CONFIG:-config/prod-zig.env}
+CONFIG=${CONFIG:-config/prod-zig-slots8.env}
 [[ -f "$CONFIG" ]] || { echo "missing $CONFIG; copy config/prod-zig-flash17.env.example first" >&2; exit 2; }
 set -a
 # shellcheck disable=SC1090
